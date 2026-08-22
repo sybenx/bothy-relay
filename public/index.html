@@ -1,0 +1,339 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>bothy</title>
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    max-width: 40rem;
+    margin: 3rem auto;
+    padding: 0 1.25rem;
+    line-height: 1.5;
+  }
+  h1 { font-size: 1.4rem; }
+  .url-row { display: flex; gap: 0.5rem; align-items: center; }
+  .url-row input {
+    flex: 1;
+    font-family: ui-monospace, monospace;
+    padding: 0.5rem;
+  }
+  button { padding: 0.5rem 0.9rem; cursor: pointer; }
+  .stats { display: grid; grid-template-columns: 1fr 1fr; gap: 0.75rem; margin: 1.5rem 0; }
+  .stat { border: 1px solid #8884; border-radius: 0.5rem; padding: 0.75rem; }
+  .stat .n { font-size: 1.3rem; font-weight: 600; }
+  .stat .label { opacity: 0.7; font-size: 0.85rem; }
+  .bar { background: #8882; border-radius: 0.25rem; height: 0.5rem; overflow: hidden; margin-top: 0.4rem; }
+  .bar > div { background: #4a90d9; height: 100%; }
+  .bar.warn > div { background: #d97a4a; }
+  form { display: flex; flex-direction: column; gap: 0.75rem; max-width: 30rem; }
+  input[type="text"] { padding: 0.5rem; font-family: ui-monospace, monospace; }
+  .profile { display: flex; gap: 0.75rem; align-items: center; }
+  .profile img { width: 2.5rem; height: 2.5rem; border-radius: 50%; }
+  #error { color: #d94a4a; }
+  #reset-note { margin-top: 2rem; font-size: 0.9rem; opacity: 0.8; }
+  h2 { font-size: 1rem; margin: 1.5rem 0 0.25rem; }
+  .live-status { opacity: 0.7; font-size: 0.85rem; margin: 0 0 0.5rem; }
+  #live-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    max-height: 12rem;
+    overflow-y: auto;
+    border: 1px solid #8884;
+    border-radius: 0.5rem;
+  }
+  #live-list li {
+    font-family: ui-monospace, monospace;
+    font-size: 0.85rem;
+    padding: 0.35rem 0.6rem;
+    border-bottom: 1px solid #8882;
+    display: flex;
+    gap: 0.75rem;
+  }
+  #live-list li:last-child { border-bottom: none; }
+  #live-list .kind { opacity: 0.7; width: 3.5rem; flex: none; }
+  #live-list .time { opacity: 0.7; width: 5rem; flex: none; }
+  #live-list .id { opacity: 0.9; }
+  #live-list:empty::after {
+    content: "waiting for events\2026";
+    display: block;
+    padding: 0.6rem;
+    opacity: 0.6;
+    font-size: 0.85rem;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  }
+</style>
+</head>
+<body>
+<h1>bothy</h1>
+
+<div id="claimed-view" hidden>
+  <p>Your relay is live at:</p>
+  <div class="url-row">
+    <input id="ws-url" readonly />
+    <button id="copy-btn">Copy</button>
+  </div>
+  <div class="stats">
+    <div class="stat"><div class="n" id="stat-total">-</div><div class="label">events stored</div></div>
+    <div class="stat"><div class="n" id="stat-24h">-</div><div class="label">events, last 24h</div></div>
+    <div class="stat">
+      <div class="n" id="stat-storage">-</div><div class="label">storage used (5 GB free limit)</div>
+      <div class="bar"><div id="bar-storage"></div></div>
+    </div>
+    <div class="stat">
+      <div class="n" id="stat-rows">-</div><div class="label">rows written, last 24h (100k/day free limit)</div>
+      <div class="bar"><div id="bar-rows"></div></div>
+    </div>
+  </div>
+
+  <h2>Backfill</h2>
+  <p id="backfill-status">-</p>
+
+  <h2>Live feed</h2>
+  <p class="live-status" id="live-status">connecting&hellip;</p>
+  <ul id="live-list"></ul>
+</div>
+
+<div id="unclaimed-view" hidden>
+  <p>This relay hasn't been claimed yet. Paste your <code>npub</code> or hex pubkey to claim it &mdash; this binds the relay to you, permanently.</p>
+  <form id="claim-form">
+    <input type="text" id="pubkey-input" placeholder="npub1... or hex pubkey" autocomplete="off" />
+    <div id="profile-preview"></div>
+    <button type="submit">Claim this relay</button>
+  </form>
+  <p id="error"></p>
+</div>
+
+<p id="reset-note" hidden>
+  Redeploying does <strong>not</strong> reset ownership &mdash; your data and claim survive <code>wrangler deploy</code>.
+  To start over, delete the Worker from the Cloudflare dashboard and deploy a fresh one. See the README.
+</p>
+
+<script>
+async function main() {
+  const res = await fetch("/api/stats");
+  const stats = await res.json();
+
+  document.getElementById("reset-note").hidden = false;
+
+  if (stats.claimed) {
+    document.getElementById("claimed-view").hidden = false;
+    const wsUrl = location.origin.replace(/^http/, "ws") + "/";
+    document.getElementById("ws-url").value = wsUrl;
+    document.getElementById("copy-btn").addEventListener("click", () => {
+      navigator.clipboard.writeText(wsUrl);
+    });
+
+    document.getElementById("stat-total").textContent = stats.totalEvents;
+    document.getElementById("stat-24h").textContent = stats.events24h;
+
+    const STORAGE_LIMIT = 5 * 1024 * 1024 * 1024;
+    const ROWS_LIMIT = 100000;
+    setBar("stat-storage", "bar-storage", stats.storageBytes, STORAGE_LIMIT, formatBytes(stats.storageBytes) + " used");
+    setBar("stat-rows", "bar-rows", stats.rowsWrittenEstimate24h, ROWS_LIMIT, stats.rowsWrittenEstimate24h + " rows (est.)");
+
+    renderBackfillStatus(stats.backfill);
+    wireLiveFeed();
+  } else {
+    document.getElementById("unclaimed-view").hidden = false;
+    wireClaimForm();
+  }
+}
+
+function setBar(statId, barId, value, limit, label) {
+  document.getElementById(statId).textContent = label;
+  const pct = Math.min(100, (value / limit) * 100);
+  const bar = document.getElementById(barId);
+  bar.style.width = pct + "%";
+  bar.parentElement.classList.toggle("warn", pct > 80);
+}
+
+function formatBytes(n) {
+  if (n < 1024) return n + " B";
+  if (n < 1024 ** 2) return (n / 1024).toFixed(1) + " KB";
+  if (n < 1024 ** 3) return (n / 1024 ** 2).toFixed(1) + " MB";
+  return (n / 1024 ** 3).toFixed(2) + " GB";
+}
+
+// One-shot backfill progress (ROADMAP.md chunk 7: "visible progress on
+// the admin page"). Purely a render of whatever src/relay.ts getStats()
+// last reported -- this page has no way to trigger or influence
+// backfill, which runs entirely on the Worker's cron trigger.
+function renderBackfillStatus(backfill) {
+  const el = document.getElementById("backfill-status");
+  if (!backfill) {
+    el.textContent = "-";
+    return;
+  }
+  const count = backfill.totalStored + (backfill.totalStored === 1 ? " event" : " events");
+  switch (backfill.status) {
+    case "pending":
+      el.textContent = "looking for your relay list…";
+      break;
+    case "running":
+      el.textContent = count + " imported so far (" + backfill.exhaustedCount + "/" + backfill.relayCount + " relays done)";
+      break;
+    case "paused-budget":
+      el.textContent = count + " imported -- paused, resumes after today's write limit resets at 00:00 UTC";
+      break;
+    case "done":
+      el.textContent = count + " imported from your history -- done";
+      break;
+  }
+}
+
+// Debugging tool that doubles as onboarding (ROADMAP.md chunk 7): turns
+// the abstract wss:// URL into something visibly alive. Kind/time/
+// truncated id only -- the server (src/relay.ts liveBroadcast) never
+// sends tags or content, and never sends gift wraps at all, so there's
+// nothing here to redact client-side.
+const LIVE_MAX_ROWS = 20;
+// Closed whenever the tab isn't visible, and only reopened when it is --
+// this is the idle timeout ROADMAP.md chunk 7 requires: a background tab
+// left open for hours must not hold a live DO connection the whole time
+// (CLAUDE.md "The budget": duration only stays cheap if hibernation
+// actually works, and a socket nobody is looking at is exactly the kind
+// of thing that's easy to forget is still open).
+function wireLiveFeed() {
+  const statusEl = document.getElementById("live-status");
+  const listEl = document.getElementById("live-list");
+  let socket = null;
+  let reconnectDelayMs = 1000;
+  let reconnectTimer = null;
+  let stopped = false;
+
+  function setStatus(text) {
+    statusEl.textContent = text;
+  }
+
+  function addRow(notice) {
+    const li = document.createElement("li");
+    const kind = document.createElement("span");
+    kind.className = "kind";
+    kind.textContent = "kind " + notice.kind;
+    const time = document.createElement("span");
+    time.className = "time";
+    time.textContent = new Date(notice.created_at * 1000).toLocaleTimeString();
+    const id = document.createElement("span");
+    id.className = "id";
+    id.textContent = notice.id;
+    li.append(kind, time, id);
+    listEl.prepend(li);
+    while (listEl.children.length > LIVE_MAX_ROWS) {
+      listEl.removeChild(listEl.lastChild);
+    }
+  }
+
+  function connect() {
+    // Guards against opening a second connection on top of one already
+    // open or in flight -- a spurious extra "visibilitychange" firing
+    // right after the initial connect() call (observed in practice on
+    // page load) would otherwise leave two live DO connections racing to
+    // append the same notice twice.
+    if (stopped || document.hidden || socket) return;
+    setStatus("connecting…");
+    const url = location.origin.replace(/^http/, "ws") + "/live";
+    socket = new WebSocket(url);
+    socket.addEventListener("open", () => {
+      reconnectDelayMs = 1000;
+      setStatus("live");
+    });
+    socket.addEventListener("message", (event) => {
+      try {
+        addRow(JSON.parse(event.data));
+      } catch {
+        // ignore malformed frames
+      }
+    });
+    socket.addEventListener("close", () => {
+      socket = null;
+      if (stopped || document.hidden) {
+        setStatus("paused (tab in background)");
+        return;
+      }
+      setStatus("reconnecting…");
+      reconnectTimer = setTimeout(connect, reconnectDelayMs);
+      reconnectDelayMs = Math.min(reconnectDelayMs * 2, 30000);
+    });
+    socket.addEventListener("error", () => socket && socket.close());
+  }
+
+  function disconnect() {
+    clearTimeout(reconnectTimer);
+    if (socket) socket.close(1000, "tab hidden");
+  }
+
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) {
+      disconnect();
+    } else {
+      connect();
+    }
+  });
+  window.addEventListener("beforeunload", () => {
+    stopped = true;
+    disconnect();
+  });
+
+  connect();
+}
+
+function wireClaimForm() {
+  const input = document.getElementById("pubkey-input");
+  const preview = document.getElementById("profile-preview");
+  const errorEl = document.getElementById("error");
+  let lookupToken = 0;
+
+  input.addEventListener("input", async () => {
+    preview.textContent = "";
+    const value = input.value.trim();
+    if (!/^[0-9a-f]{64}$/i.test(value)) return; // profile lookup only knows hex; npub is still accepted on submit
+    const token = ++lookupToken;
+    // Courtesy lookup only -- the hex/npub the user typed is what gets
+    // claimed regardless of whether this succeeds (CLAUDE.md "Claim
+    // implementation": "If the lookup fails, allow the claim anyway").
+    try {
+      const res = await fetch("/api/profile?pubkey=" + encodeURIComponent(value));
+      const { profile } = await res.json();
+      if (token !== lookupToken || !profile) return;
+      preview.innerHTML = "";
+      const wrap = document.createElement("div");
+      wrap.className = "profile";
+      if (profile.picture) {
+        const img = document.createElement("img");
+        img.src = profile.picture;
+        wrap.appendChild(img);
+      }
+      const name = document.createElement("span");
+      name.textContent = profile.name || "(no display name)";
+      wrap.appendChild(name);
+      preview.appendChild(wrap);
+    } catch {
+      // best-effort only
+    }
+  });
+
+  document.getElementById("claim-form").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    errorEl.textContent = "";
+    const res = await fetch("/api/claim", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ pubkey: input.value.trim() }),
+    });
+    if (res.ok) {
+      location.reload();
+      return;
+    }
+    const body = await res.json().catch(() => ({}));
+    errorEl.textContent = body.error || `claim failed (${res.status})`;
+  });
+}
+
+main();
+</script>
+</body>
+</html>
