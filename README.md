@@ -17,6 +17,20 @@ Click the button, paste your `npub`, get a `wss://` URL for your own relay. No t
 
 That's it. No dashboard configuration required.
 
+## Updating
+
+The deploy button forked this repo into your own GitHub account and connected it to your Worker. To pick up a new version, no terminal required:
+
+1. Open your fork on github.com (it's under your account, named `bothy`).
+2. Click **Sync fork**, then **Update branch**.
+3. Cloudflare notices the push and redeploys automatically — usually within a minute or two.
+
+Your relay stays claimed and your events survive; deploying never resets anything (see "Resetting" below for what actually does). After it redeploys, hard-refresh the admin page in your browser (`Cmd+Shift+R` / `Ctrl+Shift+R`) — the page's static assets can stick around in your browser's cache otherwise.
+
+To check whether a deploy went through, open your Worker in the Cloudflare dashboard and look at its **Deployments** tab.
+
+If you deployed manually instead of via the button (you have the code checked out locally), update the same way you would any git project, then run `npx wrangler deploy`.
+
 ### Rate limiting (recommended)
 
 This relay's read path is intentionally public (gift-wrapped DMs are the one exception — see "Inbox mode" below), so it's worth adding a free Cloudflare rate-limiting rule against abusive traffic: in the Cloudflare dashboard, go to **Security → WAF → Rate limiting rules** for your zone and add a rule capping requests per IP to your Worker's route. The relay enforces its own per-connection and per-IP limits regardless, but an edge rule catches abuse before it reaches the Worker at all.
@@ -52,6 +66,13 @@ This relay also accepts [NIP-59](https://github.com/nostr-protocol/nips/blob/mas
 Reading them back is restricted to you: an unauthenticated query for gift wraps gets a [NIP-42](https://github.com/nostr-protocol/nips/blob/master/42.md) AUTH challenge instead of results, so a stranger can't use your relay to count or time-correlate your incoming DMs. You can delete a gift wrap the same way you'd delete any note ([NIP-09](https://github.com/nostr-protocol/nips/blob/master/09.md)), and [NIP-62](https://github.com/nostr-protocol/nips/blob/master/62.md) "Request to Vanish" support means either you or a message's sender can ask for it to be permanently purged.
 
 **Worth knowing:** Cloudflare terminates the TLS connection in front of this relay, so it necessarily sees the `p` tag (who a gift wrap is addressed to), the arrival time, and the sender's IP address, the same as any other Worker traffic. On a personal relay the `p` tag is always you, so that part leaks nothing new — but the sender IPs belong to other people, sending you mail through infrastructure you chose, not them.
+
+## HTTP endpoints
+
+- `GET /api/stats` — relay stats for the admin page. Returns `{ claimed, ownerPubkey, totalEvents, events24h, storageBytes, rowsWrittenEstimate24h, backfill, icon }`.
+- `POST /api/claim` — TOFU claim; body `{ pubkey }` (npub or hex). See "Ownership" above.
+- `GET /live` — unauthenticated, push-only WebSocket for the admin page's live feed (max 5 connections, 10-minute lifetime); sends `{ kind, created_at, id }` per stored event, never gift wraps.
+- Any path, with header `Accept: application/nostr+json` — the [NIP-11](https://github.com/nostr-protocol/nips/blob/master/11.md) relay information document.
 
 ## Choices, not requirements
 
