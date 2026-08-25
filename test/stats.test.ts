@@ -1,10 +1,12 @@
 // /api/stats and the static admin page (CLAUDE.md "Admin page";
 // ROADMAP.md chunk 4).
-import { exports } from "cloudflare:workers";
+import { env, exports } from "cloudflare:workers";
+import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { signEvent } from "./helpers/event";
 import { isolateStorage } from "./helpers/isolate";
-import { OWNER_SECRET_KEY_HEX } from "./helpers/keys";
+import { OWNER_SECRET_KEY_HEX, randomKeypair } from "./helpers/keys";
+import { refreshFollows } from "../src/ownership";
 import { connectRelay, publish } from "./helpers/socket";
 
 isolateStorage();
@@ -34,6 +36,78 @@ describe("GET /api/stats", () => {
     });
     expect(body.totalEvents).toBeGreaterThanOrEqual(1);
     expect(body.events24h).toBeGreaterThanOrEqual(1);
+  });
+
+  it("reports follows write policy and zeroed follow/mute counts before any list is stored", async () => {
+    const response = await exports.default.fetch("https://example.com/api/stats");
+    const body = (await response.json()) as {
+      writePolicy: string;
+      followCount: number;
+      followsRefreshedAt: number | null;
+      muteCount: number;
+    };
+
+    // The global test env leaves ALLOW_FOLLOWS unset (vitest.config.ts),
+    // and it's an opt-out (ownership.ts allowFollowsEnabled), so this is
+    // "follows" here even with an empty follow list -- see
+    // follows.test.ts for the ALLOW_FOLLOWS=false owner-only case.
+    expect(body.writePolicy).toBe("follows");
+    expect(body.followCount).toBe(0);
+    expect(body.followsRefreshedAt).toBeNull();
+    expect(body.muteCount).toBe(0);
+  });
+
+  it("reflects real follow/mute table contents once the owner publishes kind-3/kind-10000", async () => {
+    const friendA = randomKeypair();
+    const friendB = randomKeypair();
+    const muted = randomKeypair();
+    const contacts = signEvent(OWNER_SECRET_KEY_HEX, {
+      kind: 3,
+      tags: [
+        ["p", friendA.pubkeyHex],
+        ["p", friendB.pubkeyHex],
+      ],
+    });
+    const muteList = signEvent(OWNER_SECRET_KEY_HEX, { kind: 10000, tags: [["p", muted.pubkeyHex]] });
+
+    const conn = await connectRelay();
+    await publish(conn, contacts);
+    // Mutes are checked regardless of ALLOW_FOLLOWS (ownership.ts
+    // refreshMutes), so relay.ts's immediate refresh on this owner
+    // kind-10000 populates `mutes` for real -- and since ALLOW_FOLLOWS is
+    // an opt-out (ownership.ts allowFollowsEnabled) and the global test
+    // env leaves it unset, relay.ts's immediate refresh on the kind-3
+    // above already populates `follows` for real too.
+    await publish(conn, muteList);
+    conn.close();
+
+    // Driven again directly with an explicit follows-enabled env (the
+    // same technique test/follows.test.ts uses for the write-gate itself)
+    // so this test doesn't depend on ALLOW_FOLLOWS's default staying what
+    // it is today -- what's under test here is that getStats'
+    // followCount/followsRefreshedAt reflect whatever is actually in the
+    // table, not relay.ts's refresh trigger (covered by
+    // test/write-gate-refresh.test.ts instead).
+    const id = env.RELAY.idFromName("relay");
+    const stub = env.RELAY.get(id);
+    await runInDurableObject(stub, async (_instance, state) => {
+      refreshFollows(
+        state.storage.sql,
+        { ...env, ALLOW_FOLLOWS: "true" } as unknown as Env,
+        Math.floor(Date.now() / 1000),
+      );
+    });
+
+    const response = await exports.default.fetch("https://example.com/api/stats");
+    const body = (await response.json()) as {
+      followCount: number;
+      followsRefreshedAt: number | null;
+      muteCount: number;
+    };
+
+    expect(body.followCount).toBe(2);
+    expect(body.followsRefreshedAt).toEqual(expect.any(Number));
+    expect(body.muteCount).toBe(1);
   });
 });
 
