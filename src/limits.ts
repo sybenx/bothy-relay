@@ -30,20 +30,78 @@ export function clampFilterLimit(filter: Filter): Filter {
   return { ...filter, limit };
 }
 
-// Gift wrap (NIP-59, ROADMAP.md chunk 6) abuse caps -- CLAUDE.md "Threat
-// model" scoped these to kind 1059 specifically: "This is the only
-// unbounded write path" (every other write is owner-authored, so the
-// owner is trusted not to attack their own relay; a gift wrap sender is
-// not).
+// ---------------------------------------------------------------------
+// Write-path abuse caps. Everything below this line bounds what a writer
+// who is *allowed* to write can cost -- a separate concern from the read
+// caps above, and from ownership.ts, which decides who may write at all.
+//
+// The original threat model (CLAUDE.md, chunk 6) had exactly one
+// untrusted write path: kind-1059 gift wraps, "the only unbounded write
+// path", since every other write was the owner's own and the owner is
+// trusted not to attack their own relay. v0.2.0 made ALLOW_FOLLOWS an
+// opt-OUT, which quietly turned "one trusted author" into "hundreds of
+// pubkeys the owner has merely followed" -- without moving any of the
+// gift wrap caps across. A single compromised or malicious follow was
+// then bounded only by the per-IP message rate limit in relay.ts: at 300
+// messages/minute and the measured 13 rows/event (docs/budget.md), about
+// 26 minutes to exhaust the daily rows-written ceiling, and -- far worse,
+// because storage does not reset daily -- under ten minutes to fill the
+// free tier's whole 5GB permanently. Nothing in this codebase bounded an
+// event's size; the only thing that did was SQLite's own 2MB maximum row
+// size (developers.cloudflare.com/durable-objects/platform/limits/,
+// checked 2026-08-25), which is a limit on what can be stored, not a
+// defence. 5GB / 2MB is 2,560 events, and 2,560 events at 300/minute is
+// eight and a half minutes. See docs/budget.md for the full before/after.
+//
+// Each cap is raisable or disablable through an environment variable
+// (see resolveLimit below), since none of these ceilings apply on a paid
+// plan.
+// ---------------------------------------------------------------------
 
-// Rejects a gift wrap event larger than this many bytes (JSON-serialized
-// wire size). Generous for real NIP-17 DM content (encrypted seal +
-// rumor, typically low single-digit KB) while bounding how much of the
-// 100,000 rows-written/day and 5GB storage ceilings one message can cost.
-export const MAX_GIFT_WRAP_BYTES = 64 * 1024;
+// The exact string that turns a cap off. Same shape as ALLOW_FOLLOWS
+// (ownership.ts allowFollowsEnabled) and for the same reason: removing a
+// safety cap must be a deliberate, spelled-out act, never something any
+// truthy value does by accident. A malformed or empty value falls back
+// to the default rather than resolving to "no limit" -- a typo in the
+// Cloudflare dashboard should cost you the override, not the cap.
+const DISABLE_VALUE = "off";
+
+// Resolves one of the three env-overridable caps below. Null means the
+// cap is disabled; callers skip the check entirely rather than comparing
+// against Infinity. Read defensively (`env.X` may be undefined) because
+// none of these are declared in wrangler.jsonc -- see src/env.d.ts.
+function resolveLimit(raw: string | undefined, fallback: number): number | null {
+  if (raw === undefined) return fallback;
+  if (raw === DISABLE_VALUE) return null;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
+  return parsed;
+}
+
+// Rejects any event larger than this many bytes (JSON-serialized wire
+// size), applied uniformly to every writer including the owner.
+//
+// This was MAX_GIFT_WRAP_BYTES, scoped to kind 1059 alone, and that
+// constant is gone rather than kept alongside this one: two caps
+// expressing the same idea are two caps that have to agree forever. Its
+// reasoning carries over unchanged and now covers every kind. 64KB is
+// generous for real content -- a NIP-17 DM (encrypted seal + rumor) is
+// typically low single-digit KB, and even long-form (kind 30023) rarely
+// approaches it -- while bounding how much of the 100,000
+// rows-written/day and 5GB storage ceilings any single event can cost.
+//
+// This is the cap that bounds the *permanent* damage. The two below only
+// slow an abuser down; rows-written resets every day, stored bytes never
+// do, so an unbounded event size is the one way a single author can cost
+// the relay something the next morning doesn't undo.
+export const MAX_EVENT_BYTES = 64 * 1024;
+
+export function maxEventBytes(env: Env): number | null {
+  return resolveLimit(env.MAX_EVENT_BYTES, MAX_EVENT_BYTES);
+}
 
 // Total gift wraps this relay will hold at once. At the byte cap above,
-// worst case is MAX_GIFT_WRAPS * MAX_GIFT_WRAP_BYTES = ~128MB, well under
+// worst case is MAX_GIFT_WRAPS * MAX_EVENT_BYTES = ~128MB, well under
 // the 5GB SQLite ceiling even alongside the owner's own data -- generous
 // for a real personal inbox, bounded against storage exhaustion from an
 // anonymous write path. New gift wraps are refused once reached; the
@@ -60,6 +118,59 @@ export const MAX_GIFT_WRAPS = 2000;
 // while keeping a sustained flood far below the daily ceiling.
 export const GIFT_WRAP_RATE_LIMIT_WINDOW_MS = 60_000;
 export const MAX_GIFT_WRAPS_PER_IP_PER_WINDOW = 5;
+
+// Per-PUBKEY write throttle. Per pubkey, not per IP, because the two
+// existing throttles (RATE_LIMIT_MAX_MESSAGES in relay.ts, and the gift
+// wrap one above) are both keyed by IP, and an author with several
+// addresses -- a phone on cellular, a laptop on wifi, anything behind a
+// VPN -- walks around an IP-keyed limit entirely. A follow's authority to
+// write here comes from their pubkey, so that is what the limit should
+// be attached to.
+//
+// Sized against rows-written, not intuition. At the measured 13 rows per
+// stored event (docs/budget.md, the corrected figure) and the free tier's
+// 100,000 rows-written/day:
+//
+//   100,000 / 13 = 7,692 events to exhaust the daily write budget
+//
+// Against the per-IP limit as the only bound (50 messages / 10s = 300
+// events/minute):
+//
+//   7,692 / 300 = 25.6 minutes
+//
+// At 20 events/minute per pubkey:
+//
+//   7,692 / (20 * 60) = 6.4 hours
+//
+// The goal is not to make abuse impossible -- a determined attacker with
+// the owner's follow list can still spend the daily budget eventually. It
+// is to make it slow enough that the owner notices and revokes (unfollow,
+// or NIP-86 banpubkey) before the day is gone, while sitting far above
+// any human posting rate: 20 notes a minute, sustained, is not a person.
+//
+// Counted in memory (relay.ts pubkeyRateLimits), like the two throttles
+// above, so it costs no rows to enforce. Be honest about what that means:
+// the counter is lost when the Durable Object is evicted, so an attacker
+// who pauses long enough for hibernation gets a fresh window. It is not
+// airtight and is not claimed to be. What it does cover is the case it
+// exists for -- sustained traffic keeps the object awake, so the window
+// that matters is exactly the one that survives.
+export const PUBKEY_RATE_LIMIT_WINDOW_MS = 60_000;
+export const MAX_EVENTS_PER_PUBKEY_PER_WINDOW = 20;
+
+export function maxEventsPerPubkeyPerWindow(env: Env): number | null {
+  return resolveLimit(env.MAX_EVENTS_PER_PUBKEY_PER_MINUTE, MAX_EVENTS_PER_PUBKEY_PER_WINDOW);
+}
+
+// Ceiling on how many pubkeys the in-memory throttle map tracks at once.
+// Unlike the per-IP maps, this one is keyed by something an attacker can
+// mint for free: every NIP-59 gift wrap is signed by a fresh one-time key
+// (nips/59.md), so a busy inbox would add an entry per message and never
+// reuse one. Stale windows are dropped once the map reaches this size --
+// see relay.ts prunePubkeyRateLimits. Sized so a real relay never reaches
+// it (the owner plus their follows is hundreds of keys, not thousands)
+// while keeping a DO's memory bounded regardless of traffic.
+export const PUBKEY_RATE_LIMIT_MAX_TRACKED = 10_000;
 
 // A filter with none of `ids`, `authors`, `kinds`, or a `#<letter>` tag
 // constraint has no equality condition to bound how much of the table
@@ -137,6 +248,44 @@ export const BACKFILL_PAGE_SIZE = 128;
 // profile-lookup.ts's LOOKUP_TIMEOUT_MS shape, scoped to backfill so a
 // slow/unreachable relay can't stall the whole cron invocation.
 export const BACKFILL_FETCH_TIMEOUT_MS = 8000;
+
+// Cloudflare Workers Free's SQLite storage ceiling per Durable Object
+// (5GB -- developers.cloudflare.com/durable-objects/platform/limits/,
+// checked 2026-08-25; the same number public/index.html draws its storage
+// bar against). Named here because the reserved share below needs the
+// actual figure to reason about.
+export const STORAGE_BYTES_LIMIT = 5 * 1024 * 1024 * 1024;
+
+// Non-owner writes stop once the database passes this size, reserving
+// what's left for the owner. Same shape and same reasoning as
+// hasBackfillHeadroom (backfill.ts), which already reserves half the
+// daily write budget on exactly this argument: the relay exists to hold
+// the owner's own archive, so nothing else may consume the last of a
+// ceiling the owner still needs.
+//
+// Half, mirroring BACKFILL_ROWS_SHARE_LIMIT below -- simple to reason
+// about, and the guarantee it buys is stated exactly: at the moment
+// non-owner writes start being refused, at least 2.5GB of the ceiling is
+// still free for the owner.
+//
+// Note what this measures -- total database size, not the non-owner share
+// of it. Attributing stored bytes per author would mean either a running
+// per-pubkey total (a row write per event, the cost schema.ts's
+// `ingested_at` column exists to avoid) or a scan; `sql.databaseSize` is
+// a property read that getStats already makes, so this check costs no new
+// query type at all. The tradeoff is that the owner's own data counts
+// toward the threshold that cuts off everyone else, which is the correct
+// direction: it is the owner's remaining headroom being protected, and
+// it should shrink as they use it.
+//
+// This is the cap that actually stops permanent exhaustion. MAX_EVENT_BYTES
+// bounds what one event costs and the per-pubkey throttle bounds the rate;
+// only this one bounds the total.
+export const NON_OWNER_STORAGE_SHARE_LIMIT = STORAGE_BYTES_LIMIT / 2;
+
+export function nonOwnerStorageLimit(env: Env): number | null {
+  return resolveLimit(env.NON_OWNER_STORAGE_BYTES, NON_OWNER_STORAGE_SHARE_LIMIT);
+}
 
 // Cloudflare Workers Free's daily rows-written ceiling (CLAUDE.md "The
 // budget"). Named here, not just left as the bare `100000` already
