@@ -17,11 +17,15 @@ import {
   isUnconstrainedFilter,
   LIVE_FEED_MAX_LIFETIME_MS,
   MAX_EVENTS_PER_REQ,
-  MAX_GIFT_WRAP_BYTES,
+  maxEventBytes,
+  maxEventsPerPubkeyPerWindow,
   MAX_GIFT_WRAPS,
   MAX_GIFT_WRAPS_PER_IP_PER_WINDOW,
   MAX_LIVE_FEED_CONNECTIONS,
   MAX_SUBSCRIPTIONS_PER_CONNECTION,
+  nonOwnerStorageLimit,
+  PUBKEY_RATE_LIMIT_MAX_TRACKED,
+  PUBKEY_RATE_LIMIT_WINDOW_MS,
 } from "./limits";
 import { handleManagementCall, type ManagementResponse } from "./nip86";
 import { resolveIcon, resolveName, type OwnerProfile } from "./nip11";
@@ -49,6 +53,7 @@ import {
   getRelaySettings,
   countIngested24h,
   giftWrapCount,
+  hasNonOwnerStorageHeadroom,
   isDeleted,
   isIpBlocked,
   queryFilter,
@@ -191,6 +196,14 @@ export class Relay extends DurableObject<Env> {
   // across every frame type; this one specifically bounds rows-written
   // risk on the one write path anyone can use without being the owner.
   private giftWrapRateLimits = new Map<string, { windowStart: number; count: number }>();
+
+  // Per-PUBKEY write counter (limits.ts PUBKEY_RATE_LIMIT_WINDOW_MS/
+  // MAX_EVENTS_PER_PUBKEY_PER_WINDOW). The two maps above are keyed by IP
+  // and a writer with several addresses walks around both; a follow's
+  // authority to write here is their pubkey, so this is keyed by that.
+  // Same in-memory, resets-on-eviction tradeoff as the other two -- see
+  // the constant's comment for exactly how much that is and isn't worth.
+  private pubkeyRateLimits = new Map<string, { windowStart: number; count: number }>();
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -587,7 +600,7 @@ export class Relay extends DurableObject<Env> {
       return;
     }
 
-    this.acceptEvent(ws, sql, event);
+    this.acceptEvent(ws, sql, event, auth.isOwner);
   }
 
   // NIP-59 (nips/59.md) Gift Wrap accept path -- ROADMAP.md chunk 6's one
@@ -609,11 +622,11 @@ export class Relay extends DurableObject<Env> {
       return;
     }
 
-    if (JSON.stringify(event).length > MAX_GIFT_WRAP_BYTES) {
-      ok(ws, event.id, false, "blocked: gift wrap exceeds the maximum allowed size");
-      return;
-    }
-
+    // No gift-wrap-specific size check here any more: MAX_GIFT_WRAP_BYTES
+    // became the general MAX_EVENT_BYTES (limits.ts), enforced for every
+    // writer at the top of acceptEvent below. A gift wrap is still size-
+    // capped at the same 64KB, just by a cap that no longer has to be
+    // kept in agreement with a second one.
     if (this.isGiftWrapRateLimited(getState(ws).ip)) {
       ok(ws, event.id, false, "rate-limited: too many gift wraps from this connection, slow down");
       return;
@@ -624,7 +637,12 @@ export class Relay extends DurableObject<Env> {
       return;
     }
 
-    this.acceptEvent(ws, sql, event);
+    // A gift wrap is signed by a fresh one-time key (nips/59.md), so it is
+    // never the owner in practice -- compared anyway rather than hardcoding
+    // false, since the owner p-tagging themselves is a legal event and
+    // acceptEvent's exemptions should follow who signed it, not who this
+    // path usually is.
+    this.acceptEvent(ws, sql, event, event.pubkey === owner);
   }
 
   // See limits.ts GIFT_WRAP_RATE_LIMIT_WINDOW_MS/MAX_GIFT_WRAPS_PER_IP_PER_WINDOW
@@ -638,6 +656,43 @@ export class Relay extends DurableObject<Env> {
     }
     entry.count++;
     return entry.count > MAX_GIFT_WRAPS_PER_IP_PER_WINDOW;
+  }
+
+  // See limits.ts MAX_EVENTS_PER_PUBKEY_PER_WINDOW. `max` is passed in
+  // rather than read here because it is env-overridable and acceptEvent
+  // has already resolved it (and already skipped this call entirely when
+  // the cap is disabled).
+  private isPubkeyRateLimited(pubkey: string, max: number): boolean {
+    const now = Date.now();
+    const entry = this.pubkeyRateLimits.get(pubkey);
+    if (!entry || now - entry.windowStart >= PUBKEY_RATE_LIMIT_WINDOW_MS) {
+      if (this.pubkeyRateLimits.size >= PUBKEY_RATE_LIMIT_MAX_TRACKED) {
+        this.prunePubkeyRateLimits(now);
+      }
+      this.pubkeyRateLimits.set(pubkey, { windowStart: now, count: 1 });
+      return false;
+    }
+    entry.count++;
+    return entry.count > max;
+  }
+
+  // Keyed by pubkey, this map can be grown by an attacker for free (a
+  // gift wrap carries a fresh one-time key every time), unlike the
+  // IP-keyed maps above -- so it needs a bound the others don't. Dropping
+  // expired windows is enough in every realistic case; clearing outright
+  // is the backstop for the one where it isn't, and costs an attacker who
+  // reaches it nothing they didn't already have, since a map that has just
+  // been filled with 10,000 distinct one-shot keys was not throttling any
+  // of them anyway.
+  private prunePubkeyRateLimits(now: number): void {
+    for (const [pubkey, entry] of this.pubkeyRateLimits) {
+      if (now - entry.windowStart >= PUBKEY_RATE_LIMIT_WINDOW_MS) {
+        this.pubkeyRateLimits.delete(pubkey);
+      }
+    }
+    if (this.pubkeyRateLimits.size >= PUBKEY_RATE_LIMIT_MAX_TRACKED) {
+      this.pubkeyRateLimits.clear();
+    }
   }
 
   // NIP-62 (nips/62.md) Request to Vanish -- deliberately NOT routed
@@ -684,14 +739,52 @@ export class Relay extends DurableObject<Env> {
   // id/tombstone/signature/duplicate/expiration checks and storage.
   // Used by both the owner-gated path in handleEvent and handleGiftWrap
   // above, whose authorization is entirely different but converges here.
-  private acceptEvent(ws: WebSocket, sql: SqlStorage, event: NostrEvent): void {
-    // Cheapest possible check -- a plain integer comparison -- goes
-    // first, ahead of id/signature verification, for the same
-    // cheapest-check-first reason as the tombstone check below (CLAUDE.md
-    // "Conventions", docs/budget.md chunk 5). See limits.ts
+  private acceptEvent(ws: WebSocket, sql: SqlStorage, event: NostrEvent, isOwner: boolean): void {
+    // Size first, ahead of every other check including the integer
+    // comparison below. It is the only check whose result bounds the cost
+    // of the rest: idMatchesContent re-serializes the whole event and
+    // hashes it, and storeEvent writes every byte of it permanently, so a
+    // multi-megabyte event that is going to be refused should be refused
+    // before anything touches it a second time. Applied to the owner too -- see
+    // limits.ts MAX_EVENT_BYTES; a cap the owner can exceed is a cap that
+    // does not bound stored bytes.
+    const byteCap = maxEventBytes(this.env);
+    if (byteCap !== null && JSON.stringify(event).length > byteCap) {
+      ok(ws, event.id, false, `invalid: event exceeds the maximum size of ${byteCap} bytes`);
+      return;
+    }
+
+    // A plain integer comparison -- the cheapest check here after the
+    // length above, and still well ahead of id/signature verification, for
+    // the same cheapest-check-first reason as the tombstone check below
+    // (CLAUDE.md "Conventions", docs/budget.md chunk 5). See limits.ts
     // MAX_CREATED_AT_FUTURE_SECONDS for why this rejects at all.
     if (isCreatedAtTooFarInFuture(event, nowSeconds())) {
       ok(ws, event.id, false, "invalid: created_at is too far in the future");
+      return;
+    }
+
+    // Per-pubkey write throttle (limits.ts). Still ahead of every
+    // id/tombstone/signature check -- it's a Map lookup, so it is cheaper
+    // than the storage read below and far cheaper than schnorr. The owner
+    // is exempt: they cannot meaningfully abuse their own relay, and a
+    // client replaying a backlog after being offline is a normal thing for
+    // an owner to do and an abnormal thing for a follow to do.
+    const eventCap = maxEventsPerPubkeyPerWindow(this.env);
+    if (!isOwner && eventCap !== null && this.isPubkeyRateLimited(event.pubkey, eventCap)) {
+      ok(ws, event.id, false, "rate-limited: too many events from this pubkey, slow down");
+      return;
+    }
+
+    // Storage headroom (limits.ts NON_OWNER_STORAGE_SHARE_LIMIT), non-owner
+    // only. Last of the three abuse caps and still ahead of id/signature
+    // verification: `databaseSize` is a property read, cheaper than the
+    // tombstone query below and far cheaper than schnorr. The owner keeps
+    // writing at any size -- reserving the remaining half FOR the owner is
+    // the entire point, so applying it to them would invert it.
+    const storageLimit = nonOwnerStorageLimit(this.env);
+    if (!isOwner && storageLimit !== null && !hasNonOwnerStorageHeadroom(sql, storageLimit)) {
+      ok(ws, event.id, false, "blocked: relay storage is full for writers other than the owner");
       return;
     }
 
