@@ -40,10 +40,19 @@ export function expirationOf(event: NostrEvent): number | null {
   return Number.isInteger(value) ? value : null;
 }
 
-function insertEventRow(sql: SqlStorage, event: NostrEvent, expiration: number | null): void {
+// `ingestedAt` is wall-clock now, not event.created_at -- see schema.ts's
+// `ingested_at` comment for why the two must never be conflated. It is
+// one more column on an INSERT this function already performs, so it adds
+// zero rows written per event.
+function insertEventRow(
+  sql: SqlStorage,
+  event: NostrEvent,
+  expiration: number | null,
+  ingestedAt: number,
+): void {
   sql.exec(
-    `INSERT INTO events (id, pubkey, created_at, kind, tags, content, sig, expiration)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO events (id, pubkey, created_at, kind, tags, content, sig, expiration, ingested_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     event.id,
     event.pubkey,
     event.created_at,
@@ -52,6 +61,7 @@ function insertEventRow(sql: SqlStorage, event: NostrEvent, expiration: number |
     event.content,
     event.sig,
     expiration,
+    ingestedAt,
   );
   // Only single-letter tag names are indexed (NIP-01 `#<letter>` filters
   // only ever query those), and only each tag's first value -- see
@@ -120,7 +130,7 @@ interface StoreResult {
 // relay.ts's caller broadcasts it live, but nothing here inserts a row
 // for it. Duplicate and already-expired checks happen before this is
 // called (relay.ts).
-export function storeEvent(sql: SqlStorage, event: NostrEvent): StoreResult {
+export function storeEvent(sql: SqlStorage, event: NostrEvent, ingestedAt: number): StoreResult {
   if (isEphemeralKind(event.kind)) {
     return { ok: true, message: "", stored: event };
   }
@@ -137,7 +147,7 @@ export function storeEvent(sql: SqlStorage, event: NostrEvent): StoreResult {
       return { ok: true, message: "", stored: null };
     }
     if (existing) deleteEventRow(sql, existing.id);
-    insertEventRow(sql, event, expirationOf(event));
+    insertEventRow(sql, event, expirationOf(event), ingestedAt);
     return { ok: true, message: "", stored: event };
   }
 
@@ -155,7 +165,7 @@ export function storeEvent(sql: SqlStorage, event: NostrEvent): StoreResult {
       return { ok: true, message: "", stored: null };
     }
     if (existing) deleteEventRow(sql, existing.id);
-    insertEventRow(sql, event, expirationOf(event));
+    insertEventRow(sql, event, expirationOf(event), ingestedAt);
     return { ok: true, message: "", stored: event };
   }
 
@@ -164,7 +174,7 @@ export function storeEvent(sql: SqlStorage, event: NostrEvent): StoreResult {
   // kinds, writes are owner-only so permissiveness costs nothing, and
   // storing too much is recoverable while rejecting the owner's own
   // events is not.
-  insertEventRow(sql, event, expirationOf(event));
+  insertEventRow(sql, event, expirationOf(event), ingestedAt);
   return { ok: true, message: "", stored: event };
 }
 
@@ -333,13 +343,36 @@ export function queryFilter(sql: SqlStorage, filter: Filter, nowSec: number): No
 // backfill's headroom check calls this same function while the window
 // may also contain a large burst of live writes -- exactly the case this
 // query now has to hold up under.
+// Measured by `ingested_at` -- when this relay actually wrote the row --
+// and never by `created_at`, which is when the author says they signed
+// it. Filtering on created_at made this function report rows
+// attributable to events *timestamped* in the window, so backfill's
+// writes (carrying years-old timestamps) were invisible to it: 729
+// reported against 33,000 actually written. See schema.ts's
+// `ingested_at` comment for the full account.
+//
+// Still an estimate, and still named one. It counts the rows currently
+// standing for events ingested in the window, which is not quite the
+// same as every row written in it: a row written and then deleted inside
+// the same window drops out, and the deletion's own write, plus any
+// tombstone, is not counted. Both make this a floor rather than a
+// ceiling, which is the safe direction for the budget guard in
+// backfill.ts hasBackfillHeadroom -- it will never believe there is less
+// headroom than there is, only more, and the reserved-half rule
+// (BACKFILL_ROWS_SHARE_LIMIT) is what absorbs the difference.
+//
+// Rows read: one scan of `events` joined to `event_tags`. No index
+// covers `ingested_at` and none should -- an index here would cost a row
+// write per event, the exact thing this column was chosen to avoid. The
+// unindexed scan is what the created_at version already did, so the read
+// cost is unchanged.
 export function estimateRowsWritten24h(sql: SqlStorage, sinceCutoff: number): number {
   const rows = sql
     .exec<{ tag_count: number }>(
       `SELECT COUNT(t.event_id) AS tag_count
        FROM events e
        LEFT JOIN event_tags t ON t.event_id = e.id
-       WHERE e.created_at > ?
+       WHERE e.ingested_at > ?
        GROUP BY e.id`,
       sinceCutoff,
     )
@@ -350,6 +383,21 @@ export function estimateRowsWritten24h(sql: SqlStorage, sinceCutoff: number): nu
     total += 3 + 2 * r.tag_count;
   }
   return total;
+}
+
+// How many events this relay actually took in during the window,
+// regardless of how old they are. The companion to the events24h count in
+// relay.ts getStats, which counts by `created_at` and so answers a
+// genuinely different question: "how much did the owner post lately"
+// versus "how much did this relay do lately". During a backfill those two
+// numbers differ by orders of magnitude, and reporting only the first one
+// made the admin page claim 9 events on a day it ingested thousands.
+export function countIngested24h(sql: SqlStorage, sinceCutoff: number): number {
+  return (
+    sql
+      .exec<{ n: number }>(`SELECT COUNT(*) AS n FROM events WHERE ingested_at > ?`, sinceCutoff)
+      .toArray()[0]?.n ?? 0
+  );
 }
 
 // Multiple filters in one REQ are ORed (nips/01.md line 129) and
@@ -367,4 +415,135 @@ export function queryFilters(sql: SqlStorage, filters: Filter[], nowSec: number)
     if (a.created_at !== b.created_at) return b.created_at - a.created_at;
     return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
   });
+}
+
+// ---------------------------------------------------------------------
+// NIP-86 relay management (src/nip86.ts) storage. None of the queries
+// below run on the per-event write path or the REQ read path -- bans and
+// settings are written at operator pace, and the only one that runs on a
+// client-facing path at all is isIpBlocked, called exactly once per
+// WebSocket connection in Relay.fetch(). See schema.ts for the tables.
+// ---------------------------------------------------------------------
+
+export interface BannedEvent {
+  id: string;
+  reason: string | null;
+}
+
+// Records the ban AND tombstones the id. Both are needed and they do
+// different jobs: `banned_events` is the operator-visible record that
+// listbannedevents reads back, while the `deleted_ids` tombstone is what
+// actually stops the event from coming back -- a re-send from a client or
+// a replay from backfill (backfill.ts applyBackfillPage checks isDeleted)
+// would otherwise restore an event the operator just banned. Banning an
+// id that isn't stored is meaningful for exactly that reason: the
+// tombstone refuses it on arrival.
+export function banEvent(sql: SqlStorage, id: string, reason: string | null, nowSec: number): void {
+  deleteAndTombstone(sql, id);
+  sql.exec(
+    `INSERT INTO banned_events (id, reason, banned_at) VALUES (?, ?, ?)
+       ON CONFLICT(id) DO UPDATE SET reason = excluded.reason, banned_at = excluded.banned_at`,
+    id,
+    reason,
+    nowSec,
+  );
+}
+
+// The ONLY place in this codebase that deletes a row from `deleted_ids`,
+// deliberately and by NIP-86's definition of allowevent. Everywhere else
+// a tombstone is permanent on purpose: `deleted_ids` exists so a NIP-09
+// or NIP-62 deletion sticks even though the sender still holds a signed
+// copy they could replay (see schema.ts). Lifting it here is safe only
+// because the operator is the relay owner and is explicitly asking for
+// this id to become storable again -- which also means allowevent will
+// un-delete an id that was tombstoned by a NIP-09 deletion rather than by
+// banevent, if the owner passes one. That is the operator's call to make;
+// do not "fix" it by restricting the delete to ids present in
+// banned_events, since an id banned before it ever arrived has no other
+// way back.
+export function allowEvent(sql: SqlStorage, id: string): void {
+  sql.exec(`DELETE FROM banned_events WHERE id = ?`, id);
+  sql.exec(`DELETE FROM deleted_ids WHERE id = ?`, id);
+}
+
+// Reads `banned_events`, never `deleted_ids` -- listing every tombstone
+// would report the owner's own NIP-09 deletions and NIP-62 vanish
+// requests as "banned events", which they are not.
+export function listBannedEvents(sql: SqlStorage): BannedEvent[] {
+  return sql
+    .exec<{ id: string; reason: string | null }>(
+      `SELECT id, reason FROM banned_events ORDER BY banned_at DESC`,
+    )
+    .toArray();
+}
+
+export interface BlockedIp {
+  ip: string;
+  reason: string | null;
+}
+
+export function blockIp(sql: SqlStorage, ip: string, reason: string | null, nowSec: number): void {
+  sql.exec(
+    `INSERT INTO blocked_ips (ip, reason, blocked_at) VALUES (?, ?, ?)
+       ON CONFLICT(ip) DO UPDATE SET reason = excluded.reason, blocked_at = excluded.blocked_at`,
+    ip,
+    reason,
+    nowSec,
+  );
+}
+
+export function unblockIp(sql: SqlStorage, ip: string): void {
+  sql.exec(`DELETE FROM blocked_ips WHERE ip = ?`, ip);
+}
+
+export function listBlockedIps(sql: SqlStorage): BlockedIp[] {
+  return sql
+    .exec<{ ip: string; reason: string | null }>(`SELECT ip, reason FROM blocked_ips ORDER BY blocked_at DESC`)
+    .toArray();
+}
+
+// One indexed lookup, run once per WebSocket connection in Relay.fetch()
+// -- never per message and never per event, so an IP block costs nothing
+// on the hot path. The management endpoint never calls this: see
+// src/nip86.ts.
+export function isIpBlocked(sql: SqlStorage, ip: string): boolean {
+  return sql.exec(`SELECT 1 FROM blocked_ips WHERE ip = ?`, ip).toArray().length > 0;
+}
+
+// The stored rung of the relay identity chain (nip11.ts) -- what
+// changerelayname/changerelaydescription/changerelayicon write. Absent
+// keys read back as null; there is no "" value, because clearing deletes
+// the row (see setRelaySetting).
+export interface RelaySettings {
+  name: string | null;
+  description: string | null;
+  icon: string | null;
+}
+
+export function getRelaySettings(sql: SqlStorage): RelaySettings {
+  const rows = sql.exec<{ key: string; value: string }>(`SELECT key, value FROM relay_settings`).toArray();
+  const byKey = new Map(rows.map((r) => [r.key, r.value]));
+  return {
+    name: byKey.get("name") ?? null,
+    description: byKey.get("description") ?? null,
+    icon: byKey.get("icon") ?? null,
+  };
+}
+
+// An empty string clears the stored value rather than storing one --
+// NIP-86 defines no unset operation, so this is bothy's convention for
+// falling back down the chain (README.md "Relay management API"). Storing
+// "" instead would be indistinguishable from a deliberate empty name and
+// would shadow the kind-0 and hardcoded rungs forever.
+export function setRelaySetting(sql: SqlStorage, key: "name" | "description" | "icon", value: string): void {
+  if (value === "") {
+    sql.exec(`DELETE FROM relay_settings WHERE key = ?`, key);
+    return;
+  }
+  sql.exec(
+    `INSERT INTO relay_settings (key, value) VALUES (?, ?)
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+    key,
+    value,
+  );
 }

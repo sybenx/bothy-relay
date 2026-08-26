@@ -22,7 +22,8 @@ import {
   MAX_LIVE_FEED_CONNECTIONS,
   MAX_SUBSCRIPTIONS_PER_CONNECTION,
 } from "./limits";
-import { resolveIcon } from "./nip11";
+import { handleManagementCall, type ManagementResponse } from "./nip86";
+import { resolveIcon, resolveName, type OwnerProfile } from "./nip11";
 import { version } from "../package.json";
 import { type Filter, GIFT_WRAP_KIND, type NostrEvent, pTagValues, VANISH_KIND } from "./nostr";
 import {
@@ -44,10 +45,14 @@ import {
   estimateRowsWritten24h,
   eventExists,
   expirationOf,
+  getRelaySettings,
+  countIngested24h,
   giftWrapCount,
   isDeleted,
+  isIpBlocked,
   queryFilter,
   queryFilters,
+  type RelaySettings,
   storeEvent,
 } from "./storage";
 import { idMatchesContent, parseEventShape, verifySignature } from "./validate";
@@ -194,6 +199,22 @@ export class Relay extends DurableObject<Env> {
     // recordHost is a no-op write once the host is already known.
     recordHost(this.ctx.storage.sql, new URL(request.url).host);
 
+    // NIP-86 blockip (src/nip86.ts), enforced exactly here: once per
+    // connection, before the socket is accepted, and never again for the
+    // life of that connection. Checking per message or per event would
+    // put a storage read on the hot path for a table that is almost
+    // always empty -- the whole reason IP blocking made phase one.
+    //
+    // This covers both WebSocket paths (the nostr protocol connection and
+    // the admin page's /live feed) and nothing else. In particular it
+    // does NOT cover the management endpoint, which is a plain POST
+    // handled in the Worker and never reaches this method: blocking your
+    // own address must never lock you out of the API that unblocks it.
+    const ip = request.headers.get("CF-Connecting-IP") ?? "unknown";
+    if (isIpBlocked(this.ctx.storage.sql, ip)) {
+      return new Response("blocked", { status: 403 });
+    }
+
     const pair = new WebSocketPair();
     const client = pair[0];
     const server = pair[1];
@@ -277,9 +298,30 @@ export class Relay extends DurableObject<Env> {
   // ROADMAP.md chunk 5. Null when unclaimed, when OWNER_PUBKEY skips
   // storage entirely, or when the claim-time profile lookup failed; the
   // caller (nip11.ts) falls back to hardcoded defaults in all those cases.
-  async getProfile(host?: string): Promise<{ name: string | null; picture: string | null } | null> {
-    if (host) recordHost(this.ctx.storage.sql, host);
-    return getOwnerProfile(this.ctx.storage.sql, this.env);
+  async getIdentity(host?: string): Promise<{ profile: OwnerProfile; settings: RelaySettings }> {
+    const sql = this.ctx.storage.sql;
+    if (host) recordHost(sql, host);
+    return { profile: getOwnerProfile(sql, this.env), settings: getRelaySettings(sql) };
+  }
+
+  // The owner pubkey on its own, for the Worker's NIP-98 check
+  // (src/nip98.ts) -- the signature has to be verified against something
+  // before any management call is allowed near storage, and verification
+  // deliberately happens in the Worker. Null when unclaimed, which
+  // verifyNip98 turns into a 401.
+  async getOwner(): Promise<string | null> {
+    return getOwnerPubkey(this.ctx.storage.sql, this.env);
+  }
+
+  // NIP-86 relay management (src/nip86.ts), write side. Reached only
+  // after the Worker has verified a NIP-98 event signed by the owner --
+  // this method performs no authentication of its own and must never be
+  // called from anywhere that hasn't done that check. Storage mutations
+  // live here rather than in the Worker for the same reason claim() and
+  // ingestBackfillPage() do: the Durable Object owns every write, and it
+  // opens no outbound connection to serve one.
+  async manage(method: unknown, params: unknown[], callerIp: string): Promise<ManagementResponse> {
+    return handleManagementCall(this.ctx.storage.sql, this.env, method, params, callerIp, nowSeconds());
   }
 
   // Backs GET /api/stats (src/index.ts) -- see CLAUDE.md "Admin page".
@@ -288,11 +330,24 @@ export class Relay extends DurableObject<Env> {
     claimed: boolean;
     ownerPubkey: string | null;
     totalEvents: number;
+    // Events whose own created_at falls in the last 24h -- what the owner
+    // has been posting lately. NOT what this relay took in: a backfilled
+    // event is years old by created_at and lands here as zero. See
+    // ingested24h below, which is the other half of that sentence.
     events24h: number;
+    // Events this relay actually wrote in the last 24h, backfill
+    // included (storage.ts countIngested24h).
+    ingested24h: number;
     storageBytes: number;
     rowsWrittenEstimate24h: number;
     backfill: BackfillStatus | null;
     icon: string | null;
+    // The name actually in effect, resolved through the same chain the
+    // NIP-11 document uses (nip11.ts resolveName) so the admin page's
+    // readout and the document a client fetches can never disagree.
+    // NIP-86 has no getrelayname, so this is the read side for
+    // changerelayname.
+    relayName: string;
     // Whether writes beyond the owner are currently possible at all
     // (CLAUDE.md "Writes are owner-gated"), plus the numbers that
     // back that state -- see the ALLOW_FOLLOWS-gate comment in
@@ -319,12 +374,16 @@ export class Relay extends DurableObject<Env> {
     const followsRefreshedAt =
       sql.exec<{ t: number | null }>(`SELECT MAX(fetched_at) AS t FROM follows`).toArray()[0]?.t ?? null;
 
+    const profile = getOwnerProfile(sql, this.env);
+    const settings = getRelaySettings(sql);
+
     return {
       version,
       claimed: owner !== null,
       ownerPubkey: owner,
       totalEvents,
       events24h,
+      ingested24h: countIngested24h(sql, since),
       storageBytes: sql.databaseSize,
       rowsWrittenEstimate24h: estimateRowsWritten24h(sql, since),
       backfill: owner !== null ? getBackfillStatus(sql) : null,
@@ -332,7 +391,8 @@ export class Relay extends DurableObject<Env> {
       // resolveIcon) -- the admin page uses this to set the browser
       // tab's favicon from the owner's kind-0 picture. Null falls back
       // to the static default favicon client-side.
-      icon: resolveIcon(this.env, getOwnerProfile(sql, this.env)),
+      icon: resolveIcon(this.env, settings, profile),
+      relayName: resolveName(this.env, settings, profile),
       writePolicy: allowFollowsEnabled(this.env) ? "follows" : "owner",
       followCount,
       followsRefreshedAt,
@@ -619,7 +679,9 @@ export class Relay extends DurableObject<Env> {
       return;
     }
 
-    const result = storeEvent(sql, event);
+    // Wall-clock now, not event.created_at -- see schema.ts's
+    // `ingested_at` comment.
+    const result = storeEvent(sql, event, nowSeconds());
     if (event.kind === 5 && result.stored) {
       applyDeletion(sql, event);
     }

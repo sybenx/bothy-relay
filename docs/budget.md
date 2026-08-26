@@ -421,3 +421,33 @@ reads over an already-small table, no new write cost. The admin page
 than a bare number specifically so `writePolicy: "follows"` with
 `followCount: 0` — an enabled but functionally empty allowlist blocking
 every follow — is legible as a problem, not a healthy zero.
+
+## NIP-86 relay management (added in v0.3.0)
+
+Phase one was scoped by exactly one rule: nothing that adds a per-event lookup. That is what decided which NIP-86 methods landed and which did not.
+
+The three new tables (`banned_events`, `blocked_ips`, `relay_settings`, see schema.ts) cost nothing on the per-event write path. `banned_events` and `relay_settings` are written only by an authenticated management call, at operator pace — a handful of rows in the lifetime of a relay, against a 100,000 rows-written/day ceiling. `banevent` additionally writes a `deleted_ids` tombstone, which is the same 2-row cost NIP-09 deletion already pays and is accounted for in the chunk 6 notes above.
+
+The only one of the three that is read on a client-facing path is `blocked_ips`, and it is read exactly once per WebSocket connection in `Relay.fetch`, before `acceptWebSocket`. One indexed lookup per connection, not per message and not per event: at the observed traffic shape (see the requests-by-type breakdown in the Cloudflare dashboard, where HTTP upgrades are a small fraction of total DO requests and WebSocket messages dominate) this is invisible against the 5,000,000 rows-read/day ceiling. Checking per message instead would have put a storage read in front of every frame on a table that is almost always empty, which is precisely the trade this phase refused to make.
+
+`banpubkey`/`allowpubkey` are deferred for the same reason in reverse. Enforcing a pubkey ban means a lookup on every incoming event, on the hot path, in front of the write. That is a real cost against the rows-read ceiling and a real addition to per-event CPU, and it deserves a measured baseline before it lands rather than after — which is why a metrics baseline was taken against the deployed relay before this work started.
+
+Authentication cost sits in the Worker, not the Durable Object. A NIP-98 verification is one schnorr verify (~1.1ms, docs/baselines.json) plus a SHA256 of the request body, and it happens before any RPC into the DO, so a forged management request costs zero DO time and zero rows. Within the verification itself the ownership comparison precedes the schnorr verify, the same cheapest-first ordering the write path uses: a stranger's syntactically perfect authorization is rejected by a string comparison rather than by curve math.
+
+## Rows-written accounting corrected (v0.3.1)
+
+`estimateRowsWritten24h` was measuring the wrong thing, and the gap was large enough to invalidate a baseline: Cloudflare reported **33,000 rows written** over a 24h window in which this function reported **729**.
+
+The function filtered on `events.created_at`, which is when the author says they signed an event, not when this relay wrote the row. For live traffic the two coincide, which is why the bug survived. For backfill they do not: a backfilled event carries its original timestamp, frequently years old, so every row backfill wrote fell outside the window and cost nothing as far as this function could tell.
+
+That was cosmetic on the admin page and structural in `backfill.ts hasBackfillHeadroom`, which calls the same function to decide whether backfill may write. The guard reserving half the daily ceiling for the owner's own traffic was blind to the only writer it exists to restrain. Backfill could never throttle itself, because by its own measurement it had never written anything.
+
+The fix is an `ingested_at` column on `events`, set to wall-clock now at insert. A counter table was considered and rejected again for the reason recorded earlier in this document — a counter incremented per stored event costs a row write per event, which fights the thing the stats endpoint exists to make visible. A column does not: a row write is a row, not a column, and `ingested_at` is added to an INSERT this code already performs. **The per-event write cost is unchanged at 3 + 2 × (single-letter tag count).** No index covers the new column, and none should; an index would cost exactly the per-event row the column was chosen to avoid.
+
+An in-memory counter with periodic persistence was the other candidate and was rejected on hibernation grounds. This object is designed to be evicted between messages and spends most of its life hibernating, so an in-memory counter would be lost between hourly cron ticks almost every time — and it would fail in the dangerous direction, reporting less usage than reality and telling backfill it had headroom it did not have. Flushing often enough to bound that loss reintroduces the per-event write.
+
+What the estimate still does not count: a row written and then deleted inside the same window drops out, and neither the deletion's own write nor any tombstone is counted. Both make the number a floor rather than a ceiling. That is the safe direction for the budget guard, which will only ever believe it has *less* headroom than the raw figure suggests, never more.
+
+Existing deployments carry NULL in `ingested_at` for every row written before the migration, and NULL never satisfies `> cutoff`. That undercounts for at most the single 24h window straddling the upgrade, and is exact thereafter. Backfilling the column from `created_at` would have reintroduced the exact conflation being removed.
+
+The admin page changed alongside it. `events24h` counts by `created_at` and now says so — "events dated in the last 24h" — and a second figure, "events received, last 24h", reports what the relay actually ingested. Previously the page carried two headline numbers that both understated the same day's work: 9 events and 729 rows, on a day that saw thousands of events and 33,000 rows.
