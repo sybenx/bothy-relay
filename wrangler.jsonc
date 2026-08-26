@@ -46,5 +46,22 @@
   // Workers Free.
   "triggers": {
     "crons": ["0 * * * *"]
+  },
+
+  // Workers Logs -- without this, console.error/console.log calls (e.g.
+  // scheduled()'s fault-isolation logging) are discarded and only visible
+  // via a live `wrangler tail`, which needs credentials we don't have.
+  // Included on the Free plan: 200,000 logs/day, 3-day retention.
+  // head_sampling_rate: 1 means every invocation is logged, not sampled.
+  //
+  // Added by hand rather than arriving from upstream: this relay was
+  // cloned before upstream added the block, and the sync workflow
+  // restores this file after every sync (to protect the Cloudflare
+  // resource IDs it holds), so no upstream change to wrangler.jsonc can
+  // ever reach this deployment. Any future config change from upstream
+  // has to be copied in here the same way.
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1
   }
 }
