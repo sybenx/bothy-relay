@@ -5,6 +5,7 @@ import {
   type BackfillStatus,
   getBackfillStatus,
   hasBackfillHeadroom,
+  purgeSelfRelay,
   resetWronglyExhaustedRelays,
   seedBackfillRelays,
 } from "./backfill";
@@ -165,7 +166,7 @@ function ok(ws: WebSocket, id: string, accepted: boolean, message: string): void
 // client rather than for a developer reading logs. All get the
 // `restricted:` prefix per NIP-01's own worked example (nips/01.md line
 // 173).
-function writeRejectionMessage(reason: "unclaimed" | "not-follow" | "owner-only"): string {
+function writeRejectionMessage(reason: "unclaimed" | "not-follow" | "owner-only" | "banned"): string {
   switch (reason) {
     case "unclaimed":
       return "restricted: relay has not been claimed yet";
@@ -173,6 +174,8 @@ function writeRejectionMessage(reason: "unclaimed" | "not-follow" | "owner-only"
       return "restricted: only the owner and people they follow can publish here";
     case "owner-only":
       return "restricted: writes are limited to the relay owner";
+    case "banned":
+      return "blocked: this pubkey is banned from writing here";
   }
 }
 
@@ -434,6 +437,11 @@ export class Relay extends DurableObject<Env> {
       // One-time correction for relays the pre-fix short-page exhaustion
       // heuristic wrongly retired -- see backfill.ts resetWronglyExhaustedRelays.
       resetWronglyExhaustedRelays(sql);
+      // Runs AFTER the reset, deliberately: the reset clears every
+      // exhausted flag including this relay's own row, so purging has to
+      // be what happens last or backfill would spend the next tick
+      // fetching its own history from itself. See purgeSelfRelay.
+      purgeSelfRelay(sql);
     } catch (err) {
       console.error(
         "runCron failed (DO-side):",
