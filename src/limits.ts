@@ -1,5 +1,5 @@
 import { tagFilterEntries, type Filter } from "./nostr";
-import { expandFilterCount } from "./filters";
+import { expandFilterCount, tagScanLimit } from "./filters";
 import { eventRemovalBudget, eventRowCost, indexesOn } from "./schema";
 
 // Hijacking is not the threat here. Read abuse is. The write path is
@@ -94,13 +94,9 @@ export function maxEventBytes(env: Env): number | null {
   return resolveLimit(env.MAX_EVENT_BYTES, MAX_EVENT_BYTES);
 }
 
-// Total gift wraps this relay will hold at once. At the byte cap above,
-// worst case is MAX_GIFT_WRAPS * MAX_EVENT_BYTES = ~128MB, well under
-// the 5GB SQLite ceiling even alongside the owner's own data -- generous
-// for a real personal inbox, bounded against storage exhaustion from an
-// anonymous write path. New gift wraps are refused once reached; the
-// owner deleting old ones (or vanishing them) frees room.
-export const MAX_GIFT_WRAPS = 2000;
+// Total gift wraps this relay will hold at once -- see maxGiftWraps below
+// (moved next to STORAGE_BYTES_LIMIT, which it is now derived from) for
+// the cap itself and why it is a function of env rather than a constant.
 
 // Per-IP gift wrap write throttle, separate from the general per-message
 // rate limit in relay.ts (which counts REQ/CLOSE/AUTH too and is tuned
@@ -208,7 +204,44 @@ export const PUBKEY_RATE_LIMIT_MAX_TRACKED = 10_000;
 // they bound a range, and a range ahead of the sort column still leaves
 // SQLite a sort to do -- which is why a filter of nothing but
 // since/until/limit remains rejected, exactly as before.
+//
+// A `#<letter>` condition adds a second term rather than choosing
+// between paths, since it is a conjunct and is evaluated whatever else
+// the filter names:
+//
+//   rows read  =  combinations x (2 x limit + 1)  +  values x 4 x TAG_SCAN_DEPTH x limit
+//
+// Both terms scale with `limit`, which is the property the whole guard
+// rests on and the one the tag term did not have until v0.7.7 -- see
+// filters.ts TAG_SCAN_DEPTH.
 // ---------------------------------------------------------------------
+
+// The second the current allowance window began: the most recent 00:00
+// UTC. Cloudflare's free-tier allowances reset then
+// (developers.cloudflare.com/durable-objects/platform/limits/, checked
+// 2026-08-26), so this -- not "now minus 24 hours" -- is the cutoff that
+// answers "how much of today's budget has been spent".
+//
+// The two are not interchangeable and the difference is worst exactly
+// when it matters most. A rolling window carries yesterday's traffic
+// across the reset: at 00:05 UTC the write-budget meter on the admin page
+// could read 85% against a ceiling that had been empty for five minutes,
+// and backfill.ts hasBackfillHeadroom would keep refusing to write for
+// most of a day on the strength of rows the account had already been
+// forgiven. The panel exists to be read during an outage, and a rolling
+// window makes it wrong during the recovery from one.
+export function utcDayStartSeconds(nowMs: number): number {
+  const msPerDay = 86_400_000;
+  return Math.floor((nowMs - (nowMs % msPerDay)) / 1000);
+}
+
+// The other end of the same window: how long until the allowances reset.
+// Used for the Retry-After on the 503 an exhausted allowance produces
+// (src/index.ts) -- a real retry time rather than a guess.
+export function secondsUntilUtcMidnight(nowMs: number): number {
+  const msPerDay = 86_400_000;
+  return Math.ceil((msPerDay - (nowMs % msPerDay)) / 1000);
+}
 
 // Cloudflare Workers Free's daily rows-READ ceiling, the companion to
 // DAILY_ROWS_WRITTEN_LIMIT below (developers.cloudflare.com/durable-objects/platform/limits/,
@@ -230,6 +263,24 @@ export const MAX_FILTER_ROWS_READ = DAILY_ROWS_READ_LIMIT / 500;
 // derived -- 41 rows for a limit of 20.
 const ROWS_READ_PER_MATCH = 2;
 
+// Rows read per tag row a `#<letter>` condition looks at. Twice the
+// figure above, because a tag lookup pays the same two rows twice over:
+// idx_event_tags_lookup is (tag_name, tag_value, created_at) and carries
+// no `event_id`, so each match costs an index entry plus the
+// `event_tags` row it points at to learn the id -- and then the outer
+// `id IN (...)` costs the primary key entry plus the `events` row.
+// Measured at 4 exactly for a single tag value (test/read-cost.test.ts:
+// 400 rows for a scan of 100).
+//
+// It is charged per named value, which for more than one value is
+// deliberately pessimistic: SQLite merges the ranges and stops at the
+// subquery's LIMIT, so two values cost ~4.5 rows per scanned row rather
+// than 8. The worst case that cannot be exceeded is each named value
+// contributing a full scan's worth of index entries and table rows
+// (2 x values) plus the outer key lookups (2), which is what this
+// bounds.
+export const TAG_ROWS_READ_PER_MATCH = 4;
+
 // Which filter field pins which indexed column to a value.
 //
 // `created_at` is deliberately absent. `since`/`until` constrain it to a
@@ -247,13 +298,21 @@ export interface FilterReadCost {
   // Estimated rows read to answer this filter.
   rowsRead: number;
   // Which access path produces that estimate -- an index name, or the
-  // primary key. Carried so the test harness and any future diagnostic
-  // can say WHY a filter is cheap, not just that it is.
+  // primary key, or a driver and a tag conjunct joined by `+` when the
+  // filter pays for both. Carried so the test harness and any future
+  // diagnostic can say WHY a filter is cheap, not just that it is.
   via: string;
 }
 
 // The cheapest bounded way to answer this filter, or null when nothing
 // bounds it below the size of the table.
+//
+// Two parts, and they compose differently. The access paths (primary key
+// and the ordered indexes on `events`) are ALTERNATIVES -- SQLite picks
+// one, so the cheapest is the estimate. A `#<letter>` condition is not
+// an alternative but an addition: it is a conjunct, its subquery runs
+// whatever else the filter names, and its cost is added to whichever
+// path drives.
 //
 // `limit` is taken as given: callers pass an already-clamped filter, and
 // boundFilter below is what does the clamping.
@@ -268,32 +327,9 @@ export function filterReadCost(filter: Filter): FilterReadCost | null {
     candidates.push({ rowsRead: filter.ids.length, via: "events primary key" });
   }
 
-  // Tag filters, through idx_event_tags_lookup. buildFilterQuery
-  // resolves these as `id IN (SELECT event_id FROM event_tags WHERE
-  // tag_name = ? AND tag_value IN (...))`, an exact seek per named
-  // value.
-  //
-  // Be honest about this one: it is the single estimate here that can be
-  // wrong LOW. The subquery is not bounded by `limit` -- it reads every
-  // tag row carrying a named value -- so a filter like
-  // `{"#p":[owner]}` on a relay where most events p-tag the owner costs
-  // far more than this says. It is modelled as limit-bounded because
-  // every tag value a real client asks about is a specific event id or
-  // pubkey matching a handful of rows (measured: 5 rows for one match),
-  // and because pricing it correctly would take a COUNT query, i.e. a
-  // read, to decide whether a read is affordable. Recorded rather than
-  // fixed, and unchanged from the behaviour before this guard -- tag
-  // filters were always accepted.
-  const tags = tagFilterEntries(filter);
-  if (tags.length > 0) {
-    const values = tags.reduce((n, [, v]) => n + v.length, 0);
-    if (values > 0) {
-      candidates.push({
-        rowsRead: values * ROWS_READ_PER_MATCH * limit,
-        via: "idx_event_tags_lookup",
-      });
-    }
-  }
+  // Tag conditions are handled after the access paths below, because
+  // they are not an access path. See the block above `return` at the
+  // bottom of this function.
 
   // The ordered indexes on `events`. An index qualifies when every one
   // of its key columns is pinned by the filter at all -- once
@@ -330,11 +366,51 @@ export function filterReadCost(filter: Filter): FilterReadCost | null {
     });
   }
 
-  if (candidates.length === 0) return null;
   // SQLite picks one access path; the cheapest available is the honest
   // estimate of what it will pick, and the pessimistic direction is
   // already covered by rejecting anything above MAX_FILTER_ROWS_READ.
-  return candidates.reduce((best, c) => (c.rowsRead < best.rowsRead ? c : best));
+  const driver =
+    candidates.length === 0
+      ? null
+      : candidates.reduce((best, c) => (c.rowsRead < best.rowsRead ? c : best));
+
+  // Tag conditions, through idx_event_tags_lookup. These are priced
+  // ADDED to whatever drives the query rather than offered as an
+  // alternative to it, which is the correction v0.7.7 made: a
+  // `#<letter>` condition is a conjunct, so its subquery is evaluated
+  // whatever else the filter names, and taking the cheaper of the two
+  // priced a query that runs both as though it ran one. Measured, at
+  // E=1,000 with every event p-tagging the owner:
+  // `{"#p":[owner],"kinds":[1059],"limit":20}` reads 127 rows, against
+  // the 41 the `kinds` index alone was charged for.
+  //
+  // The estimate is now bounded rather than hopeful, because the query
+  // is: filters.ts tagScanLimit caps how far into the tag index the
+  // subquery may read, so this scales with the filter's `limit` instead
+  // of with the number of rows in the table that happen to carry the
+  // named value. That is what lets boundFilter below do anything at all
+  // with the shape -- see the comment on TAG_SCAN_DEPTH for the
+  // measurement that forced the change, and for what a bounded scan
+  // gives up in exchange.
+  //
+  // The bound only exists when the filter carries a `limit`, so neither
+  // does the estimate: a limitless tag filter is priced as unbounded and
+  // refused unless something else in the filter can carry it. Nothing
+  // reaches storage that way in practice -- boundFilter always supplies
+  // one -- but the two must agree on when the subquery is capped, or
+  // this function is describing a query the relay does not run.
+  const tags = tagFilterEntries(filter);
+  const values = tags.reduce((n, [, v]) => n + v.length, 0);
+  if (values > 0) {
+    if (filter.limit === undefined) return null;
+    const tagRows = values * TAG_ROWS_READ_PER_MATCH * tagScanLimit(filter.limit);
+    return {
+      rowsRead: (driver?.rowsRead ?? 0) + tagRows,
+      via: driver === null ? "idx_event_tags_lookup" : `${driver.via} + idx_event_tags_lookup`,
+    };
+  }
+
+  return driver;
 }
 
 export type FilterBound =
@@ -454,6 +530,40 @@ export function nonOwnerStorageLimit(env: Env): number | null {
   return resolveLimit(env.NON_OWNER_STORAGE_BYTES, NON_OWNER_STORAGE_SHARE_LIMIT);
 }
 
+// Share of total storage the gift wrap inbox may occupy: 1/40 of the 5GB
+// ceiling, ~128MB, well under it even alongside the owner's own data.
+// Generous for a real personal inbox, bounded against storage exhaustion
+// from an anonymous write path -- kind-1059 is the one write path with no
+// ownership check at all (CLAUDE.md "Threat model"), so this cap doesn't
+// get to trust the size of anything it admits the way NON_OWNER_STORAGE_-
+// SHARE_LIMIT above already bounds non-owner writers generally.
+const GIFT_WRAP_STORAGE_SHARE = STORAGE_BYTES_LIMIT / 40;
+
+// Total gift wraps this relay will hold at once, DERIVED from the share
+// above and the ACTUAL per-event byte cap in effect (maxEventBytes(env)),
+// not the compile-time MAX_EVENT_BYTES default this used to multiply
+// while ignoring env entirely. That was wrong in both directions: an
+// operator who raised MAX_EVENT_BYTES to, say, 1MB was still billed
+// against the 64KB default, so the documented ~128MB worst case was
+// actually 2000 * 1MB = ~2GB; an operator who disabled it (`"off"`) got
+// no derived bound at all, since there is no per-event size to multiply a
+// fixed count by.
+//
+// A disabled byte cap is priced against the compile-time default here
+// instead of making this count unbounded -- there is no real per-event
+// ceiling to derive a count from in that state, and pricing it at the
+// default keeps this cap meaningful rather than silently no-op. The
+// actual backstop when the byte cap is off is nonOwnerStorageLimit /
+// NON_OWNER_STORAGE_SHARE_LIMIT above, which bounds total bytes
+// regardless of event size or count.
+//
+// New gift wraps are refused once reached; the owner deleting old ones
+// (or vanishing them) frees room.
+export function maxGiftWraps(env: Env): number {
+  const perEventBytes = maxEventBytes(env) ?? MAX_EVENT_BYTES;
+  return Math.max(1, Math.floor(GIFT_WRAP_STORAGE_SHARE / perEventBytes));
+}
+
 // Cloudflare Workers Free's daily rows-written ceiling (CLAUDE.md "The
 // budget"). Named here, not just left as the bare `100000` already
 // hardcoded in public/index.html's admin-page display, because
@@ -561,7 +671,24 @@ export const BACKFILL_ROWS_SHARE_LIMIT = DAILY_ROWS_WRITTEN_LIMIT / 2;
 // estimate assumed.
 const TAGS_PER_REAL_EVENT = 5;
 const BACKFILL_SHARE_UTILISATION = 0.8;
-const CRON_TICKS_PER_DAY = 24;
+
+// Restates wrangler.jsonc's `triggers.crons` ("0 * * * *", hourly) as a
+// number, because BACKFILL_PAGE_SIZE and VANISH_BATCH_SIZE below need to
+// divide a per-tick share by ticks-per-day and a Worker cannot read its
+// own wrangler.jsonc at runtime to derive it -- that file is consumed by
+// the `wrangler` CLI at deploy time, not bundled in. So this is a second
+// place that has to agree with the crontab, and it is exported (rather
+// than kept private the way the rest of this section's inputs are) so
+// test/hibernation.test.ts can assert the crontab actually says what this
+// number claims.
+//
+// That assertion is load-bearing, not decorative: changing the trigger to
+// something more frequent -- `*/15 * * * *` for tighter backfill/vanish
+// latency, say -- without updating this constant would leave
+// BACKFILL_PAGE_SIZE and VANISH_BATCH_SIZE sized for 24 ticks/day while
+// the relay actually ran 96, quadrupling both paths' real daily rows
+// written with no test failing to say so.
+export const CRON_TICKS_PER_DAY = 24;
 
 // Never zero. Enough declared indexes would drive the quotient below one
 // and floor() would silently stop backfill entirely -- a derived constant

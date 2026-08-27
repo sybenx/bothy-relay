@@ -13,12 +13,14 @@ import { matchesAnyFilter, parseFilter } from "./filters";
 import { recordHost } from "./host";
 import {
   boundFilter,
+  DAILY_ROWS_READ_LIMIT,
+  DAILY_ROWS_WRITTEN_LIMIT,
   GIFT_WRAP_RATE_LIMIT_WINDOW_MS,
   LIVE_FEED_MAX_LIFETIME_MS,
   MAX_EVENTS_PER_REQ,
   maxEventBytes,
   maxEventsPerPubkeyPerWindow,
-  MAX_GIFT_WRAPS,
+  maxGiftWraps,
   MAX_GIFT_WRAPS_PER_IP_PER_WINDOW,
   MAX_LIVE_FEED_CONNECTIONS,
   MAX_SUBSCRIPTIONS_PER_CONNECTION,
@@ -27,11 +29,20 @@ import {
   PUBKEY_RATE_LIMIT_MAX_TRACKED,
   PUBKEY_RATE_LIMIT_WINDOW_MS,
   STATS_SNAPSHOT_MAX_AGE_MS,
+  STORAGE_BYTES_LIMIT,
+  utcDayStartSeconds,
 } from "./limits";
 import { handleManagementCall, type ManagementResponse } from "./nip86";
 import { resolveIcon, resolveName, type OwnerProfile } from "./nip11";
 import { version } from "../package.json";
-import { type Filter, GIFT_WRAP_KIND, type NostrEvent, pTagValues, VANISH_KIND } from "./nostr";
+import {
+  type Filter,
+  GIFT_WRAP_KIND,
+  type NostrEvent,
+  pTagValues,
+  tagFilterEntries,
+  VANISH_KIND,
+} from "./nostr";
 import {
   allowFollowsEnabled,
   CONTACT_LIST_KIND,
@@ -55,7 +66,7 @@ import {
   readStatsSnapshot,
   type StatsSnapshot,
   writeStatsSnapshot,
-  estimateRowsWritten24h,
+  estimateRowsWrittenSince,
   eventExists,
   expirationOf,
   getRelaySettings,
@@ -406,7 +417,7 @@ export class Relay extends DurableObject<Env> {
     // ingested24h below, which is the other half of that sentence.
     events24h: number;
     // When `totalEvents`, `events24h`, `followCount`,
-    // `followsRefreshedAt` and `largestNonOwnerAuthor` were computed
+    // `followsListAt` and `largestNonOwnerAuthor` were computed
     // (unix seconds). Those five come from the `stats_snapshot` row and
     // are up to limits.ts STATS_SNAPSHOT_MAX_AGE_MS old; every other
     // field here is read live. Reported so a consumer can tell the two
@@ -416,7 +427,21 @@ export class Relay extends DurableObject<Env> {
     // included (storage.ts countIngested24h). Live, not snapshotted.
     ingested24h: number;
     storageBytes: number;
-    rowsWrittenEstimate24h: number;
+    // Rows written storing events since the last 00:00 UTC, when the
+    // free tier's allowances reset -- the write-budget meter, and the
+    // only figure here measured against a window the platform chose
+    // rather than one this relay chose. See storage.ts
+    // estimateRowsWrittenSince for what it does not count.
+    rowsWrittenToday: number;
+    // The three Workers-free-tier ceilings limits.ts declares, transported
+    // rather than left for public/index.html to hardcode a second copy of
+    // -- see CLAUDE.md "The budget". Static per deployment (none of these
+    // are env-overridable), but served from the one place that already
+    // knows them so the admin page's progress bars can never drift from
+    // what this relay is actually being measured against.
+    storageBytesLimit: number;
+    dailyRowsWrittenLimit: number;
+    dailyRowsReadLimit: number;
     backfill: BackfillStatus | null;
     icon: string | null;
     // The name actually in effect, resolved through the same chain the
@@ -434,7 +459,11 @@ export class Relay extends DurableObject<Env> {
     // a mystery.
     writePolicy: "owner" | "follows";
     followCount: number;
-    followsRefreshedAt: number | null;
+    // The `created_at` of the owner's contact list as the follow cache
+    // currently has it -- not when that cache was last refreshed, which
+    // is no longer a thing that happens on a schedule (ownership.ts
+    // refreshFollows).
+    followsListAt: number | null;
     // The largest number of stored events held by one non-owner pubkey,
     // and NIP-62 vanish requests still draining. Both are here for the
     // same reason: a vanish removes every event its sender authored, the
@@ -454,7 +483,7 @@ export class Relay extends DurableObject<Env> {
     reads: ReadMetricsSnapshot;
   }> {
     // Scoped to "getStats" rather than measured per query: the nested
-    // estimateRowsWritten24h declares its own scope and so reports
+    // estimateRowsWrittenSince declares its own scope and so reports
     // separately -- it was for a long time the most expensive call in
     // here, and keeping it separately billed is how that stays visible.
     const stats = withReadPath("getStats", () => this.collectStats(host));
@@ -471,7 +500,15 @@ export class Relay extends DurableObject<Env> {
 
     const sql = this.sql;
     const owner = getOwnerPubkey(sql, this.env);
-    const since = nowSeconds() - 86400;
+    const nowMs = Date.now();
+    // Two windows, deliberately, because two different questions are
+    // being asked. `since` is a rolling 24 hours and answers "how much
+    // has this relay done lately", which has no reset to respect.
+    // `budgetSince` is the last 00:00 UTC, because the rows-written
+    // ceiling it measures against is an allowance that empties then --
+    // see limits.ts utcDayStartSeconds.
+    const since = Math.floor(nowMs / 1000) - 86400;
+    const budgetSince = utcDayStartSeconds(nowMs);
 
     // The expensive half, read back from `stats_snapshot` rather than
     // recomputed. Recomputed here only when the cron tick has not done it
@@ -502,7 +539,10 @@ export class Relay extends DurableObject<Env> {
       // meter.
       ingested24h: countIngested24h(sql, since),
       storageBytes: sql.databaseSize,
-      rowsWrittenEstimate24h: estimateRowsWritten24h(sql, since),
+      rowsWrittenToday: estimateRowsWrittenSince(sql, budgetSince),
+      storageBytesLimit: STORAGE_BYTES_LIMIT,
+      dailyRowsWrittenLimit: DAILY_ROWS_WRITTEN_LIMIT,
+      dailyRowsReadLimit: DAILY_ROWS_READ_LIMIT,
       // Live: the backfill tables hold one row per relay in the owner's
       // kind-10002 list, so this is ~20 rows read, not O(E). Snapshotting
       // it would save nothing and would make "last ran" and the refusal
@@ -517,7 +557,7 @@ export class Relay extends DurableObject<Env> {
       relayName: resolveName(this.env, settings, profile),
       writePolicy: allowFollowsEnabled(this.env) ? "follows" : "owner",
       followCount: snapshot.followCount,
-      followsRefreshedAt: snapshot.followsRefreshedAt,
+      followsListAt: snapshot.followsListAt,
       largestNonOwnerAuthor: snapshot.largestNonOwnerAuthor,
       vanishing: pendingVanishes(sql),
     };
@@ -575,7 +615,7 @@ export class Relay extends DurableObject<Env> {
       const sql = this.sql;
       const now = nowSeconds();
       withReadPath("cron", () => {
-        refreshFollows(sql, this.env, now);
+        refreshFollows(sql, this.env);
         refreshProfile(sql, this.env, now);
       // One-time correction for relays the pre-fix short-page exhaustion
       // heuristic wrongly retired -- see backfill.ts resetWronglyExhaustedRelays.
@@ -798,7 +838,7 @@ export class Relay extends DurableObject<Env> {
       return;
     }
 
-    if (giftWrapCount(sql) >= MAX_GIFT_WRAPS) {
+    if (giftWrapCount(sql) >= maxGiftWraps(this.env)) {
       ok(ws, event.id, false, "blocked: gift wrap inbox storage is full");
       return;
     }
@@ -1046,7 +1086,7 @@ export class Relay extends DurableObject<Env> {
       // follow's own kind-3 can never even trigger a redundant refresh.
       const owner = getOwnerPubkey(sql, this.env);
       if (event.pubkey === owner && event.kind === CONTACT_LIST_KIND) {
-        refreshFollows(sql, this.env, nowSeconds());
+        refreshFollows(sql, this.env);
       }
       this.broadcast(result.stored);
       this.liveBroadcast(result.stored);
@@ -1113,21 +1153,15 @@ export class Relay extends DurableObject<Env> {
     // (CLAUDE.md "What it is").
     // Reusing the real query engine here means the gate can't drift out
     // of sync with whatever storage.ts actually considers a match, the
-    // way the hand-rolled version did. Cheap: one extra rows-read query
-    // per filter, `limit: 1` since only existence matters, and skipped
-    // entirely when `kinds` already rules out 1059 without touching
-    // storage at all.
+    // way the hand-rolled version did.
+    //
+    // The AUTH check comes FIRST, and the probe only runs when it can
+    // still change the outcome. The owner is allowed to read gift wraps,
+    // so for them the probe decides nothing and is pure rows read on
+    // every REQ they send; a filter naming kind 1059 outright is refused
+    // without touching storage at all.
     const owner = getOwnerPubkey(this.sql, this.env);
-    const requestsGiftWraps = filters.some((f) => {
-      if (f.kinds !== undefined) return f.kinds.includes(GIFT_WRAP_KIND);
-      if (owner === null) return false;
-      return withReadPath(
-        "giftWrapGate",
-        () =>
-          queryFilter(this.sql, { ...f, kinds: [GIFT_WRAP_KIND], limit: 1 }, nowSeconds()).length > 0,
-      );
-    });
-    if (requestsGiftWraps && state.authedPubkey !== owner) {
+    if (state.authedPubkey !== owner && this.requestsGiftWraps(filters, owner)) {
       if (state.authedPubkey === undefined) {
         if (!state.challenge) {
           state.challenge = crypto.randomUUID();
@@ -1149,6 +1183,37 @@ export class Relay extends DurableObject<Env> {
       send(ws, ["EVENT", subId, event]);
     }
     send(ws, ["EOSE", subId]);
+  }
+
+  // Whether any filter in this REQ could surface a kind-1059 event.
+  // Answered from `kinds` alone where that settles it, and otherwise by
+  // re-running the filter against real storage restricted to gift wraps
+  // -- see the gate in handleReqInner for why the question is asked of
+  // storage rather than of the filter's shape.
+  //
+  // The probe's `limit` is the filter's own whenever the filter carries a
+  // tag condition, and 1 otherwise, and the difference is load-bearing
+  // rather than a tuning choice. filters.ts bounds a tag subquery to
+  // tagScanLimit(limit) rows, so how far a filter can reach into the tag
+  // index depends on its limit: probing `{"#p":[owner]}` at limit 1 would
+  // look at five tag rows and clear a REQ that goes on to read a hundred,
+  // and a gift wrap sitting anywhere past the fifth would be handed to an
+  // unauthenticated client. Probing at the same limit looks at exactly
+  // the rows the REQ itself can return. Every other filter shape is
+  // complete at any limit -- existence does not depend on it -- so 1 is
+  // still enough there, and the common kinds-less REQ keeps paying three
+  // rows for its gate.
+  private requestsGiftWraps(filters: Filter[], owner: string | null): boolean {
+    return filters.some((f) => {
+      if (f.kinds !== undefined) return f.kinds.includes(GIFT_WRAP_KIND);
+      if (owner === null) return false;
+      const limit = tagFilterEntries(f).length > 0 ? (f.limit ?? 1) : 1;
+      return withReadPath(
+        "giftWrapGate",
+        () =>
+          queryFilter(this.sql, { ...f, kinds: [GIFT_WRAP_KIND], limit }, nowSeconds()).length > 0,
+      );
+    });
   }
 
   private handleClose(ws: WebSocket, subId: unknown): void {

@@ -1,6 +1,7 @@
 import { buildFilterQuery, compareEvents, expandFilter } from "./filters";
 import { eventRowCost } from "./schema";
-import { countReplacement, withReadPath } from "./read-metrics";
+import { withReadPath } from "./read-metrics";
+import { normalizeIp } from "./ip";
 import {
   dTagValue,
   type Filter,
@@ -59,7 +60,7 @@ function isIndexedTag(tag: string[]): boolean {
 // `row_cost` is stamped here for the same reason and at the same price:
 // this INSERT is the only place that knows both how many indexed tag rows
 // are about to follow and what the schema charges for each, and
-// estimateRowsWritten24h below then reads a column instead of rebuilding
+// estimateRowsWrittenSince below then reads a column instead of rebuilding
 // the figure from a table-wide join. eventRowCost is derived from
 // schema.ts INDEXES, so the number stamped here tracks the real index set
 // rather than a constant somebody has to remember to update.
@@ -191,7 +192,7 @@ export function hasNonOwnerStorageHeadroom(sql: SqlStorage, limit: number): bool
   return sql.databaseSize < limit;
 }
 
-// Current count of stored gift wraps -- backs the MAX_GIFT_WRAPS cap
+// Current count of stored gift wraps -- backs the maxGiftWraps cap
 // (limits.ts) on the write path. A read against the 5,000,000/day
 // rows-read ceiling, not the rows-written one -- see CLAUDE.md "The
 // budget".
@@ -231,10 +232,7 @@ export function storeEvent(sql: SqlStorage, event: NostrEvent, ingestedAt: numbe
     if (existing && isSupersededBy(existing, event)) {
       return { ok: true, message: "", stored: null };
     }
-    // Counted here rather than inside deleteEventRow, which is also
-    // reached by NIP-09/NIP-62/NIP-86 deletions -- see countReplacement.
     if (existing) {
-      countReplacement();
       deleteEventRow(sql, existing.id);
     }
     insertEventRow(sql, event, expirationOf(event), ingestedAt);
@@ -255,7 +253,6 @@ export function storeEvent(sql: SqlStorage, event: NostrEvent, ingestedAt: numbe
       return { ok: true, message: "", stored: null };
     }
     if (existing) {
-      countReplacement();
       deleteEventRow(sql, existing.id);
     }
     insertEventRow(sql, event, expirationOf(event), ingestedAt);
@@ -562,7 +559,7 @@ export function largestNonOwnerAuthor(sql: SqlStorage, owner: string | null): La
 // one of these numbers is a dashboard rather than a gate -- nothing on a
 // correctness path reads them. backfill.ts hasBackfillHeadroom, the one
 // figure on /api/stats that IS a gate, deliberately calls
-// estimateRowsWritten24h directly and is not snapshotted.
+// estimateRowsWrittenSince directly and is not snapshotted.
 //
 // The membership rule is measured cost, not stale-tolerance: a field is
 // in here because reading it walks a table, not because an hour-old
@@ -578,7 +575,14 @@ export interface StatsSnapshot {
   totalEvents: number;
   events24h: number;
   followCount: number;
-  followsRefreshedAt: number | null;
+  // The `created_at` of the contact list the follow cache reflects. The
+  // column behind it is still called `follows_refreshed_at`: it held a
+  // refresh timestamp until v0.7.7, when refreshFollows stopped
+  // rebuilding a list that had not changed and there ceased to be a
+  // refresh time to report. Renaming a stored column would mean a
+  // migration for a diagnostic, so the column keeps its name and this is
+  // where the two are reconciled.
+  followsListAt: number | null;
   largestNonOwnerAuthor: LargestNonOwnerAuthor | null;
 }
 
@@ -606,7 +610,7 @@ export function readStatsSnapshot(sql: SqlStorage): StatsSnapshot | null {
     totalEvents: row.total_events,
     events24h: row.events_24h,
     followCount: row.follow_count,
-    followsRefreshedAt: row.follows_refreshed_at,
+    followsListAt: row.follows_refreshed_at,
     largestNonOwnerAuthor:
       row.largest_author_pubkey === null || row.largest_author_events === null
         ? null
@@ -646,7 +650,13 @@ export function computeStatsSnapshot(
         .exec<{ n: number }>(`SELECT COUNT(*) AS n FROM events WHERE created_at > ?`, since)
         .toArray()[0]?.n ?? 0,
     followCount: sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM follows`).toArray()[0]?.n ?? 0,
-    followsRefreshedAt:
+    // The `created_at` of the contact list the cache currently reflects
+    // (schema.ts `follows`), not the moment it was last rebuilt -- there
+    // is no longer such a moment to report, since refreshFollows only
+    // writes when the list has actually changed. Every row carries the
+    // same value; MAX is how one is picked, not an aggregate over
+    // different ones.
+    followsListAt:
       sql.exec<{ t: number | null }>(`SELECT MAX(fetched_at) AS t FROM follows`).toArray()[0]?.t ??
       null,
     largestNonOwnerAuthor: largestNonOwnerAuthor(sql, owner),
@@ -674,7 +684,7 @@ export function writeStatsSnapshot(sql: SqlStorage, snapshot: StatsSnapshot): vo
     snapshot.totalEvents,
     snapshot.events24h,
     snapshot.followCount,
-    snapshot.followsRefreshedAt,
+    snapshot.followsListAt,
     snapshot.largestNonOwnerAuthor?.pubkey ?? null,
     snapshot.largestNonOwnerAuthor?.events ?? null,
   );
@@ -725,7 +735,7 @@ function runFilterQuery(sql: SqlStorage, filter: Filter, nowSec: number): NostrE
 // column each INSERT stamps (schema.ts eventRowCost, storage.ts
 // insertEventRow). A read-only estimate, not a tracked counter -- see
 // limits.ts/relay.ts comments on why this relay avoids extra writes just
-// to measure itself. Backs /api/stats's `rowsWrittenEstimate24h`
+// to measure itself. Backs /api/stats's `rowsWrittenToday`
 // (relay.ts getStats) and backfill's own headroom check (backfill.ts
 // hasBackfillHeadroom: backfill must yield to the owner's live traffic
 // rather than compete with it for the same daily ceiling) -- both need
@@ -826,14 +836,24 @@ function runFilterQuery(sql: SqlStorage, filter: Filter, nowSec: number): NostrE
 //     is unbounded in principle, since nothing reserves a share for
 //     NIP-09.
 //
+// Deletion is not the only omission, and the other one is quieter: this
+// sums `events.row_cost`, so it sees nothing this relay writes that is
+// not an event row. The follow cache rebuild (ownership.ts
+// refreshFollows) is the largest of those -- 900 rows at 300 follows,
+// every time the owner's contact list changes, and once per cron tick
+// besides until v0.7.7 stopped it rebuilding a list that had not moved.
+// The NIP-86 ban and settings tables, backfill's cursor bookkeeping and
+// the stats snapshot are the rest, each small and none of them here.
+// Every one is a real write against the same 100,000/day ceiling.
+//
 // So: read this number as "rows written STORING events", not "rows
 // written". `/api/stats` reports draining vanish requests alongside it
 // (`vanishing`), which is the signal that the gap is currently wide.
 // Fixing it would mean stamping deletion cost somewhere, and the only
 // place to stamp it is a counter row -- a row write to measure a row
 // write, which is the trade schema.ts rejected for exactly this column.
-export function estimateRowsWritten24h(sql: SqlStorage, sinceCutoff: number): number {
-  return withReadPath("estimateRowsWritten24h", () => estimateRowsWritten24hInner(sql, sinceCutoff));
+export function estimateRowsWrittenSince(sql: SqlStorage, sinceCutoff: number): number {
+  return withReadPath("estimateRowsWrittenSince", () => estimateRowsWrittenSinceInner(sql, sinceCutoff));
 }
 
 // Scoped separately from whichever path called it (read-metrics.ts):
@@ -844,7 +864,7 @@ export function estimateRowsWritten24h(sql: SqlStorage, sinceCutoff: number): nu
 // expensive line in the fixed daily floor, which is reason enough to
 // keep its own line in the report now that it is not -- a path that
 // stops being expensive is worth being able to see stay that way.
-function estimateRowsWritten24hInner(sql: SqlStorage, sinceCutoff: number): number {
+function estimateRowsWrittenSinceInner(sql: SqlStorage, sinceCutoff: number): number {
   return (
     sql
       .exec<{ total: number | null }>(
@@ -949,18 +969,27 @@ export interface BlockedIp {
   reason: string | null;
 }
 
+// ip is canonicalized (ip.ts normalizeIp) before it ever reaches storage
+// or a comparison, at all three call sites here plus the self-block check
+// in nip86.ts -- the same address written two different ways (an
+// operator's hand-typed, expanded IPv6 vs. Cloudflare's own compressed
+// CF-Connecting-IP) must resolve to the same key, or a block stored under
+// one spelling silently fails to match connections presenting the other:
+// listblockedips would read the row back as "blocked" while the
+// connection-time check below never fires. See ip.ts for the full
+// reasoning.
 export function blockIp(sql: SqlStorage, ip: string, reason: string | null, nowSec: number): void {
   sql.exec(
     `INSERT INTO blocked_ips (ip, reason, blocked_at) VALUES (?, ?, ?)
        ON CONFLICT(ip) DO UPDATE SET reason = excluded.reason, blocked_at = excluded.blocked_at`,
-    ip,
+    normalizeIp(ip),
     reason,
     nowSec,
   );
 }
 
 export function unblockIp(sql: SqlStorage, ip: string): void {
-  sql.exec(`DELETE FROM blocked_ips WHERE ip = ?`, ip);
+  sql.exec(`DELETE FROM blocked_ips WHERE ip = ?`, normalizeIp(ip));
 }
 
 export function listBlockedIps(sql: SqlStorage): BlockedIp[] {
@@ -974,7 +1003,7 @@ export function listBlockedIps(sql: SqlStorage): BlockedIp[] {
 // on the hot path. The management endpoint never calls this: see
 // src/nip86.ts.
 export function isIpBlocked(sql: SqlStorage, ip: string): boolean {
-  return sql.exec(`SELECT 1 FROM blocked_ips WHERE ip = ?`, ip).toArray().length > 0;
+  return sql.exec(`SELECT 1 FROM blocked_ips WHERE ip = ?`, normalizeIp(ip)).toArray().length > 0;
 }
 
 // The stored rung of the relay identity chain (nip11.ts) -- what

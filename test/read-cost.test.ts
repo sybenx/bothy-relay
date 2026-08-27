@@ -34,8 +34,14 @@
 // got there.
 import { env, runInDurableObject, SELF } from "cloudflare:test";
 import { beforeAll, describe, expect, it } from "vitest";
-import { buildFilterQuery, expandFilter, expandFilterCount } from "../src/filters";
-import { boundFilter, MAX_FILTER_ROWS_READ } from "../src/limits";
+import { buildFilterQuery, expandFilter, expandFilterCount, tagScanLimit } from "../src/filters";
+import {
+  boundFilter,
+  filterReadCost,
+  MAX_FILTER_LIMIT,
+  MAX_FILTER_ROWS_READ,
+  TAG_ROWS_READ_PER_MATCH,
+} from "../src/limits";
 import type { Filter } from "../src/nostr";
 import { queryFilter, readStatsSnapshot } from "../src/storage";
 import { readMetricsSnapshot, resetReadMetrics } from "../src/read-metrics";
@@ -53,7 +59,7 @@ const EVENTS = 1000;
 const TAGS_PER_EVENT = 5;
 const TAG_ROWS = EVENTS * TAGS_PER_EVENT;
 // How many of the seeded rows carry an `ingested_at` inside the rolling
-// 24h window estimateRowsWritten24h measures. Ten, not zero, and the
+// 24h window estimateRowsWrittenSince measures. Ten, not zero, and the
 // difference matters twice over.
 //
 // It mattered for the pre-v0.7.2 join: with nothing in the window SQLite
@@ -105,9 +111,19 @@ beforeAll(async () => {
         sql.exec(
           `INSERT INTO event_tags (tag_name, tag_value, event_id, created_at) VALUES (?, ?, ?, ?)`,
           t % 2 === 0 ? "e" : "p",
-          `v${i}_${t}`,
+          // One of the five is the same value on every event: the owner's
+          // own pubkey, p-tagged. That is not a contrived shape -- every
+          // gift wrap this relay accepts must p-tag the owner
+          // (relay.ts handleGiftWrap), so `#p:<owner>` is by construction
+          // the highest-cardinality tag value in the table, and it is
+          // exactly what a NIP-17 client asks for. The other four stay
+          // unique, so both ends of the cardinality range are seeded.
+          t === 1 ? OWNER_PUBKEY_HEX : `v${i}_${t}`,
           id,
-          now,
+          // The event's own created_at, as storage.ts insertEventRow
+          // copies it -- the tag index's ordering column is only usable
+          // as a bound on the outer query if the two agree.
+          now - (EVENTS - i) * 60,
         );
       }
     }
@@ -187,6 +203,130 @@ describe("rows read by query shape", () => {
     });
   });
 
+  it("bounds a high-cardinality tag filter by its limit, where it once read every matching row", async () => {
+    // The shape that survived the first read-abuse guard untouched.
+    // buildFilterQuery resolved a `#<letter>` condition as an unbounded
+    // `id IN (SELECT event_id FROM event_tags WHERE ...)`, so the
+    // subquery read every row carrying the named value whatever the
+    // filter's `limit` -- and `#p:<owner>` names the one value every gift
+    // wrap in the table carries. Flat in the limit meant limits.ts
+    // boundFilter could neither clamp the filter nor refuse it: halving a
+    // limit the cost does not depend on changes nothing.
+    //
+    // The "before" figure is measured live, against the same rows, by
+    // stripping the ORDER BY/LIMIT back off the subquery.
+    await runInDurableObject(stub(), async (_instance: Relay, state) => {
+      const sql = state.storage.sql;
+      const now = Math.floor(Date.now() / 1000);
+
+      const small = buildFilterQuery({ "#p": [OWNER_PUBKEY_HEX], limit: 20 }, now);
+      const tiny = buildFilterQuery({ "#p": [OWNER_PUBKEY_HEX], limit: 1 }, now);
+      expect(small).not.toBeNull();
+      expect(tiny).not.toBeNull();
+
+      // 4 rows per tag row scanned -- the index entry and the
+      // `event_tags` row it points at (idx_event_tags_lookup carries no
+      // `event_id`), then the primary key entry and the `events` row.
+      // This is the measurement limits.ts TAG_ROWS_READ_PER_MATCH is set
+      // from, and TAG_SCAN_DEPTH x limit is how far the scan may go.
+      expect(rowsRead(sql, small!.sql, ...small!.params)).toBe(
+        TAG_ROWS_READ_PER_MATCH * tagScanLimit(20),
+      );
+      expect(rowsRead(sql, tiny!.sql, ...tiny!.params)).toBe(
+        TAG_ROWS_READ_PER_MATCH * tagScanLimit(1),
+      );
+
+      // The property that was missing: asking for less costs less.
+      const unbounded = small!.sql.replace(/ ORDER BY created_at DESC LIMIT \?\)/, ")");
+      const unboundedParams = small!.params.filter((p) => p !== tagScanLimit(20));
+      const before = rowsRead(sql, unbounded, ...unboundedParams);
+      // Four per tag row in the table, plus the one row the outer scan
+      // stops on: a function of E, with `limit` nowhere in it.
+      expect(before).toBe(4 * EVENTS + 1);
+      const beforeAtOne = rowsRead(
+        sql,
+        tiny!.sql.replace(/ ORDER BY created_at DESC LIMIT \?\)/, ")"),
+        ...tiny!.params.filter((p) => p !== tagScanLimit(1)),
+      );
+      // Identical at limit 1 and limit 20: the old cost was a function of
+      // the table, not of the request.
+      expect(beforeAtOne).toBe(before);
+    });
+  });
+
+  it("prices a tag condition as an addition to the driving path, not an alternative to it", async () => {
+    // A `#<letter>` condition is a conjunct: its subquery runs whatever
+    // else the filter names. filterReadCost used to offer it as one
+    // candidate access path among several and take the cheapest, which
+    // priced a query that pays for both as though it paid for one.
+    await runInDurableObject(stub(), async (_instance: Relay, state) => {
+      const sql = state.storage.sql;
+      const now = Math.floor(Date.now() / 1000);
+      const filter = { "#p": [OWNER_PUBKEY_HEX], kinds: [7], limit: 20 };
+
+      const query = buildFilterQuery(filter, now);
+      expect(query).not.toBeNull();
+      const measured = rowsRead(sql, query!.sql, ...query!.params);
+
+      const cost = filterReadCost(filter);
+      expect(cost).not.toBeNull();
+      // Both terms, added -- and the estimate stays on the safe side of
+      // what SQLite actually does.
+      expect(cost!.rowsRead).toBe(
+        2 * 20 + 1 + TAG_ROWS_READ_PER_MATCH * tagScanLimit(20),
+      );
+      expect(cost!.via).toContain("idx_event_tags_lookup");
+      expect(measured).toBeLessThan(cost!.rowsRead);
+      // The old model would have charged the `kinds` index alone.
+      expect(measured).toBeGreaterThan(2 * 20 + 1);
+    });
+  });
+
+  it("keeps the tag-scan depth derived from the ceiling it is meant to respect", () => {
+    // filters.ts TAG_SCAN_DEPTH is not a tuning knob picked by hand: it
+    // is the depth at which a single-value tag filter asking for
+    // MAX_FILTER_LIMIT events costs exactly the per-filter ceiling. If
+    // any of these three moves, the depth has to move with it, and this
+    // is what says so.
+    expect(TAG_ROWS_READ_PER_MATCH * tagScanLimit(MAX_FILTER_LIMIT)).toBe(MAX_FILTER_ROWS_READ);
+  });
+
+  it("clamps a tag filter's limit instead of admitting it at any cost", () => {
+    // The whole point of bounding the subquery. Before it, this filter
+    // was admitted at whatever limit it asked for, because the cost the
+    // guard computed did not move when the limit did.
+    const bound = boundFilter({ "#p": [OWNER_PUBKEY_HEX, "b".repeat(64), "c".repeat(64)], limit: 500 });
+    expect(bound.ok).toBe(true);
+    if (bound.ok) {
+      expect(bound.filter.limit).toBeLessThan(500);
+      expect(bound.cost.rowsRead).toBeLessThanOrEqual(MAX_FILTER_ROWS_READ);
+    }
+  });
+
+  it("narrows a paginating tag filter to the window it asked for", async () => {
+    // `since`/`until` are pushed into the tag subquery rather than
+    // applied to its output. `event_tags.created_at` is the event's own,
+    // so the bound is exact -- and without the pushdown a bounded
+    // subquery would hand `until` the newest rows in the table and then
+    // discard all of them, which is to say pagination would stop dead
+    // after the first page.
+    await runInDurableObject(stub(), async (_instance: Relay, state) => {
+      const sql = state.storage.sql;
+      const now = Math.floor(Date.now() / 1000);
+      const until = now - 500 * 60;
+      const query = buildFilterQuery({ "#p": [OWNER_PUBKEY_HEX], until, limit: 20 }, now);
+      expect(query).not.toBeNull();
+
+      const cursor = sql.exec(query!.sql, ...query!.params);
+      const rows = cursor.toArray() as { created_at: number }[];
+      // A full page, from the right end of the table, at the same cost as
+      // the first page.
+      expect(rows).toHaveLength(20);
+      expect(Math.max(...rows.map((r) => r.created_at))).toBeLessThanOrEqual(until);
+      expect(cursor.rowsRead).toBe(TAG_ROWS_READ_PER_MATCH * tagScanLimit(20));
+    });
+  });
+
   it("splits a multi-kind filter instead of sorting the table for it", async () => {
     // An index can only serve the sort when every key column ahead of
     // created_at is pinned to ONE value, and `kind IN (1, 7)` pins
@@ -239,7 +379,7 @@ describe("rows read by query shape", () => {
     });
   });
 
-  it("costs estimateRowsWritten24h the size of the 24h window, not the size of the table", async () => {
+  it("costs estimateRowsWrittenSince the size of the 24h window, not the size of the table", async () => {
     // The last line of the fixed daily floor, removed in two steps, and
     // both steps are measured here against the same rows in the same
     // Durable Object so the before/after in CLAUDE.md "The budget" is a
@@ -474,11 +614,11 @@ describe("read attribution", () => {
     expect(byPath.get("req")?.rowsRead ?? 0).toBeGreaterThan(0);
     expect(byPath.get("req")?.rowsRead ?? 0).toBeLessThan(EVENTS);
 
-    // estimateRowsWritten24h reports separately from the getStats call
+    // estimateRowsWrittenSince reports separately from the getStats call
     // that invoked it -- the whole reason it declares its own scope. It
     // no longer touches `event_tags` at all, so its bucket must now sit
     // at or below E rather than above E + T.
-    expect(byPath.get("estimateRowsWritten24h")?.rowsRead ?? 0).toBeLessThanOrEqual(EVENTS + 1);
+    expect(byPath.get("estimateRowsWrittenSince")?.rowsRead ?? 0).toBeLessThanOrEqual(EVENTS + 1);
     expect(byPath.get("getStats")?.rowsRead ?? 0).toBeGreaterThan(0);
 
     expect(snapshot.totalRowsRead).toBeGreaterThan(0);
@@ -562,65 +702,6 @@ describe("read attribution", () => {
     // by nothing else -- in particular not by how often anyone loads the
     // page, which is exactly what set the rate before.
     expect(row?.computedAt).toBeGreaterThan(0);
-  });
-
-  it("counts replacements as R, and projects the table size at which that path alone hits the ceiling", async () => {
-    // R is the number the event_tags-delete decision turns on (see the
-    // comment on storage.ts deleteEventRow). The per-call cost is known
-    // and measured; how OFTEN it is paid is not, and estimating it lands
-    // on a range spanning the point where this path overtakes the cron
-    // floor -- so it is counted rather than guessed.
-    await runInDurableObject(stub(), async () => resetReadMetrics());
-    const now = Math.floor(Date.now() / 1000);
-
-    // kind 10003 (NIP-51 bookmarks): replaceable, special-cased nowhere in
-    // relay.ts, and touched by no other test in this file -- which matters
-    // because this file deliberately shares one Durable Object across its
-    // tests, so two of them contending for the same replaceable address
-    // would make whichever ran second depend on the first one's
-    // timestamps.
-    const conn = await connectRelay();
-    conn.send(["EVENT", signEvent(OWNER_SECRET_KEY_HEX, { kind: 10003, content: "", created_at: now })]);
-    await conn.nextMessage();
-    // Only this second one supersedes an existing version, so only this
-    // one is a replacement.
-    conn.send([
-      "EVENT",
-      signEvent(OWNER_SECRET_KEY_HEX, { kind: 10003, content: "again", created_at: now + 10 }),
-    ]);
-    await conn.nextMessage();
-    conn.close();
-
-    const snapshot = await runInDurableObject(stub(), async () => readMetricsSnapshot());
-    expect(snapshot.replacements.count).toBe(1);
-    // Under MIN_SAMPLE_MS of uptime the rate is deliberately null rather
-    // than one replacement multiplied by 1,440.
-    if (snapshot.replacements.projected24h !== null) {
-      expect(snapshot.replacements.ceilingAtEvents).not.toBeNull();
-    }
-  });
-
-  it("does not count an operator deletion as R", async () => {
-    // NIP-09/NIP-62/NIP-86 deletions reach the same unindexed DELETE and
-    // pay the same per-call cost, but they happen at operator pace rather
-    // than on the per-event drumbeat R measures. Folding them in would
-    // inflate exactly the number the fix decision turns on.
-    await runInDurableObject(stub(), async () => resetReadMetrics());
-    const now = Math.floor(Date.now() / 1000);
-
-    const conn = await connectRelay();
-    const note = signEvent(OWNER_SECRET_KEY_HEX, { kind: 1, content: "to delete", created_at: now });
-    conn.send(["EVENT", note]);
-    await conn.nextMessage();
-    conn.send([
-      "EVENT",
-      signEvent(OWNER_SECRET_KEY_HEX, { kind: 5, tags: [["e", note.id]], created_at: now + 1 }),
-    ]);
-    await conn.nextMessage();
-    conn.close();
-
-    const snapshot = await runInDurableObject(stub(), async () => readMetricsSnapshot());
-    expect(snapshot.replacements.count).toBe(0);
   });
 
   it("bills a replaceable replacement to the write path, now at index-seek cost", async () => {
