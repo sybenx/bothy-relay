@@ -19,8 +19,11 @@
 import { env } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import { initSchema, reconcileColumns, TABLES, type TableSpec } from "../src/schema";
+import { eventRowCost, initSchema, reconcileColumns, TABLES, type TableSpec } from "../src/schema";
+import { estimateRowsWritten24h } from "../src/storage";
+import { refreshProfile } from "../src/ownership";
 import { isolateStorage } from "./helpers/isolate";
+import { OWNER_PUBKEY_HEX } from "./helpers/keys";
 
 isolateStorage();
 
@@ -191,7 +194,14 @@ describe("initSchema against historical table shapes", () => {
       label: "pre-v0.3.1, before ingested_at",
       create: `CREATE TABLE events (id TEXT PRIMARY KEY, pubkey TEXT NOT NULL, created_at INTEGER NOT NULL, kind INTEGER NOT NULL, tags TEXT NOT NULL, content TEXT NOT NULL, sig TEXT NOT NULL, expiration INTEGER)`,
       seed: `INSERT INTO events (id, pubkey, created_at, kind, tags, content, sig) VALUES ('e1', 'p1', 100, 1, '[]', 'hi', 's1')`,
-      expectAdded: ["ingested_at"],
+      expectAdded: ["ingested_at", "row_cost"],
+    },
+    {
+      table: "events",
+      label: "pre-v0.7.2, before row_cost",
+      create: `CREATE TABLE events (id TEXT PRIMARY KEY, pubkey TEXT NOT NULL, created_at INTEGER NOT NULL, kind INTEGER NOT NULL, tags TEXT NOT NULL, content TEXT NOT NULL, sig TEXT NOT NULL, expiration INTEGER, ingested_at INTEGER)`,
+      seed: `INSERT INTO events (id, pubkey, created_at, kind, tags, content, sig, ingested_at) VALUES ('e1', 'p1', 100, 1, '[]', 'hi', 's1', 100)`,
+      expectAdded: ["row_cost"],
     },
     {
       table: "backfill_relays",
@@ -248,6 +258,41 @@ describe("initSchema against historical table shapes", () => {
     });
   });
 
+  it("re-derives `about` once profile_synced_at already predates it (the owner.about production gap)", async () => {
+    // owner.about was added to CREATE TABLE well after profile_synced_at
+    // and icon_refreshed_at already existed on deployed relays, so it
+    // landed NULL with profile_synced_at already non-null and no newer
+    // kind-0 to trigger refreshProfile's re-parse. Reproduce exactly that:
+    // an owner row with the pre-about columns already populated from a
+    // real cron run, a locally-stored kind-0 whose created_at is not
+    // newer than profile_synced_at, and about missing from the table.
+    await withSql((sql) => {
+      sql.exec(`DROP TABLE owner`);
+      sql.exec(
+        `CREATE TABLE owner (pubkey TEXT NOT NULL, name TEXT, picture TEXT, profile_synced_at INTEGER, icon_refreshed_at INTEGER)`,
+      );
+      sql.exec(
+        `INSERT INTO owner (pubkey, name, picture, profile_synced_at, icon_refreshed_at) VALUES (?, 'Aaro', 'https://example.com/a.png', 1000, 1000)`,
+        OWNER_PUBKEY_HEX,
+      );
+      sql.exec(
+        `INSERT INTO events (id, pubkey, created_at, kind, tags, content, sig) VALUES ('e1', ?, 1000, 0, '[]', ?, 's1')`,
+        OWNER_PUBKEY_HEX,
+        JSON.stringify({ name: "Aaro", picture: "https://example.com/a.png", about: "Aaro's relay" }),
+      );
+
+      initSchema(sql);
+      // icon_refreshed_at gates refreshProfile's whole body to at most
+      // once/day (ownership.ts), so `now` has to clear that window too --
+      // not just be newer than the kind-0's created_at -- or the re-parse
+      // this test exists to prove never runs at all.
+      refreshProfile(sql, env as unknown as Env, 1000 + 86400 + 1);
+
+      const row = sql.exec(`SELECT about FROM owner LIMIT 1`).toArray()[0] as { about: string | null };
+      expect(row.about).toBe("Aaro's relay");
+    });
+  });
+
   it("creates every declared table and column on a fresh database", async () => {
     await withSql((sql) => {
       for (const spec of TABLES) {
@@ -297,6 +342,45 @@ describe("initSchema against historical table shapes", () => {
       for (const spec of TABLES) {
         expect(columnsOf(sql, spec.name).sort()).toEqual(spec.columns.map((c) => c.name).sort());
       }
+    });
+  });
+});
+
+// The one behaviour `row_cost` shares with `ingested_at`: rows written
+// before the column existed carry NULL, and are simply absent from the
+// SUM. Documented in schema.ts and asserted here because it is a real
+// undercount with a real duration -- at most the one 24h window
+// straddling an upgrade -- and because the alternative, backfilling the
+// column from a guess, is exactly how this project got rows-written
+// accounting wrong by 45x the first time.
+describe("row_cost across the migration boundary", () => {
+  it("omits pre-migration rows from the 24h estimate rather than inventing a cost for them", async () => {
+    const stub = env.RELAY.get(env.RELAY.idFromName("relay"));
+    await runInDurableObject(stub, async (_instance, state) => {
+      const sql = state.storage.sql;
+      const now = Math.floor(Date.now() / 1000);
+
+      // A row as an older deployment left it: ingested inside the window,
+      // but with no row_cost, because the column did not exist when it
+      // was written.
+      sql.exec(
+        `INSERT INTO events (id, pubkey, created_at, kind, tags, content, sig, expiration, ingested_at)
+         VALUES ('legacy', 'p1', ?, 1, '[]', 'x', 's', NULL, ?)`,
+        now,
+        now,
+      );
+      expect(estimateRowsWritten24h(sql, now - 86400)).toBe(0);
+
+      // A row written by the current code counts in full, so the estimate
+      // becomes exact again as the legacy rows age out of the window.
+      sql.exec(
+        `INSERT INTO events (id, pubkey, created_at, kind, tags, content, sig, expiration, ingested_at, row_cost)
+         VALUES ('current', 'p1', ?, 1, '[]', 'x', 's', NULL, ?, ?)`,
+        now,
+        now,
+        eventRowCost(0),
+      );
+      expect(estimateRowsWritten24h(sql, now - 86400)).toBe(eventRowCost(0));
     });
   });
 });
