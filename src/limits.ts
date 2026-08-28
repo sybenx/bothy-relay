@@ -250,13 +250,76 @@ export function secondsUntilUtcMidnight(nowMs: number): number {
 // it rather than picked.
 export const DAILY_ROWS_READ_LIMIT = 5_000_000;
 
-// The most one REQ filter may read. A five-hundredth of the daily
-// ceiling: it takes 500 filters at the cap to spend a day's budget,
-// against the 125 it took before this guard existed. Not a ceiling on
-// what a connection can spend over time -- the per-IP message throttle in
-// relay.ts is what bounds that -- only on what any single filter can cost
-// in one go.
+// The most one REQ may read. A five-hundredth of the daily ceiling: it
+// takes 500 REQ frames at the cap to spend a day's budget, against the
+// 125 it took before this guard existed.
+//
+// It says REQ and it now means REQ. For a long time it was enforced per
+// FILTER while reading as though it were per message, and a REQ frame may
+// carry any number of filters -- so one message could stack this cap as
+// many times as fit in 1MiB while the per-IP throttle in relay.ts counted
+// the message once. Measured before the fix: a REQ carrying 200 filters
+// was answered with EOSE, having run all 200, and ~540 of them fit in the
+// 16KiB the connection state can hold -- a single frame able to ask for
+// the whole day's rows-read allowance.
+//
+// relay.ts handleReqInner divides this figure by the number of filters in
+// the frame and passes each one a share (boundFilter's `budget`
+// parameter), so the frame as a whole stays inside it. The common
+// single-filter REQ gets the whole cap and is unaffected.
+//
+// Still not a ceiling on what a connection can spend over TIME. The
+// per-IP message throttle (relay.ts RATE_LIMIT_MAX_MESSAGES: 50 per 10s)
+// is the only thing bounding that, and 5 REQs/second at this cap is
+// 50,000 rows/second -- the daily ceiling in 100 seconds from one
+// address. Nothing here closes that; it would take a per-connection
+// rows-read budget, which this relay does not have.
 export const MAX_FILTER_ROWS_READ = DAILY_ROWS_READ_LIMIT / 500;
+
+// Filters one REQ frame may carry.
+//
+// NIP-01 puts no bound on the count ("REQ messages may contain multiple
+// filter objects", nips/01.md) and neither did this relay, so one
+// message could carry as many filters as fit in a WebSocket frame --
+// each independently admitted at up to MAX_FILTER_ROWS_READ, while the
+// per-IP throttle in relay.ts counted the message as one. Measured
+// before this cap: a single REQ carrying 200 filters was answered with
+// EOSE.
+//
+// Ten rather than a derived number, because there is nothing to derive
+// it from: no index cost or row count says how many filters a client
+// ought to send. It matches MAX_SUBSCRIPTIONS_PER_CONNECTION for the
+// reason those two numbers describe the same thing from either end --
+// how much concurrent read work one connection may have outstanding --
+// and it is comfortably above what real clients send (NIP-01 REQs in the
+// wild carry one to five).
+//
+// It is not what bounds the rows a REQ may read -- MAX_FILTER_ROWS_READ
+// above is, shared out across however many filters arrive. What this
+// bounds is the share getting so thin that every filter in the frame is
+// clamped to uselessness, and the statement count behind them.
+export const MAX_FILTERS_PER_REQ = 10;
+
+// Bytes of serialized connection state (relay.ts ConnState: every open
+// subscription's filters, plus the ip/host/challenge/authedPubkey beside
+// them) a connection may hold.
+//
+// Not a budget cap like the rest of this file -- a platform one.
+// Subscriptions are persisted in the WebSocket attachment so they survive
+// hibernation, and `serializeAttachment` THROWS above 16KiB
+// (developers.cloudflare.com/durable-objects/api/websockets/, checked
+// 2026-08-28). Nothing checked, so a REQ whose filters serialized past it
+// -- an ordinary `{"authors":[<400 keys>],"kinds":[1]}` is ~26KB, and
+// every cap in this file admitted it -- threw inside webSocketMessage
+// after the query had run: no CLOSED, no NOTICE, an uncaught exception in
+// the Durable Object and a client left waiting on a reply that was never
+// coming.
+//
+// Set below the real ceiling, not at it. The check happens before the
+// state is stored, and what is stored also carries the challenge, the
+// host and the authenticated pubkey; leaving a margin means a REQ that
+// passes cannot be defeated by a later AUTH pushing the same state over.
+export const MAX_CONN_STATE_BYTES = 15 * 1024;
 
 // Rows read per row returned by an ordered index scan: the index entry,
 // then the table row it points at. Measured (test/read-cost.test.ts), not
@@ -280,6 +343,32 @@ const ROWS_READ_PER_MATCH = 2;
 // (2 x values) plus the outer key lookups (2), which is what this
 // bounds.
 export const TAG_ROWS_READ_PER_MATCH = 4;
+
+// Queries one filter may be expanded into -- filters.ts expandFilter's
+// `authors` x `kinds` cross-product, capped independently of what those
+// queries are estimated to READ.
+//
+// Independently, because the two are not the same quantity and pricing
+// alone cannot bound the second. filterReadCost below returns the
+// CHEAPEST access path, and a filter naming ids has a cheap one: seeking
+// n ids costs n rows however many statements it takes. Before this cap,
+// `{"ids":[<one id>],"authors":[<5,000 keys>]}` priced at 1 row and read
+// 5,000 across 5,000 statements in 71ms of Durable Object time, while
+// the identical filter without the single id was refused as too broad at
+// any limit. One 64-hex string turned a refused filter into a free one.
+//
+// Fixing the price (it is now combinations x ids.length) closes the
+// mispricing but not the shape: statements cost CPU whether or not they
+// read rows, and rows-read pricing cannot see that. So the query count
+// gets its own ceiling.
+//
+// Derived rather than picked, and deliberately set to the bound the
+// index path already implied: an index-served filter at a limit of 1
+// costs combinations x (ROWS_READ_PER_MATCH + 1) rows, so anything above
+// MAX_FILTER_ROWS_READ / 3 combinations was already refused at every
+// limit. This changes nothing for filters an index serves -- it makes
+// the same ceiling apply to the one access path that was escaping it.
+export const MAX_FILTER_COMBINATIONS = Math.floor(MAX_FILTER_ROWS_READ / (ROWS_READ_PER_MATCH + 1));
 
 // Which filter field pins which indexed column to a value.
 //
@@ -320,29 +409,18 @@ export function filterReadCost(filter: Filter): FilterReadCost | null {
   const limit = filter.limit ?? MAX_FILTER_LIMIT;
   const candidates: FilterReadCost[] = [];
 
-  // The primary key. `id TEXT PRIMARY KEY` is a unique index, so an
-  // `ids` filter is one seek per id and needs no ordering at all -- the
-  // rows it can return are already bounded by how many ids were named.
-  if (filter.ids !== undefined && filter.ids.length > 0) {
-    candidates.push({ rowsRead: filter.ids.length, via: "events primary key" });
-  }
-
-  // Tag conditions are handled after the access paths below, because
-  // they are not an access path. See the block above `return` at the
-  // bottom of this function.
-
-  // The ordered indexes on `events`. An index qualifies when every one
-  // of its key columns is pinned by the filter at all -- once
-  // filters.ts expandFilter has split the filter, each of those columns
-  // holds exactly one value in every query that actually runs.
+  // How many queries filters.ts expandFilter will run for this filter.
+  // Hoisted above every access path below because EVERY path pays it:
+  // the expansion happens before storage sees the filter at all, so each
+  // sub-filter carries the whole of the rest of the filter with it.
   //
-  // `combinations` is the number of queries filters.ts expandFilter will
-  // run, NOT the product of the chosen index's own key columns, and that
-  // distinction is a correctness condition rather than a nicety. A filter
-  // naming one author and two kinds runs TWO queries whichever index
-  // serves them; pricing it from idx_events_pubkey_created's single key
-  // column called it one query and understated the cost by half, which a
-  // test caught and reading did not.
+  // It used to be computed further down, where only the index paths
+  // could see it, and the `ids` path below was priced as though the
+  // filter were run once. It is not run once. `{"ids":[<one id>],
+  // "authors":[<5,000 keys>]}` was priced at 1 row and read 5,000, one
+  // per statement -- while dropping the single id from that same filter
+  // made it 5,005,000 and refused it. Whichever path prices cheapest,
+  // the query count is the same, so it belongs to all of them.
   //
   // Counted arithmetically rather than as `expandFilter(filter).length`.
   // Same number -- expandFilterCount and expandFilter are asserted equal
@@ -354,6 +432,32 @@ export function filterReadCost(filter: Filter): FilterReadCost | null {
   // objects to discover that a filter is too expensive to run, which is a
   // cheap denial of service against the guard that exists to prevent one.
   const combinations = expandFilterCount(filter);
+
+  // The primary key. `id TEXT PRIMARY KEY` is a unique index, so an
+  // `ids` filter is one seek per id and needs no ordering at all -- the
+  // rows it can return are already bounded by how many ids were named.
+  // Times `combinations`, because each of the expanded queries carries
+  // the same `id IN (...)` list and seeks every one of them again.
+  if (filter.ids !== undefined && filter.ids.length > 0) {
+    candidates.push({ rowsRead: combinations * filter.ids.length, via: "events primary key" });
+  }
+
+  // Tag conditions are handled after the access paths below, because
+  // they are not an access path. See the block above `return` at the
+  // bottom of this function.
+
+  // The ordered indexes on `events`. An index qualifies when every one
+  // of its key columns is pinned by the filter at all -- once
+  // filters.ts expandFilter has split the filter, each of those columns
+  // holds exactly one value in every query that actually runs.
+  //
+  // `combinations` (hoisted above) is the number of queries filters.ts
+  // expandFilter will run, NOT the product of the chosen index's own key
+  // columns, and that distinction is a correctness condition rather than
+  // a nicety. A filter naming one author and two kinds runs TWO queries
+  // whichever index serves them; pricing it from
+  // idx_events_pubkey_created's single key column called it one query and
+  // understated the cost by half, which a test caught and reading did not.
   for (const index of indexesOn("events")) {
     const qualifies = index.keyColumns.every((column) => {
       const values = PINS[column]?.(filter);
@@ -432,7 +536,32 @@ export type FilterBound =
 // refusing it. Refusal is reserved for the two cases no limit can fix:
 // a filter no index can serve at all, and one whose combination count
 // alone puts it over the cap at a limit of 1.
-export function boundFilter(filter: Filter): FilterBound {
+//
+// `budget` defaults to MAX_FILTER_ROWS_READ -- one filter alone gets the
+// whole of it -- and relay.ts handleReqInner passes a SHARE of it when a
+// REQ carries several, so the frame as a whole stays inside the number
+// this file has always claimed for it. Divided equally rather than spent
+// first-come, so the answer does not depend on the order the client
+// happened to write its filters in.
+export function boundFilter(filter: Filter, budget: number = MAX_FILTER_ROWS_READ): FilterBound {
+  // The query count, refused ahead of the cost model rather than through
+  // it. filterReadCost prices the cheapest access path, and the cheapest
+  // path can be cheap in rows while still being thousands of statements
+  // -- see MAX_FILTER_COMBINATIONS. Statements cost Durable Object CPU
+  // whether or not they read anything, and a lowered `limit` does not
+  // remove one of them, so this belongs before the halving loop rather
+  // than inside it.
+  const combinations = expandFilterCount(filter);
+  if (combinations > MAX_FILTER_COMBINATIONS) {
+    return {
+      ok: false,
+      reason:
+        `invalid: filter expands to ${combinations} queries, over the ` +
+        `${MAX_FILTER_COMBINATIONS} limit; name fewer authors x kinds combinations ` +
+        `and split it across several REQs`,
+    };
+  }
+
   const requested = filter.limit === undefined ? MAX_FILTER_LIMIT : Math.min(filter.limit, MAX_FILTER_LIMIT);
 
   // Halving rather than solving for the largest affordable limit
@@ -453,20 +582,21 @@ export function boundFilter(filter: Filter): FilterBound {
           "since/until alone would scan the whole table",
       };
     }
-    if (cost.rowsRead <= MAX_FILTER_ROWS_READ) return { ok: true, filter: candidate, cost };
+    if (cost.rowsRead <= budget) return { ok: true, filter: candidate, cost };
   }
 
   // Reached only when the cost does not fall with the limit. Two shapes
   // do that: a cross-product of `authors` x `kinds` large enough that
   // even one row each is too many, and an `ids` list long enough that
   // seeking every id exceeds the cap on its own (an `ids` seek costs one
-  // row per id no matter how few of them the client says it wants back).
+  // row per id, times the combination count, no matter how few of them
+  // the client says it wants back).
   // The message names both rather than guessing which one applies, since
   // guessing wrong sends the client to fix the field that was fine.
   return {
     ok: false,
     reason:
-      `invalid: filter is too broad to answer within ${MAX_FILTER_ROWS_READ} rows read ` +
+      `invalid: filter is too broad to answer within ${budget} rows read ` +
       `at any limit; name fewer ids, or fewer authors x kinds combinations, ` +
       `and split it across several REQs`,
   };
@@ -610,9 +740,32 @@ const GIFT_WRAP_STORAGE_SHARE = STORAGE_BYTES_LIMIT / 40;
 //
 // New gift wraps are refused once reached; the owner deleting old ones
 // (or vanishing them) frees room.
+//
+// Bounded by MAX_FILTER_ROWS_READ as well as by the storage share, and
+// the second bound is a READ cost sitting on a write-path cap, which
+// needs saying. Gift wraps are omitted from an unauthenticated read
+// rather than refused (filters.ts excludeGiftWraps), and omitting a row
+// still costs reading it: an `authors`-pinned filter naming a pubkey
+// that authored nothing but gift wraps reads past every one of them to
+// reach the first event it may return. Measured at a 2,000-wrap inbox:
+// 41 rows without the exclusion, 2,002 with it. So the inbox count is
+// the ceiling on that skip, which makes it a per-filter read cost, which
+// makes MAX_FILTER_ROWS_READ the number it has to fit inside -- or the
+// read guard would be stating a bound the storage cap could lift it past.
+//
+// It binds only where an operator has lowered MAX_EVENT_BYTES below
+// ~26KB; at the default the storage share already yields 2,048, well
+// under this. Divided by ROWS_READ_PER_MATCH because each skipped wrap
+// costs the index entry and the table row behind it.
 export function maxGiftWraps(env: Env): number {
   const perEventBytes = maxEventBytes(env) ?? MAX_EVENT_BYTES;
-  return Math.max(1, Math.floor(GIFT_WRAP_STORAGE_SHARE / perEventBytes));
+  return Math.max(
+    1,
+    Math.min(
+      Math.floor(MAX_FILTER_ROWS_READ / ROWS_READ_PER_MATCH),
+      Math.floor(GIFT_WRAP_STORAGE_SHARE / perEventBytes),
+    ),
+  );
 }
 
 // Cloudflare Workers Free's daily rows-written ceiling (CLAUDE.md "The
@@ -663,102 +816,48 @@ export const MAX_CREATED_AT_FUTURE_SECONDS = 3600;
 // With nothing left that walked a table, `stats_snapshot`, this constant,
 // relay.ts refreshStatsSnapshot and its cron call were a mechanism
 // rationing a cost that no longer existed, and were removed together.
-// LIVE_STATS_MAX_AGE_MS below is the one stats cap left, over the two
-// figures that genuinely cannot be maintained.
 //
 // The general lesson, since this file is where costs get priced: a TTL
 // over an expensive read is a bound on how often you pay it, not on what
 // it costs, and it survives only as long as nobody can make the read
 // cheap. Reach for the counter first and the clock second.
 
-// How stale /api/stats' LIVE half may get -- `ingested24h` and
-// `rowsWrittenToday`, the two windowed scans left over once the
-// `stats_snapshot` half was moved into a row (schema.ts
-// `live_stats`, storage.ts computeLiveStats, relay.ts refreshLiveStats).
+// A second stats cap lived here after that one, LIVE_STATS_MAX_AGE_MS,
+// bounding how stale the other half of /api/stats could get:
+// `ingested24h` and `rowsWrittenToday`, the two windowed scans left when
+// the counts that walked a table became counters. It is gone too, and it
+// went the same way, one release later.
 //
-// A separate constant from the one above, not a reuse of it, and the
-// separation is the point. Six hours is fine for a total event count and
-// is far too stale for the write-budget meter, which is the one number on
-// this page an operator reads while deciding whether the relay is out of
-// allowance or actually broken. These two figures wanted to stay live for
-// that reason and did, until it turned out what "live" cost.
+// It guarded ~1,200 rows per refresh -- both figures seek
+// idx_events_ingested, so neither scaled with E, but both scaled with the
+// ingest WINDOW, and GET /api/stats is unauthenticated with nothing in
+// front of it. ~4,100 requests took the whole 5,000,000 rows-read/day
+// allowance, from anywhere, at no cost to the caller. Five minutes was
+// the arithmetic that bounded the recompute rate at 288/day however many
+// requests arrived, chosen against
 //
-// WHAT IT COSTS, and why a cache rather than a freshness preference. Both
-// queries read the ingest window via idx_events_ingested, so neither
-// scales with E -- measured on the live relay at 853 rows
-// (countIngested24h) plus 344 (estimateRowsWrittenSince), ~1,200 per
-// request with the ~11 rows of lookups beside them. GET /api/stats is
-// unauthenticated, reachable before anything gates it, and was billed
-// per request: ~4,100 requests took the 5,000,000 rows-read/day
-// allowance for the rest of the UTC day, from anywhere, at no cost to
-// the caller. That is the same shape as the gift wrap gate probe -- an
-// expensive read on the far side of no gate -- and the fix, where a
-// figure cannot simply be maintained, is to bound the RATE at which the
-// expensive thing runs so the request count stops being what sets it.
+//   flood floor = (86,400 / T) x 1.5D   (D = events ingested per day)
 //
-// A ROW, NOT MEMORY, and the reasoning is worth stating because the
-// obvious argument points the other way: hibernation clears memory, but a
-// flood keeps the object awake, so an in-memory cache would hit exactly
-// during the flood it exists to survive. That is true and it is not
-// enough. A flood is not the cheapest way to spend this budget -- pacing
-// requests slower than eviction is, and it defeats a memory cache
-// completely: at one request every ten seconds, 8,640 requests/day x
-// ~1,200 rows is 10,400,000 rows, twice the ceiling, from a single host
-// making six requests a minute. Storage is the only state in this object
-// that outlives eviction, so the bound has to live there or it is a
-// description of an intention. The `stats_snapshot` cache this file
-// used to declare a TTL for learned that the expensive way, by shipping
-// an in-memory cache first that measurement showed essentially never
-// hit; this is the same lesson applied before rather than after.
+// which at T = 60s admits only D <= 2,315 events/day and at T = 300s
+// admits D <= 11,574 -- above anything the 100,000 rows-written ceiling
+// lets this relay ingest.
 //
-// WHY FIVE MINUTES. A refresh does not cost a constant -- both queries
-// read the ingest window, so one costs roughly 1.5 x D, where D is
-// events ingested per day. The flood floor is therefore
-// (86,400 / T) x 1.5D rows/day, and asking that to stay under the
-// 5,000,000 ceiling gives the admissible D for a given T:
-//
-//   T =  60s   1,440 refreshes/day    D <=  2,315 events/day
-//   T = 300s     288 refreshes/day    D <= 11,574 events/day
-//   T = 600s     144 refreshes/day    D <= 23,148 events/day
-//
-// One minute is the interval the freshness argument alone would pick, and
-// it fails the arithmetic: a relay running a backfill ingests far more
-// than 2,315 events/day -- the 100,000 rows-written ceiling alone admits
-// ~16,600 at the cheapest 6 rows each -- so a 60-second TTL would put the
-// floor back over the ceiling on exactly the busy days the meter is being
-// watched. Five minutes holds for any ingest rate this relay can reach
-// while writing, and costs ~8.6% of the read ceiling at the live relay's
-// ingest rate even under a sustained flood.
-//
-// Five minutes is also finer than the thing it measures. During a
-// backfill `rowsWrittenToday` moves in hourly steps, because backfill
-// writes on the hourly cron tick; live traffic moves it continuously but
-// slowly. /api/stats reports `liveAt` beside these two so their age is
-// stated rather than implied -- and it is now the ONLY age on that
-// document, since every other field is either current or a maintained
-// counter.
-//
-// Refreshed ONLY on demand, deliberately -- the cron tick does not
-// refresh this. The tick fires hourly, which is
-// longer than this TTL, so it could not keep the row warm; all it would
-// add is a fixed 24-refresh/day floor paid on a relay nobody is looking
-// at.
-//
-// THE NEXT STEP, if this stops being enough: hourly bucket counters --
-// one row written per event into a per-hour bucket, and a windowed sum
-// that reads at most 24 rows. That makes a figure cheap outright rather
-// than cheap-on-average, and removes the staleness with it.
-//
-// That shape now exists: `events24h` is exactly it (schema.ts
-// `event_hour_counts`), and it retired the six-hour cache these two used
-// to sit beside. It has not been applied HERE because these two are
-// harder than `events24h` was, not because it was forgotten.
-// `ingested24h` would need a second bucket table keyed by ingest time --
-// a third row written per event, for a diagnostic -- and
+// Both figures are hourly bucket counters now (schema.ts
+// `ingest_hour_counts`), keyed by ingest time and read as at most 25 rows
+// in one statement. That was named in this file as THE NEXT STEP if the
+// TTL stopped being enough, with the caveat that these two were harder
+// than `events24h`: `ingested24h` would want its own bucket table, and
 // `rowsWrittenToday` is a sum over a window that empties at 00:00 UTC,
-// which no per-event increment expresses. So these two stay cached, and
-// the bucket tables stay where the arithmetic actually paid for them.
-export const LIVE_STATS_MAX_AGE_MS = 5 * 60 * 1000;
+// which no per-event increment expresses. Both objections dissolved in
+// the same table: one bucket row per ingest hour carries both figures, so
+// the "third row written per event" is the same row as the second, and a
+// UTC day boundary falls on a whole hour, so the reset is a range start
+// rather than something a counter has to express.
+//
+// So the lesson above got its second demonstration in two releases, which
+// is why it is stated as a rule rather than as a story: reach for the
+// counter first and the clock second. There is no stats cache left, and
+// nothing on /api/stats answers to a clock.
 
 // Backfill must yield to the owner's own live
 // traffic, never compete with it for the shared daily rows-written

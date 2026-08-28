@@ -9,7 +9,7 @@ A single-user nostr relay that deploys in one click and runs on the Cloudflare W
 - WebSocket Hibernation API throughout (`acceptWebSocket`, `webSocketMessage`/`webSocketClose`/`alarm`), `setWebSocketAutoResponse` for ping/pong. The Durable Object must never open an outbound connection — doing so breaks hibernation. The Worker owns every outbound connection (claim-time profile lookup, backfill fetches) on the DO's behalf.
 - TOFU ownership: unclaimed until `POST /api/claim` binds a pubkey, permanently, with no signature required (`OWNER_PUBKEY` env var skips this and disables the endpoint). Every event is still signature-verified regardless of owner.
 - Writes are owner-gated, with two exceptions: `ALLOW_FOLLOWS` (opt-out, on unless set to `"false"`) also accepts the owner's kind-3 follow list (cached from the owner's own stored contact list, refreshed immediately when the owner publishes a new one to this relay, with hourly cron as the fallback for when it arrived some other way — never fetched per event); kind-1059 gift wraps (NIP-59) are accepted from anyone, p-tag-addressed to the owner, gated by their own storage cap and per-IP throttle on top of the general write caps below. [docs/rungs.md](docs/rungs.md) describes this kind of escalation generically, in terms of who may write and what bounds the volume — bothy implements rung 3 (follows may write) with kind-1059 gift wraps layered in as an instance of rung 2 (addressed mail).
-- Gift wrap reads require NIP-42 AUTH as the p-tagged recipient. The gate re-runs the filter restricted to `kinds: [1059]` against real storage rather than pattern-matching the filter shape.
+- Gift wrap reads require NIP-42 AUTH as the p-tagged recipient, and the gate is **omission, not refusal**: a filter naming kind 1059 is refused from `f.kinds` alone with no storage access, and a filter that names no `kinds` is answered normally with the kind-1059 rows dropped from the query (`filters.ts excludeGiftWraps`). It used to decide by probing storage — re-run the filter restricted to 1059, refuse if anything came back — and that made the refusal itself the answer: an unauthenticated `{"#p":[owner],"since":S,"until":U,"limit":1}` said `auth-required` when a wrap fell inside the window and `EOSE` when none did, so bisecting since/until yielded exact arrival windows and an exact inbox count without ever naming 1059. Refusal leaks; omission does not. In SQL and never in memory afterwards, because a client asking for 20 and receiving 8 has counted the wraps in its own window.
 - NIP-09 deletion and NIP-62 vanish requests both tombstone ids (`deleted_ids`) so a deleted event — gift wraps especially, since the sender keeps their own signed copy — can't be replayed back into storage.
 - Live feed (`/live`) is a separate, unauthenticated, push-only WebSocket channel for the admin page, capped at 5 concurrent connections and a 10-minute server-enforced lifetime (DO alarm). Never sends gift wraps or event content, only kind/time/truncated id.
 - NIP-86 relay management API: `banevent`/`allowevent`/`listbannedevents`, `banpubkey`/`unbanpubkey`/`listbannedpubkeys`, `allowpubkey`/`unallowpubkey`/`listallowedpubkeys`, `blockip`/`unblockip`/`listblockedips`, and `changerelayname`/`changerelaydescription`/`changerelayicon`, plus `supportedmethods`. Authenticated by a NIP-98 event ([src/nip98.ts](src/nip98.ts)) signed by the owner, with the `payload` tag required rather than optional; verification runs in the Worker so a forged request costs no DO time, and storage mutations go to the DO by RPC (`Relay.manage`). Phase one shipped only the methods that cost nothing on the per-event write path; phase two (`banpubkey`/`allowpubkey`) is the one addition that does, landed only once a metrics baseline existed to compare against — see CLAUDE.md "The budget". The kind allowlist methods answer with an explanation rather than a generic unknown-method error, since bothy stores every kind deliberately.
@@ -58,26 +58,64 @@ which carry about five single-letter tags each).
 ### Rows written, per stored event
 
 ```
-8 + 3 × (single-letter tag count)
+9 + 3 × (single-letter tag count)
 ```
 
 Six for the event row: one base row, one for the implicit unique index behind
 `id TEXT PRIMARY KEY` (a TEXT primary key is not a rowid alias), and one for each
-of the four declared indexes on `events`. Two more for the maintained counters
-(`maintained_counts` and `event_hour_counts`, both unindexed or rowid-aliased, so one
-row apiece). Three per indexed tag row: the row and its two indexes. A bare note
-costs 8, a reply carrying `#e` and `#p` costs 14, a real note carrying about five
-tags costs 23. A delete is a write too, so a replacement or a NIP-09 deletion
-costs this shape again, plus 2 for a tombstone.
+of the four declared indexes on `events`. Three more for the maintained counters
+(`maintained_counts`, `event_hour_counts` and `ingest_hour_counts`, all unindexed or
+rowid-aliased, so one row apiece). Three per indexed tag row: the row and its two
+indexes. A bare note costs 9, a reply carrying `#e` and `#p` costs 15, a real note
+carrying about five tags costs 24. A delete is a write too, so a replacement or a
+NIP-09 deletion costs this shape again, plus 2 for a tombstone.
 
-The two counter rows are the price of `/api/stats` no longer scanning the table
-to report `totalEvents` and `events24h` — 2 rows written per event against
-~1,100 events/day here, so ~2,200 of 100,000, to remove a ~3E read that grew
-without bound. `schema.ts EVENT_COUNTER_ROW_COST` declares it and `eventRowCost`
-folds it in, so backfill's page sizing, the vanish drain's pacing and the admin
-page's budget bar all see it; a counter cost paid at the write site but hidden
-from those guards would be the same shape of error that made
-`estimateRowsWrittenSince` wrong by 45x.
+The three counter rows are the price of `/api/stats` no longer scanning or
+sampling anything at all — 3 rows written per event against ~1,100 events/day
+here, so ~3,300 of 100,000, to remove a ~3E read that grew without bound
+(`totalEvents`, `events24h`) and two window scans behind a five-minute cache
+(`ingested24h`, `rowsWrittenToday`). `schema.ts EVENT_COUNTER_ROW_COST` declares
+it and `eventRowCost` folds it in, so backfill's page sizing, the vanish drain's
+pacing and the admin page's budget bar all see it; a counter cost paid at the
+write site but hidden from those guards would be the same shape of error that
+made `estimateRowsWrittenSince` wrong by 45x.
+
+The third row does double duty, and that is why it is affordable. It is the
+ingest-hour bucket behind `ingested24h`, and it is also where the **measured**
+rows-written total lands: `read-metrics.ts` wraps `SqlStorage` once in the Relay
+constructor, so every cursor's `rowsWritten` accumulates without any query being
+instrumented by hand, and `insertEventRow` folds the running total into the
+bucket UPDATE it was already issuing. Measuring what the relay writes therefore
+costs nothing on the path that dominates the budget. Only writes with no bucket
+of their own — cron ticks, the follow rebuild, NIP-86 calls — pay a row to land
+their total (`storage.ts settleRowsWritten`), on the order of thirty a day.
+
+A wrapper rather than per-path reporting, deliberately: a path that must remember
+to report is a path that will eventually forget, and nothing catches it. This
+codebase has that history — `BACKFILL_PAGE_SIZE` was hand-maintained and silently
+wrong three times. The wrapper can mis-attribute an hour; it cannot be forgotten.
+
+**Where the count lands is the correctness property.** The accumulator is
+instance memory, and this relay wakes ~70 times per cron interval, so a flush on
+a timer or one deferred to the next tick would lose roughly 98% of the count —
+and lose more of it the quieter the relay is, which is the failure mode nobody
+would notice. Every Durable Object entry point therefore lands its own total
+before returning (`relay.ts metered`).
+
+**Removals are accounted explicitly, on top of the wrapper.** `SqlStorageCursor`
+reports index maintenance on INSERT but not on DELETE, so a wrapper-only figure
+undercounts every removal, which is the wrong direction for a budget meter.
+`deleteEventRow` adds `eventRemovalBudget` — the pessimistic figure the vanish
+drain is already paced against — over what the cursor reported, accepting the
+double-count of the portion the cursor did see. Leaning high is the call
+`schema.ts` already made for the drain, and it is made here for the same reason.
+
+Prediction and measurement stay separate. `eventRowCost` answers "what will this
+cost" before doing it, which is what sizes backfill pages and paces the vanish
+drain; the wrapper answers "what did we spend". Neither feeds the other —
+`estimateRowsWrittenSince` survives as backfill's headroom guard alone, where
+seeing only event writes is correct, since deletion traffic is bounded by its own
+reserved share.
 
 `schema.ts eventRowCost` derives this from `INDEXES` rather than restating it, so
 adding an index updates the admin page, backfill's headroom guard and
@@ -88,19 +126,20 @@ insert time so `estimateRowsWrittenSince` can sum a column.
 
 | Path | Rows read |
 |---|---|
-| REQ filter, `ids` | 1 per id |
+| REQ filter, `ids` | 1 per id, × combinations |
 | REQ filter, `#<letter>` tag | ~2 per matching tag row |
 | REQ filter served by an index | combinations × (2 × limit + 1) |
-| Gift wrap gate probe, per filter, only when `kinds` is absent | 1–5 |
-| `estimateRowsWrittenSince` | bounded by today's ingest count, not E (`idx_events_ingested`) |
+| Gift wrap exclusion, tag-driven filter | 0 — bounded by the tag subquery's own LIMIT |
+| Gift wrap exclusion, `authors`-pinned filter with no `kinds` | up to the wraps that author holds, ≤ `maxGiftWraps` |
+| `estimateRowsWrittenSince` (backfill's headroom guard only) | bounded by today's ingest count, not E (`idx_events_ingested`) |
 | `totalEvents` + `followCount` (`readMaintainedCounts`) | 1 for the pair, maintained |
 | `events24h` (`countEvents24h`) | ≤ 26 bucket rows, maintained |
+| `ingested24h` + `rowsWrittenToday` (`readIngestCounts`) | ≤ 25 bucket rows for the pair, one statement, maintained |
 | `followsListAt` | 1 |
-| `/api/stats`, live cache stale (recomputes) | ~2 × today's ingest count |
-| `/api/stats`, live cache warm | ~10–36, independent of E, F and of the ingest window |
-| `auditMaintainedCounts`, once a day | E + F (one scan of `events`, one of `follows`) |
+| `/api/stats`, any request | ~10 measured, ≤ ~61 bounded; independent of E, F and of the ingest window |
+| `auditMaintainedCounts`, once a day | E + F + ≤ 51 bucket rows (one scan of `events`, one of `follows`) |
 | Backfill tick | bounded by today's ingest count (headroom check) + ~2 per event in the page |
-| Live write, regular kind | 0–2, plus 2 for the counter updates |
+| Live write, regular kind | 0–2, plus 3 for the counter updates |
 | Replaceable/addressable replacement | ~2 per tag on the replaced event |
 | NIP-62 vanish, per event removed | ~2 per tag on that event |
 | `giftWrapCount`, per gift wrap accepted | ~0 |
@@ -129,7 +168,9 @@ in [src/schema.ts](src/schema.ts).
 
 `combinations` is the number of queries `filters.ts expandFilter` runs for a
 filter — its `authors` × `kinds` cross-product. The `2` is the index entry plus
-the table row it points at.
+the table row it points at. It multiplies **every** access path, the primary key
+included: the expansion happens before storage sees the filter, so each expanded
+query carries the whole of the rest of it, `id IN (...)` list and all.
 
 ### Where the read ceiling actually binds
 
@@ -171,11 +212,11 @@ no longer existed, and were removed together.
 That is the general lesson, and it is why `limits.ts` records it where costs get
 priced: a TTL over an expensive read bounds how often you pay it, not what it
 costs, and it survives only as long as nobody makes the read cheap. Reach for the
-counter first and the clock second. `live_stats` is the one stats cache left,
-over the two figures that genuinely resist a counter — `ingested24h` would need a
-second bucket table keyed by ingest time (a third row written per event, for a
-diagnostic), and `rowsWrittenToday` is a sum over a window that empties at 00:00
-UTC, which no per-event increment expresses.
+counter first and the clock second. That lesson then got its second demonstration
+one release later: `live_stats`, the five-minute cache over `ingested24h` and
+`rowsWrittenToday`, went the same way when those two were bucketed by ingest hour.
+**There is no cache on `/api/stats` at all, and no `liveAt` age, because nothing
+on the document is stale.**
 
 Buckets rather than a scalar because `events24h` is a **rolling** window: an
 event leaves it by the clock moving, with nothing happening to the event, and no
@@ -188,8 +229,13 @@ of the bug `ingested_at` exists to fix. The window is whole hours, so it spans
 six hours stale, so the number moved closer to the truth, not further.
 
 The one path that still scales with E is `storage.ts auditMaintainedCounts`, and
-it is deliberate: once a day the cron tick recounts `events` in a single scan and
-`follows` beside it, and logs loudly if any counter disagrees. **Detect only — it
+it is deliberate: once a day the cron tick recounts `events` in a single scan —
+producing the total, the `created_at` window, the `ingest_at` window and the
+stamped cost in that window, four figures from one pass — and `follows` beside it,
+and logs loudly if any counter disagrees. The rows-written check is a **floor**
+rather than an equality: the bucket legitimately exceeds the cost of the events
+still standing in it, since it also holds deletions, follow rebuilds and NIP-86
+calls, but it can never fall below it, and below means the meter lost writes. **Detect only — it
 never repairs.** A
 counter that silently corrects itself erases the evidence of whatever broke it,
 so the drift returns on the next occurrence and is swallowed again, and the only
@@ -204,49 +250,107 @@ the codebase that write to it, the counter writes sit inside them rather than
 beside their callers, and every removal path — replaceable replacement, NIP-09,
 NIP-62 vanish, NIP-86 `banevent` — reaches them. `deleteEventRow` reads the row's
 `created_at` itself rather than taking it from the caller, because `banEvent` can
-be handed an id that was never stored and must not decrement a bucket for it. For
+be handed an id that was never stored and must not decrement a bucket for it — and
+it reads `ingested_at` and `row_cost` in the same seek, for the ingest bucket and
+the removal's rows-written estimate. For
 `follows`: `ownership.ts refreshFollows` is the only function that writes it, and
 the counter moves in each of its two write branches — the rebuild and the clear —
 rather than at the function's exit, which two early returns on the common path
 would otherwise skip. That a refresh finding an unchanged contact list writes zero
 rows, counter included, is asserted in `test/follows.test.ts`.
 
-The rest of `/api/stats` scaled with something else, and closing it took a
-second cache beside the snapshot. `ingested24h` and `rowsWrittenToday` both seek
-`idx_events_ingested`, so neither grows with E — but both read the ingest
-*window*, measured live at 853 + 344 rows, ~1,200 per request with the
-lookups beside them. `GET /api/stats` is unauthenticated and nothing
-rate-limits it, so **~4,100 requests from anywhere took the whole
-5,000,000 rows-read allowance for the rest of the UTC day**, at no cost to
-the caller — the same shape as the gift wrap gate probe, an expensive read
-on the far side of no gate. Both figures now come from the `live_stats`
-row on a five-minute clock (`limits.ts LIVE_STATS_MAX_AGE_MS`), which
-bounds the recompute rate at 288/day however many requests arrive:
+The rest of `/api/stats` scaled with something else, and closing it took two
+passes. `ingested24h` and `rowsWrittenToday` both seek `idx_events_ingested`, so
+neither grows with E — but both read the ingest *window*, measured live at
+853 + 344 rows, ~1,200 per request with the lookups beside them. `GET /api/stats`
+is unauthenticated, so **~4,100 requests from anywhere took the whole 5,000,000
+rows-read allowance for the rest of the UTC day**, at no cost to the caller — the
+same shape as the gift wrap gate probe, an expensive read on the far side of no
+gate.
+
+The first pass moved both into a `live_stats` row on a five-minute clock, which
+bounded the recompute rate at 288/day however many requests arrived:
 
 ```
 flood floor = (86,400 / TTL) × 1.5D   (D = events ingested per day)
 ```
 
-That is the arithmetic the TTL was chosen against — at 60s it admits only
-D ≤ 2,315 events/day before the floor alone reaches the ceiling, which a
-backfilling relay exceeds; at 300s it admits D ≤ 11,574, above anything the
-100,000 rows-written ceiling permits this relay to ingest. A warm load
-costs 8 rows measured (`test/read-cost.test.ts`), so the endpoint went from
-~4,100 loads/day to ~387,000. In a row and not in memory for the reason the
-`stats_snapshot` cache beside it was: a flood keeps the object awake, but
-pacing one request every ten seconds misses an in-memory cache every time
-and still reaches twice the ceiling. Hourly bucket counters are the better
-shape where they fit — one row written per event, windowed sums reading at
-most 26 rows, no staleness — and `events24h` is now exactly that. It does
-not fit these two: `ingested24h` would need a second bucket table keyed by
-ingest time, a third row written per event for a diagnostic, and
-`rowsWrittenToday` is a sum over a window that empties at 00:00 UTC, which
-no per-event increment expresses. So these stay cached and this is the one
-stats cache left.
+That bounded the request rate and not the cost, and the cost was the term that
+grew: at D = 5,000 events/day — an ordinary backfill day — the 288 refreshes
+alone were **~2,160,000 rows/day, ~43% of the read ceiling, spent whether or not
+anybody loaded the page**.
+
+The second pass removed it. Both figures are now `ingest_hour_counts`, one bucket
+row per ingest hour carrying an event count and a rows-written total, read as **at
+most 25 rows in one statement**. That table was named here as the next step, with
+the caveat that these two were harder than `events24h`: `ingested24h` would want
+its own bucket table, and `rowsWrittenToday` is a sum over a window that empties
+at 00:00 UTC, which no per-event increment expresses. Both objections dissolved in
+the same table — one bucket carries both figures, so the "third row per event" is
+the same row as the second, and a UTC day boundary falls on a whole hour, so the
+reset is a range start rather than something a counter has to express. It is
+*more* exact than the sum it replaced at exactly the moment that matters, 00:01
+UTC during a recovery, where the cached figure was two minutes old and describing
+the wrong day.
+
+Measured: **10 rows per load** (`test/read-cost.test.ts`), bounded at ~61 —
+`maintained_counts`, ≤ 26 `event_hour_counts` rows, ≤ 25 `ingest_hour_counts`
+rows and the fixed lookups beside them. The endpoint went from ~4,100 loads/day
+before any cache, to ~387,000 with one plus a floor that grew with D, to ~82,000
+with no cache and no floor at all. Keyed by ingest time and NOT sharing
+`event_hour_counts`: the two tables are the same events viewed through the two
+clocks `events.ingested_at` exists to keep apart, and merging them would undo
+exactly the distinction that column was added to make.
 
 Traffic-driven paths are bounded by `limits.ts boundFilter`, which admits a REQ
 filter only at a limit some index can afford, and by the per-IP message throttle
 in `relay.ts`.
+
+Three quantities bound one REQ, and they are three because pricing alone bounds
+none of the other two:
+
+- **Rows read per REQ** — `MAX_FILTER_ROWS_READ`, 10,000, divided equally
+  among the frame's filters and passed to `boundFilter` as a budget.
+  `filterReadCost`
+  prices the cheapest access path, and the `ids` path was priced as though the
+  filter ran once. It runs `combinations` times: `{"ids":[<one id>],
+  "authors":[<5,000 keys>]}` priced at 1 row and read 5,000, while the identical
+  filter *without* the id priced at 5,005,000 and was refused at any limit. One
+  64-hex string turned a refused filter into a free one. The price is now
+  `combinations × ids.length`.
+- **Queries per filter** — `MAX_FILTER_COMBINATIONS`, derived as
+  `MAX_FILTER_ROWS_READ / (ROWS_READ_PER_MATCH + 1)` = 3,333, which is the bound
+  the index path already implied at a limit of 1. Capped *independently* of the
+  price, because statements cost CPU whether or not they read rows: those 5,000
+  seeks were 71ms of Durable Object time, and no lowered limit removes one of
+  them.
+- **Filters per REQ** — `MAX_FILTERS_PER_REQ`, 10. `MAX_FILTER_ROWS_READ` was
+  enforced per filter while its comment read as a per-message bound; a REQ
+  frame carried as many filters as fit, each admitted at the full cap, while
+  the per-IP throttle counted the frame once. Measured before the cap: a REQ
+  carrying 200 filters was answered with EOSE, and ~540 fit in the 16KiB the
+  connection state holds — one frame able to ask for the whole day's rows-read
+  allowance. This cap bounds the statement count and keeps the per-filter share
+  from thinning to uselessness; the *rows* are bounded by the shared budget
+  above.
+
+What none of this bounds is spend over TIME, and it is worth stating rather
+than leaving to be rediscovered. The per-IP message throttle
+(`relay.ts RATE_LIMIT_MAX_MESSAGES`: 50 per 10s) permits 5 REQs/second, and at
+the per-REQ cap that is **50,000 rows/second — the 5,000,000 daily ceiling in
+100 seconds from one address**. That was true before these caps and is true
+after; they bound what one message costs, not what a connection costs. Closing
+it needs a per-connection or per-IP rows-read budget, which this relay does not
+have.
+
+A fourth bound is not a budget cap but a platform one. Subscriptions live in the
+WebSocket attachment so they survive hibernation, and `serializeAttachment`
+throws above 16KiB. Nothing checked it, so an ordinary
+`{"authors":[<400 keys>],"kinds":[1]}` — ~26KB serialized, admitted by every cap
+above — ran its query, sent its events, and then took an uncaught exception in
+place of the EOSE. `MAX_CONN_STATE_BYTES` checks the *would-be* state before
+storing it, so an oversized REQ is refused with `CLOSED` and leaves the
+subscriptions it could not join intact.
 
 ### The HTTP side
 
@@ -342,14 +446,16 @@ usefully — what it structurally cannot do.
   writes to the owner's kind-3 list and nothing else. NIP-86 `banpubkey` and
   `allowpubkey` adjust that set by hand.
 - **Read abuse.** `limits.ts boundFilter` admits a REQ filter only at a limit
-  some index can afford, so no filter can scan the table. Plus a
-  per-connection subscription cap and a per-IP message throttle. On the HTTP
+  some index can afford, so no filter can scan the table — at a price that now
+  includes the query count on every access path, and under a separate cap on
+  that count, since statements cost CPU that rows-read pricing cannot see. Plus
+  a cap on filters per REQ, a per-connection subscription cap, a bound on the
+  connection state a subscription may hold open, and a per-IP message throttle. On the HTTP
   side, Cloudflare's Rate Limiting binding bounds every path that wakes the
   Durable Object, per IP, before the Worker's code runs; underneath it
-  `/api/stats` is still defended by cost. Every count it reports is maintained
-  rather than computed, so no request walks a table at all; the two figures that
-  resist a counter are cached in a row (`live_stats`) so their recompute rate is
-  set by a TTL rather than by the request rate.
+  `/api/stats` is still defended by cost. **Every figure it reports is maintained
+  rather than computed**, so no request walks a table, reads a window, or misses
+  a cache — there is no cache left, and a load costs ~10 rows.
 - **Being made into an amplifier.** `/api/profile` is the only path whose cost
   lands on somebody else's infrastructure — two outbound WebSockets to
   well-known relays per uncached miss. It is scoped to the pre-claim window,
@@ -359,8 +465,12 @@ usefully — what it structurally cannot do.
   `NON_OWNER_STORAGE_BYTES` reserves half the 5GB ceiling for the owner. Gift
   wraps carry their own count cap and per-IP throttle on top.
 - **Gift wrap disclosure.** Reads of kind-1059 require NIP-42 AUTH as the
-  p-tagged recipient, checked by re-running the filter against real storage
-  rather than by pattern-matching its shape.
+  p-tagged recipient. A filter naming 1059 is refused from `kinds` alone; a
+  filter that names no kinds is served with the wraps omitted. The gate
+  answers the same way whether or not the inbox holds anything, which the
+  storage probe it replaced could not — that probe's refusal was a one-bit
+  read of the owner's inbox per REQ, bisectable into exact arrival times and
+  an exact count.
 - **Replay of deleted events.** `deleted_ids` tombstones every id removed by
   NIP-09, NIP-62 or `banevent`, so a sender holding a signed copy cannot put it
   back.
@@ -380,9 +490,17 @@ usefully — what it structurally cannot do.
   and unfollowing both act through `isAllowedWriter`, which this path never
   calls, so an ex-follow keeps both their stored events and the ability to
   trigger it. Cost is the only available control, which is why
-  `idx_event_tags_event` exists and why the drain is checkpointed. `/api/stats`
-  reports vanish requests still draining, so a stalled one is visible rather
-  than inferred.
+  `idx_event_tags_event` exists, why the drain is checkpointed, and why the
+  path now pays two reads before its first write: `hasVanishTargets` (a vanish
+  over an empty set is complete when it is asked, and used to cost 4 rows
+  written to record and immediately forget) and `pendingVanishCutoff` (a signed
+  vanish is replayable forever by anyone who has seen it, and each replay used
+  to re-checkpoint and take another drain batch). What cannot be gated is
+  *honouring* the request; paying rows to honour one with nothing to do is not
+  the same thing. `/api/stats` reports how many are still draining — a count,
+  a progress total and an age, never the pubkeys: the endpoint is public and
+  unauthenticated, and itemising the rows published exactly which identities
+  had asked this relay to erase them.
 - **Anyone reading anything that is not a gift wrap.** There is no read
   authentication and none is planned; a personal relay's contents are as public
   as the notes in it.
@@ -406,15 +524,15 @@ usefully — what it structurally cannot do.
 - [src/relay.ts](src/relay.ts) — the `Relay` Durable Object: connection lifecycle, NIP-01 message handling, live feed, alarm.
 - [src/relay-stub.ts](src/relay-stub.ts) — the one `idFromName("relay")` accessor, shared so nothing else can shard it.
 - [src/storage.ts](src/storage.ts) / [src/schema.ts](src/schema.ts) — SQLite schema and all read/write queries, including the row-cost accounting. `events.ingested_at` is wall-clock write time and must never be conflated with `created_at`: rows-written accounting and backfill's headroom guard both measure `ingested_at`, because a backfilled event's `created_at` is years old and measuring that made backfill's own writes invisible to the guard restraining them. A column, not a counter table — a counter costs a row write per event, a column costs nothing. The same argument added `events.row_cost` in v0.7.2: each event's rows-written cost is stamped at insert time so `estimateRowsWrittenSince` sums a column instead of rebuilding the figure from a `LEFT JOIN event_tags` with no index behind it, which read every tag row in the table to answer a question about the 24h window. The same argument runs the other way for `maintained_counts`/`event_hour_counts`, which DO pay a row write per event: there the alternative was a read that grew without bound, so 2 fixed rows against an event already costing 6 to 21 is the cheaper side. See CLAUDE.md "The budget".
-- [src/filters.ts](src/filters.ts) — REQ filter parsing, SQL query building, in-memory match testing for live broadcast, and `expandFilter`, which splits one filter into the cross-product of its `authors` × `kinds` singletons. That split is what lets an index serve `ORDER BY created_at DESC LIMIT n`: a key column pinned to one value arrives sorted, `kind IN (1, 7)` does not, so a multi-kind filter defeats an index as thoroughly as no index at all. `storage.ts queryFilter` re-merges and re-slices to `limit`, so the split is invisible on the wire.
+- [src/filters.ts](src/filters.ts) — REQ filter parsing, SQL query building, in-memory match testing for live broadcast, `FilterQueryOptions.excludeGiftWraps` (the NIP-42 read gate, expressed as omission — see "What it is"), and `expandFilter`, which splits one filter into the cross-product of its `authors` × `kinds` singletons. That split is what lets an index serve `ORDER BY created_at DESC LIMIT n`: a key column pinned to one value arrives sorted, `kind IN (1, 7)` does not, so a multi-kind filter defeats an index as thoroughly as no index at all. `storage.ts queryFilter` re-merges and re-slices to `limit`, so the split is invisible on the wire.
 - [src/nostr.ts](src/nostr.ts) — wire types and kind-range classifiers (replaceable/ephemeral/addressable).
 - [src/validate.ts](src/validate.ts) — event id computation and schnorr signature verification (`@noble/curves`).
-- [src/ownership.ts](src/ownership.ts) — owner pubkey resolution, TOFU claim, follow-list cache, profile/icon refresh.
+- [src/ownership.ts](src/ownership.ts) — owner pubkey resolution, TOFU claim, follow-list cache, profile/icon refresh. `getOwnerPubkey` runs `OWNER_PUBKEY` through `normalizePubkey` like every other pubkey boundary in the project, memoised on the raw string because it sits on the write path. It did not, and returned the variable verbatim while every comparison target is lowercase hex — so an operator setting an npub (the form every client shows them) got a relay where the owner could not write, could not read their own gift wraps, and could not be addressed by one, silently. A malformed value now resolves to null, which reads as unclaimed and is visible; `index.ts` still gates `/api/claim` on the variable being *set*, so this fails closed rather than reopening TOFU.
 - [src/host.ts](src/host.ts) — this deployment's own host, learned from request traffic; lets backfill skip self-seeding.
 - [src/pubkey.ts](src/pubkey.ts) / [src/bech32.ts](src/bech32.ts) — npub/hex normalization.
 - [src/profile-lookup.ts](src/profile-lookup.ts) — best-effort kind-0 lookup from well-known relays, runs in the Worker only, plus the isolate-local cache in front of it (`lookupProfileCached`). The cache is not `caches.default`: the Cache API needs a custom domain (developers.cloudflare.com/workers/runtime-apis/cache/, checked 2026-08-27) and bothy deploys to `workers.dev`, so it would silently no-op on the deployment shape this project exists for. Negative results are cached and concurrent lookups for one pubkey are coalesced — without both, the cache would miss on exactly the traffic it exists to absorb.
 - [src/backfill.ts](src/backfill.ts) / [src/backfill-worker.ts](src/backfill-worker.ts) — backfill state machine (DO-side, pure) and outbound fetch orchestration (Worker-side).
-- [src/limits.ts](src/limits.ts) — every numeric abuse/budget cap in the project, each commented with what it bounds. The three write-path caps (event size, per-pubkey rate, non-owner storage share) are enforced in `relay.ts acceptEvent` before id/signature verification, exempt the owner from two of the three, and are each raisable or disablable by env var — disabled only by the exact string `"off"`, never by any truthy value. Also `boundFilter`, the read-abuse guard: it prices a REQ filter (`combinations × (2 × limit + 1)`, where `combinations` comes from `expandFilter` itself) against the index set declared in `schema.ts`, clamps the limit until the query is affordable, and refuses only what no limit can fix. It replaced `isUnconstrainedFilter`, which asked whether a field was *present* rather than what the query *cost* and so admitted the two shapes that read the whole table. The one cap NOT declared here is the HTTP rate limit: Cloudflare's runtime enforces it from `wrangler.jsonc` before any of this code runs, so a number here would be decorative and could silently disagree with the one in force — `limits.ts` carries the pointer and the reasoning instead.
+- [src/limits.ts](src/limits.ts) — every numeric abuse/budget cap in the project, each commented with what it bounds. The three write-path caps (event size, per-pubkey rate, non-owner storage share) are enforced in `relay.ts acceptEvent` before id/signature verification, exempt the owner from two of the three, and are each raisable or disablable by env var — disabled only by the exact string `"off"`, never by any truthy value. Also `boundFilter`, the read-abuse guard: it prices a REQ filter (`combinations × (2 × limit + 1)` on an index path, `combinations × ids.length` on the primary key, where `combinations` comes from `expandFilter` itself) against the index set declared in `schema.ts`, clamps the limit until the query is affordable, and refuses what no limit can fix — plus `MAX_FILTER_COMBINATIONS`, which refuses on query count alone, ahead of the price, because a lowered limit removes rows and never statements. It replaced `isUnconstrainedFilter`, which asked whether a field was *present* rather than what the query *cost* and so admitted the two shapes that read the whole table. The one cap NOT declared here is the HTTP rate limit: Cloudflare's runtime enforces it from `wrangler.jsonc` before any of this code runs, so a number here would be decorative and could silently disagree with the one in force — `limits.ts` carries the pointer and the reasoning instead.
 - [src/exhaustion.ts](src/exhaustion.ts) — classifies a Cloudflare free-tier allowance being consumed and names which one; `index.ts` wraps both `fetch` and `scheduled` with it. Exists because the last outage's only symptom was an admin page that loaded the word "bothy" and no numbers — `public/` is served from `env.ASSETS` and never touches the DO, so the one part still working was the part that proved nothing. Matching is substring signatures against error text Cloudflare does not document as stable, so it fails useful rather than silent: the raw message is always logged, the resource name only added when a signature matches. Non-exhaustion errors are logged and rethrown, never converted into a quiet 503.
 - [src/read-metrics.ts](src/read-metrics.ts) — **diagnostic, and expected to be removed**: in-memory attribution of rows *read* to the code path that caused them, surfaced as `reads` on `/api/stats`. Added after the live relay exhausted the 5,000,000 rows-read/day allowance under ordinary operation and nothing here could say which path spent it. Counters live in memory, never in storage — a counter costing a row write to measure a row read repeats the mistake CLAUDE.md "The budget" already rejected — so they reset on eviction and describe proportions, not daily totals. Every `SqlStorage` access in the DO goes through `instrumentSql`, so a query can be mislabelled into `unattributed` but never missed. See CLAUDE.md "The budget" for the per-call costs and the arithmetic against the ceiling.
 - [src/nip11.ts](src/nip11.ts) — relay info document, and the name/description/icon resolution chain shared with `/api/stats`.
@@ -432,6 +550,11 @@ usefully — what it structurally cannot do.
 - Indexes are declared once, as data, in `schema.ts INDEXES`, and three things read that declaration: `limits.ts boundFilter` (which filters are affordable), `schema.ts eventRowCost` (what an event costs to write), and `limits.ts BACKFILL_PAGE_SIZE`/`VANISH_BATCH_SIZE` (how much work fits in a cron tick). Four on `events` — `(pubkey, kind, created_at)`, `(kind, created_at)`, `(pubkey, created_at)`, `(ingested_at)` covering `row_cost` — and two on `event_tags` — `(tag_name, tag_value, created_at)` and `(event_id)`. Adding another index therefore changes both the guard and the write accounting on its own; what it must NOT change silently is the measured baseline, so re-run `test/hibernation.test.ts`'s rows-written assertions and update the schema.ts comment and CLAUDE.md "The budget". Every accepted read filter must be answerable from one of these — that is enforced by cost, not by requiring a particular field.
 - Verify Cloudflare's own platform limits against live docs before relying on a number in a file — they change between compatibility dates. CLAUDE.md "The budget" cites the source and date at each point of use rather than assuming a cached number still holds.
 - Pin dependency versions; don't float to `latest` mid-project.
+- Commit directly to `main`. Never create a branch, and never open a pull
+  request — this repository has one contributor, and every branch created so
+  far has ended up either a stale leftover or a deploy that silently didn't
+  happen. Cloudflare builds from `main`; work on any other branch does not
+  reach the relay.
 
 ## Commands
 
