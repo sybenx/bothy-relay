@@ -1,5 +1,20 @@
 import { buildFilterQuery, compareEvents, expandFilter, type FilterQueryOptions } from "./filters";
-import { eventRowCost, TOMBSTONE_ROW_COST } from "./schema";
+import {
+  acrossScopes,
+  GROUP_SCOPE,
+  type GroupScope,
+  PUBLIC_SCOPE,
+  scopeOf,
+} from "./groups";
+import {
+  EVENT_BASE_ROW_COST,
+  EVENT_BASE_ROW_COST_MEASURED,
+  EVENT_COUNTER_ROW_COST,
+  eventRowCost,
+  TAG_ROW_COST,
+  TAG_ROW_COST_MEASURED,
+  TOMBSTONE_ROW_COST,
+} from "./schema";
 import { addRowsWritten, takeRowsWritten, unlandedRowsWritten, withReadPath } from "./read-metrics";
 import { normalizeIp } from "./ip";
 import {
@@ -71,9 +86,17 @@ function insertEventRow(
   ingestedAt: number,
 ): void {
   const indexedTags = event.tags.filter(isIndexedTag);
+  // Which partition this event lands in, decided once here from the
+  // event's own tags (groups.ts scopeOf) and then copied onto every row
+  // that describes it -- the event row, its tag rows, and the counters.
+  // Decided at the choke point rather than by the caller for the same
+  // reason `deleteEventRow` reads `created_at` itself: this is one of the
+  // two functions in the codebase that write to `events`, so "what an
+  // event is" and "what gets stored about it" are the same lines of code.
+  const scope = scopeOf(event);
   sql.exec(
-    `INSERT INTO events (id, pubkey, created_at, kind, tags, content, sig, expiration, ingested_at, row_cost)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO events (id, pubkey, created_at, kind, tags, content, sig, expiration, ingested_at, row_cost, is_group)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     event.id,
     event.pubkey,
     event.created_at,
@@ -84,6 +107,7 @@ function insertEventRow(
     expiration,
     ingestedAt,
     eventRowCost(indexedTags.length),
+    scope,
   );
   // Immediately after the row exists and before anything else can fail.
   //
@@ -97,18 +121,24 @@ function insertEventRow(
   // before the tag loop for the same reason in the other direction: if a
   // tag insert throws, the event row is real and the counters must say so.
   //
-  // Rows written: 2 per stored event, on top of the 6 + 3T the row itself
-  // costs -- see schema.ts eventRowCost. The UPDATE is one row in a
-  // one-row table with no index; the upsert is one row in a rowid-aliased
-  // table with no index. CLAUDE.md "The budget" carries the arithmetic.
-  bumpEventCounters(sql, event.created_at, 1);
+  // Rows written: 2 per stored event (the third counter row is the ingest
+  // bucket at the end of this function), on top of the 6 + 3T the row
+  // itself costs -- see schema.ts eventRowCostMeasured, and
+  // eventRowCost beside it for the figure the guards deliberately
+  // over-charge. The UPDATE is one row in a one-row table with no index;
+  // the upsert is one row in a rowid-aliased table with no index. Both
+  // now carry the group half in a second column, which is free: a column
+  // added to a statement that already runs is not a row.
+  // CLAUDE.md "The budget" carries the arithmetic.
+  bumpEventCounters(sql, event.created_at, 1, scope);
   for (const tag of indexedTags) {
     sql.exec(
-      `INSERT INTO event_tags (tag_name, tag_value, event_id, created_at) VALUES (?, ?, ?, ?)`,
+      `INSERT INTO event_tags (tag_name, tag_value, event_id, created_at, is_group) VALUES (?, ?, ?, ?, ?)`,
       tag[0],
       tag[1],
       event.id,
       event.created_at,
+      scope,
     );
   }
   // LAST, and after the tag rows rather than beside the counters above,
@@ -128,7 +158,7 @@ function insertEventRow(
   // execution context put there: a replaceable replacement deletes the
   // superseded version before reaching this line, and deleteEventRow
   // accounts for that removal into the same accumulator.
-  bumpIngestCounters(sql, hourBucket(ingestedAt), 1, takeRowsWritten());
+  bumpIngestCounters(sql, hourBucket(ingestedAt), 1, scope === GROUP_SCOPE ? 1 : 0, takeRowsWritten());
 }
 
 // ---------------------------------------------------------------------
@@ -204,10 +234,12 @@ function deleteEventRow(sql: SqlStorage, id: string): void {
   // Rows read: 1. Removals are rare next to insertions, and this is the
   // same index seek the DELETE below performs anyway.
   const row = sql
-    .exec<{ created_at: number; ingested_at: number | null; row_cost: number | null }>(
-      `SELECT created_at, ingested_at, row_cost FROM events WHERE id = ?`,
-      id,
-    )
+    .exec<{
+      created_at: number;
+      ingested_at: number | null;
+      row_cost: number | null;
+      is_group: number;
+    }>(`SELECT created_at, ingested_at, row_cost, is_group FROM events WHERE id = ?`, id)
     .toArray()[0];
   sql.exec(`DELETE FROM event_tags WHERE event_id = ?`, id);
   sql.exec(`DELETE FROM events WHERE id = ?`, id);
@@ -215,7 +247,12 @@ function deleteEventRow(sql: SqlStorage, id: string): void {
   // of a statement that then threw would leave the counters describing
   // fewer events than are stored.
   if (row === undefined) return;
-  bumpEventCounters(sql, row.created_at, -1);
+  // `is_group` read from the row rather than recomputed from the event,
+  // for the reason `created_at` beside it is: banEvent reaches here with
+  // an id that may never have been stored, and the counters must move for
+  // the partition the row was actually IN, not the one a caller guessed.
+  const scope: GroupScope = row.is_group === 1 ? GROUP_SCOPE : PUBLIC_SCOPE;
+  bumpEventCounters(sql, row.created_at, -1, scope);
   // The ingest-hour bucket behind `ingested24h`, which counts events this
   // relay took in and STILL HOLDS -- so a removal has to come back out of
   // the hour it arrived in, not the hour it was removed in. A plain
@@ -231,7 +268,11 @@ function deleteEventRow(sql: SqlStorage, id: string): void {
   // column existed carry: they were never bucketed (schema.ts
   // seedIngestCounts skips them too), so there is nothing to decrement.
   if (row.ingested_at !== null) {
-    sql.exec(`UPDATE ingest_hour_counts SET n = n - 1 WHERE hour = ?`, hourBucket(row.ingested_at));
+    sql.exec(
+      `UPDATE ingest_hour_counts SET n = n - 1, group_n = group_n - ? WHERE hour = ?`,
+      scope === GROUP_SCOPE ? 1 : 0,
+      hourBucket(row.ingested_at),
+    );
   }
   // ------------------------------------------------------------------
   // THE ONE PLACE ROWS WRITTEN ARE ACCOUNTED BY HAND rather than
@@ -305,16 +346,36 @@ export function hourBucket(createdAt: number): number {
 // bucket necessarily exists, and an upsert there would silently create a
 // -1 bucket if that ever stopped being true rather than leaving the audit
 // something to find.
-function bumpEventCounters(sql: SqlStorage, createdAt: number, delta: 1 | -1): void {
-  sql.exec(`UPDATE maintained_counts SET events = events + ?`, delta);
+function bumpEventCounters(
+  sql: SqlStorage,
+  createdAt: number,
+  delta: 1 | -1,
+  scope: GroupScope,
+): void {
+  // The group half moves in the same statements as the total, never in
+  // statements of its own -- which is what makes the split free. A column
+  // added to an UPDATE that already runs costs no additional rows written
+  // (measured: 1 row either way), where a second counter row per hour
+  // would have cost one per event.
+  const group = scope === GROUP_SCOPE ? 1 : 0;
+  sql.exec(
+    `UPDATE maintained_counts SET events = events + ?, group_events = group_events + ?`,
+    delta,
+    delta * group,
+  );
   if (delta === 1) {
     sql.exec(
-      `INSERT INTO event_hour_counts (hour, n) VALUES (?, 1)
-         ON CONFLICT(hour) DO UPDATE SET n = n + 1`,
+      `INSERT INTO event_hour_counts (hour, n, group_n) VALUES (?, 1, ?)
+         ON CONFLICT(hour) DO UPDATE SET n = n + 1, group_n = group_n + excluded.group_n`,
       hourBucket(createdAt),
+      group,
     );
   } else {
-    sql.exec(`UPDATE event_hour_counts SET n = n - 1 WHERE hour = ?`, hourBucket(createdAt));
+    sql.exec(
+      `UPDATE event_hour_counts SET n = n - 1, group_n = group_n - ? WHERE hour = ?`,
+      group,
+      hourBucket(createdAt),
+    );
   }
 }
 
@@ -325,13 +386,21 @@ function bumpEventCounters(sql: SqlStorage, createdAt: number, delta: 1 | -1): v
 // One upsert, one row, no index entry: `hour` is a rowid alias. The
 // decrement side lives in deleteEventRow as a plain UPDATE, for the same
 // reason bumpEventCounters' does.
-function bumpIngestCounters(sql: SqlStorage, hour: number, events: number, rowsWritten: number): void {
+function bumpIngestCounters(
+  sql: SqlStorage,
+  hour: number,
+  events: number,
+  groupEvents: number,
+  rowsWritten: number,
+): void {
   sql.exec(
-    `INSERT INTO ingest_hour_counts (hour, n, rows_written) VALUES (?, ?, ?)
+    `INSERT INTO ingest_hour_counts (hour, n, group_n, rows_written) VALUES (?, ?, ?, ?)
        ON CONFLICT(hour) DO UPDATE SET n = n + excluded.n,
+                                       group_n = group_n + excluded.group_n,
                                        rows_written = rows_written + excluded.rows_written`,
     hour,
     events,
+    groupEvents,
     rowsWritten,
   );
 }
@@ -365,7 +434,7 @@ const MIN_ROWS_WRITTEN_LANDING = 2;
 // swelling `unattributed`, which is the instrument's gap detector.
 export function settleRowsWritten(sql: SqlStorage, nowSec: number): void {
   if (unlandedRowsWritten() < MIN_ROWS_WRITTEN_LANDING) return;
-  withReadPath("meter", () => bumpIngestCounters(sql, hourBucket(nowSec), 0, takeRowsWritten()));
+  withReadPath("meter", () => bumpIngestCounters(sql, hourBucket(nowSec), 0, 0, takeRowsWritten()));
 }
 
 // /api/stats `ingested24h` and `rowsWrittenToday`, out of the ingest-hour
@@ -392,17 +461,25 @@ export function readIngestCounts(
   sql: SqlStorage,
   nowSec: number,
   budgetSince: number,
-): { ingested24h: number; rowsWrittenToday: number } {
+): { ingested24h: number; ingestedGroup24h: number; rowsWrittenToday: number } {
   const row = sql
-    .exec<{ ingested: number | null; written: number | null }>(
+    .exec<{ ingested: number | null; grouped: number | null; written: number | null }>(
       `SELECT SUM(n) AS ingested,
+              SUM(group_n) AS grouped,
               SUM(CASE WHEN hour >= ? THEN rows_written ELSE 0 END) AS written
          FROM ingest_hour_counts WHERE hour >= ?`,
       hourBucket(budgetSince),
       hourBucket(nowSec - 86400),
     )
     .toArray()[0];
-  return { ingested24h: row?.ingested ?? 0, rowsWrittenToday: row?.written ?? 0 };
+  return {
+    ingested24h: row?.ingested ?? 0,
+    // Read out of the same bucket rows at no additional cost, and
+    // subtracted before /api/stats reports anything -- see relay.ts
+    // collectStats. The audit uses both halves.
+    ingestedGroup24h: row?.grouped ?? 0,
+    rowsWrittenToday: row?.written ?? 0,
+  };
 }
 
 export interface CountAuditStatus {
@@ -421,14 +498,22 @@ export interface CountAuditStatus {
 // one row and collectStats wants all of them.
 export function readMaintainedCounts(
   sql: SqlStorage,
-): { events: number; follows: number } & CountAuditStatus {
+): { events: number; groupEvents: number; follows: number } & CountAuditStatus {
   const row = sql
-    .exec<{ events: number; follows: number; audited_at: number | null; last_drift: string | null }>(
-      `SELECT events, follows, audited_at, last_drift FROM maintained_counts`,
-    )
+    .exec<{
+      events: number;
+      group_events: number;
+      follows: number;
+      audited_at: number | null;
+      last_drift: string | null;
+    }>(`SELECT events, group_events, follows, audited_at, last_drift FROM maintained_counts`)
     .toArray()[0];
   return {
     events: row?.events ?? 0,
+    // One more column off the row already being read: /api/stats reports
+    // `events - groupEvents`, so a public poller cannot time group
+    // arrivals off the total (schema.ts `group_events`).
+    groupEvents: row?.group_events ?? 0,
     follows: row?.follows ?? 0,
     lastRanAt: row?.audited_at ?? null,
     drift: row?.last_drift ? (JSON.parse(row.last_drift) as string[]) : null,
@@ -478,15 +563,19 @@ export function followsListAt(sql: SqlStorage): number | null {
 // table, and it replaces a figure that was exact to the second and up to
 // SIX HOURS stale (it came from `stats_snapshot`), so the number on the
 // page got considerably closer to the truth rather than further from it.
-export function countEvents24h(sql: SqlStorage, nowSec: number): number {
-  return (
-    sql
-      .exec<{ n: number | null }>(
-        `SELECT SUM(n) AS n FROM event_hour_counts WHERE hour >= ?`,
-        hourBucket(nowSec - 86400),
-      )
-      .toArray()[0]?.n ?? 0
-  );
+export function countEvents24h(
+  sql: SqlStorage,
+  nowSec: number,
+): { total: number; group: number } {
+  const row = sql
+    .exec<{ n: number | null; grouped: number | null }>(
+      `SELECT SUM(n) AS n, SUM(group_n) AS grouped FROM event_hour_counts WHERE hour >= ?`,
+      hourBucket(nowSec - 86400),
+    )
+    .toArray()[0];
+  // Both halves, from one statement over the same bucket rows: /api/stats
+  // reports the difference, the audit checks each against the table.
+  return { total: row?.n ?? 0, group: row?.grouped ?? 0 };
 }
 
 // Once-a-day proof that every maintained counter still matches the table
@@ -520,8 +609,8 @@ export function countEvents24h(sql: SqlStorage, nowSec: number): number {
 // frequency, so it stays daily whatever the cron schedule becomes.
 export function auditMaintainedCounts(sql: SqlStorage, nowSec: number): void {
   const state = sql
-    .exec<{ events: number; follows: number; audited_at: number | null }>(
-      `SELECT events, follows, audited_at FROM maintained_counts`,
+    .exec<{ events: number; groupEvents: number; follows: number; audited_at: number | null }>(
+      `SELECT events, group_events AS groupEvents, follows, audited_at FROM maintained_counts`,
     )
     .toArray()[0];
   if (state === undefined) return;
@@ -533,17 +622,42 @@ export function auditMaintainedCounts(sql: SqlStorage, nowSec: number): void {
   // a second scan would be a second E for numbers the first pass already
   // has in hand.
   const actual = sql
-    .exec<{ total: number; windowed: number; ingested: number; ingestedCost: number }>(
+    .exec<{
+      total: number;
+      groupTotal: number;
+      windowed: number;
+      groupWindowed: number;
+      ingested: number;
+      groupIngested: number;
+      ingestedCost: number;
+      ingestedCosted: number;
+    }>(
       `SELECT COUNT(*) AS total,
+              COALESCE(SUM(is_group), 0) AS groupTotal,
               COALESCE(SUM(CASE WHEN created_at / 3600 >= ? THEN 1 ELSE 0 END), 0) AS windowed,
+              COALESCE(SUM(CASE WHEN created_at / 3600 >= ? THEN is_group ELSE 0 END), 0) AS groupWindowed,
               COALESCE(SUM(CASE WHEN ingested_at / 3600 >= ? THEN 1 ELSE 0 END), 0) AS ingested,
-              COALESCE(SUM(CASE WHEN ingested_at / 3600 >= ? THEN row_cost ELSE 0 END), 0) AS ingestedCost
+              COALESCE(SUM(CASE WHEN ingested_at / 3600 >= ? THEN is_group ELSE 0 END), 0) AS groupIngested,
+              COALESCE(SUM(CASE WHEN ingested_at / 3600 >= ? THEN row_cost ELSE 0 END), 0) AS ingestedCost,
+              COALESCE(SUM(CASE WHEN ingested_at / 3600 >= ? AND row_cost IS NOT NULL THEN 1 ELSE 0 END), 0) AS ingestedCosted
          FROM events`,
       cutoff,
       cutoff,
       cutoff,
+      cutoff,
+      cutoff,
+      cutoff,
     )
-    .toArray()[0] ?? { total: 0, windowed: 0, ingested: 0, ingestedCost: 0 };
+    .toArray()[0] ?? {
+    total: 0,
+    groupTotal: 0,
+    windowed: 0,
+    groupWindowed: 0,
+    ingested: 0,
+    groupIngested: 0,
+    ingestedCost: 0,
+    ingestedCosted: 0,
+  };
   const counted24h = countEvents24h(sql, nowSec);
   // The rolling half of the ingest buckets, on the same cutoff the scan
   // above used. `budgetSince` is passed as the rolling cutoff too, so
@@ -559,23 +673,55 @@ export function auditMaintainedCounts(sql: SqlStorage, nowSec: number): void {
   // tailing logs at the moment this runs, and `driftMessages` is what
   // survives past that moment for /api/stats to read back tomorrow.
   const driftMessages: string[] = [];
-  const drift = (what: string, said: number, is: number, where: string) => {
-    const message = `${what} says ${said}, the table says ${is} (off by ${said - is})`;
+  // `message` is what survives into `maintained_counts.last_drift`, which
+  // /api/stats reads back -- and that endpoint is PUBLIC and
+  // unauthenticated. `detail` is the part that goes only to the log line.
+  // The split exists for the group membership check below, whose useful
+  // detail is a list of pubkeys: naming them in `last_drift` would publish
+  // part of this group's membership on the one document anybody can fetch,
+  // which is the disclosure the whole partition exists to prevent. The
+  // stored half therefore counts; the logged half names.
+  const report = (message: string, where: string, detail = "") => {
     driftMessages.push(message);
     console.error(
-      `MAINTAINED COUNT DRIFT: ${message}. NOT corrected -- see storage.ts auditMaintainedCounts. ` +
+      `MAINTAINED COUNT DRIFT: ${message}.${detail === "" ? "" : ` ${detail}.`} ` +
+        `NOT corrected -- see storage.ts auditMaintainedCounts. ` +
         `Every write to the counted table must go through ${where}.`,
     );
+  };
+  const drift = (what: string, said: number, is: number, where: string) => {
+    report(`${what} says ${said}, the table says ${is} (off by ${said - is})`, where);
   };
 
   if (actual.total !== state.events) {
     drift("maintained_counts.events", state.events, actual.total, "insertEventRow/deleteEventRow");
   }
-  if (actual.windowed !== counted24h) {
+  // The group halves are audited separately rather than folded into the
+  // totals above, because they are what /api/stats SUBTRACTS: a group
+  // counter that drifted low would put group events back on a public,
+  // unauthenticated document one at a time, and a total that still
+  // matched would say nothing was wrong.
+  if (actual.groupTotal !== state.groupEvents) {
+    drift(
+      "maintained_counts.group_events",
+      state.groupEvents,
+      actual.groupTotal,
+      "insertEventRow/deleteEventRow",
+    );
+  }
+  if (actual.windowed !== counted24h.total) {
     drift(
       "event_hour_counts, summed over the last 24h",
-      counted24h,
+      counted24h.total,
       actual.windowed,
+      "insertEventRow/deleteEventRow",
+    );
+  }
+  if (actual.groupWindowed !== counted24h.group) {
+    drift(
+      "event_hour_counts.group_n, summed over the last 24h",
+      counted24h.group,
+      actual.groupWindowed,
       "insertEventRow/deleteEventRow",
     );
   }
@@ -587,6 +733,14 @@ export function auditMaintainedCounts(sql: SqlStorage, nowSec: number): void {
       "ingest_hour_counts, summed over the last 24h",
       ingestBuckets.ingested24h,
       actual.ingested,
+      "insertEventRow/deleteEventRow",
+    );
+  }
+  if (actual.groupIngested !== ingestBuckets.ingestedGroup24h) {
+    drift(
+      "ingest_hour_counts.group_n, summed over the last 24h",
+      ingestBuckets.ingestedGroup24h,
+      actual.groupIngested,
       "insertEventRow/deleteEventRow",
     );
   }
@@ -602,12 +756,76 @@ export function auditMaintainedCounts(sql: SqlStorage, nowSec: number): void {
   // or a write reaching SQLite outside the wrapper.
   //
   // Detect only, like everything else in this function.
-  if (ingestBuckets.rowsWrittenToday < actual.ingestedCost) {
+  //
+  // AND IT IS COMPARED AGAINST THE MEASURED COST, NOT THE STAMPED ONE.
+  // `row_cost` carries schema.ts eventRowCost, which is deliberately an
+  // over-estimate: it counts each partial index PAIR twice where a row
+  // pays one half (12 + 4T charged against 9 + 3T spent -- see
+  // EVENT_BASE_ROW_COST for why that is left wrong). Every other consumer
+  // of that number is a guard made stricter by over-charging; this one is
+  // not. A floor set above what the meter can ever report is not a floor,
+  // it is a drift line logged every single day, on the one check whose
+  // value is that it fires rarely.
+  //
+  // So the stamped sum is converted back to what those events actually
+  // cost, using the same two declarations it was built from: the tag rows
+  // in the window are recovered from the stamped total, then re-priced at
+  // the measured per-row figures. When the derivation is one day fixed,
+  // measured and stamped become equal, this arithmetic collapses to
+  // `ingestedCost`, and it should be deleted.
+  //
+  // Rows written before `row_cost` existed are excluded from both sides
+  // (`ingestedCosted` counts only stamped rows), the same way they have
+  // always been absent from the sum.
+  const stampedPerEvent = EVENT_BASE_ROW_COST + EVENT_COUNTER_ROW_COST;
+  const measuredPerEvent = EVENT_BASE_ROW_COST_MEASURED + EVENT_COUNTER_ROW_COST;
+  const tagRowsInWindow = Math.max(
+    0,
+    (actual.ingestedCost - actual.ingestedCosted * stampedPerEvent) / TAG_ROW_COST,
+  );
+  const measuredCost = Math.floor(
+    actual.ingestedCosted * measuredPerEvent + tagRowsInWindow * TAG_ROW_COST_MEASURED,
+  );
+  if (ingestBuckets.rowsWrittenToday < measuredCost) {
     drift(
       "ingest_hour_counts.rows_written, summed over the last 24h, is BELOW the cost of the events in it",
       ingestBuckets.rowsWrittenToday,
-      actual.ingestedCost,
+      measuredCost,
       "the read-metrics.ts wrapper, landed by storage.ts settleRowsWritten at every entry point",
+    );
+  }
+
+  // NOT a counter, and the one check here that is about an invariant
+  // between two tables rather than between a table and a number kept
+  // alongside it. It lives in this function anyway because this is where
+  // the daily pace is (schema.ts `maintained_counts`: "a single
+  // `audited_at` is then what paces one daily audit over everything this
+  // relay maintains, rather than two gates that could drift apart").
+  //
+  // What it checks: every NIP-29 group member has an `allowed_pubkeys`
+  // row. Membership is the inner of two nested lists and the outer one is
+  // what the write gate actually consults (src/nip29.ts), so a member
+  // missing from it is a member who silently cannot write -- their events
+  // are refused by ownership.ts isAllowedWriter with a message about
+  // follows that says nothing about groups, and nothing anywhere connects
+  // the cause to the effect. The two tables are written together by
+  // nip29.ts applyModeration and can only come apart through a bug or a
+  // hand-edit, which is exactly the class of thing a daily check is for.
+  //
+  // Detect only, like everything above it. Repairing the containment would
+  // mean this function granting relay write access to a pubkey on the
+  // strength of a row it has just decided it cannot trust -- the loudest
+  // possible version of the objection schema.ts already makes to
+  // self-healing counters.
+  //
+  // Rows read: M plus an indexed seek each, where M is the member count.
+  const unallowedMembers = groupMembersWithoutAllowance(sql);
+  if (unallowedMembers.length > 0) {
+    report(
+      `${unallowedMembers.length} group member(s) have no allowed_pubkeys row, so the relay-wide write ` +
+        `gate refuses their events even though the group holds them as members`,
+      "nip29.ts applyModeration, which writes both tables together",
+      `Affected pubkeys: ${unallowedMembers.join(", ")}`,
     );
   }
 
@@ -629,6 +847,30 @@ export function auditMaintainedCounts(sql: SqlStorage, nowSec: number): void {
   );
 }
 
+// ---------------------------------------------------------------------
+// THE PARTITION RULE, stated once and obeyed by every query below.
+//
+// Every stored event lives in exactly one partition of `events` --
+// `is_group` 0 or 1 (src/groups.ts) -- and schema.ts declares the three
+// REQ-serving indexes as partial PAIRS keyed on it. SQLite uses a partial
+// index only for a query whose WHERE clause implies the index's own
+// predicate, so:
+//
+//   pinned to one partition   the same plan, and the same cost, as before
+//                             this column existed
+//   pinned to neither         no index qualifies; SCAN events
+//
+// Measured at 50,000 group events, `SELECT id FROM events WHERE pubkey = ?
+// AND kind = ?`: 2 rows read pinned, 51,500 unpinned.
+//
+// A lookup that is not about one partition in particular therefore runs
+// once per partition and concatenates, which costs one extra seek and
+// keeps every one of them index-served. Reads that ARE about one
+// partition -- everything a REQ produces -- pin it directly instead.
+//
+// Primary-key lookups (`WHERE id = ?`) are exempt and always were:
+// `sqlite_autoindex_events_1` is not partial, so an id seek needs no pin.
+// ---------------------------------------------------------------------
 export function eventExists(sql: SqlStorage, id: string): boolean {
   return sql.exec(`SELECT 1 FROM events WHERE id = ?`, id).toArray().length > 0;
 }
@@ -666,10 +908,20 @@ export function hasNonOwnerStorageHeadroom(sql: SqlStorage, limit: number): bool
 // rows-read ceiling, not the rows-written one -- see CLAUDE.md "The
 // budget".
 export function giftWrapCount(sql: SqlStorage): number {
-  return (
-    sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM events WHERE kind = ?`, GIFT_WRAP_KIND).toArray()[0]
-      ?.n ?? 0
-  );
+  // Both partitions: nothing stops a sender putting an `h` tag on a gift
+  // wrap, and a storage cap that only counted half of what it is capping
+  // would be a cap with a hole in it. Two index counts rather than one --
+  // measured at the same 500 rows the single count cost (the partial pair
+  // holds between them exactly the rows the whole index held).
+  return acrossScopes((scope) =>
+    sql
+      .exec<{ n: number }>(
+        `SELECT COUNT(*) AS n FROM events WHERE kind = ? AND is_group = ?`,
+        GIFT_WRAP_KIND,
+        scope,
+      )
+      .toArray(),
+  ).reduce((total, row) => total + row.n, 0);
 }
 
 interface StoreResult {
@@ -691,18 +943,28 @@ export function storeEvent(sql: SqlStorage, event: NostrEvent, ingestedAt: numbe
   }
 
   if (isReplaceableKind(event.kind)) {
-    const existing = sql
-      .exec<{ id: string; created_at: number }>(
-        `SELECT id, created_at FROM events WHERE pubkey = ? AND kind = ?`,
-        event.pubkey,
-        event.kind,
-      )
-      .toArray()[0];
-    if (existing && isSupersededBy(existing, event)) {
+    // Both partitions, because NIP-01 keys a replaceable event by
+    // (pubkey, kind) and says nothing about groups: the newest one wins
+    // whether or not either copy carries an `h` tag. Pinning only the
+    // incoming event's own partition would have let one author hold two
+    // "current" kind-10002s, one public and one group-scoped, which is a
+    // protocol divergence bought for nothing -- see the partition rule
+    // above for why the alternative (no pin at all) is a table scan.
+    const existing = acrossScopes((scope) =>
+      sql
+        .exec<{ id: string; created_at: number }>(
+          `SELECT id, created_at FROM events WHERE pubkey = ? AND kind = ? AND is_group = ?`,
+          event.pubkey,
+          event.kind,
+          scope,
+        )
+        .toArray(),
+    );
+    if (existing.some((row) => isSupersededBy(row, event))) {
       return { ok: true, message: "", stored: null };
     }
-    if (existing) {
-      deleteEventRow(sql, existing.id);
+    for (const row of existing) {
+      deleteEventRow(sql, row.id);
     }
     insertEventRow(sql, event, expirationOf(event), ingestedAt);
     return { ok: true, message: "", stored: event };
@@ -710,18 +972,22 @@ export function storeEvent(sql: SqlStorage, event: NostrEvent, ingestedAt: numbe
 
   if (isAddressableKind(event.kind)) {
     const d = dTagValue(event.tags);
-    const candidates = sql
-      .exec<{ id: string; created_at: number; tags: string }>(
-        `SELECT id, created_at, tags FROM events WHERE pubkey = ? AND kind = ?`,
-        event.pubkey,
-        event.kind,
-      )
-      .toArray();
-    const existing = candidates.find((c) => dTagValue(JSON.parse(c.tags) as string[][]) === d);
-    if (existing && isSupersededBy(existing, event)) {
+    // Both partitions, for the reason the replaceable branch above gives.
+    const candidates = acrossScopes((scope) =>
+      sql
+        .exec<{ id: string; created_at: number; tags: string }>(
+          `SELECT id, created_at, tags FROM events WHERE pubkey = ? AND kind = ? AND is_group = ?`,
+          event.pubkey,
+          event.kind,
+          scope,
+        )
+        .toArray(),
+    );
+    const matching = candidates.filter((c) => dTagValue(JSON.parse(c.tags) as string[][]) === d);
+    if (matching.some((c) => isSupersededBy(c, event))) {
       return { ok: true, message: "", stored: null };
     }
-    if (existing) {
+    for (const existing of matching) {
       deleteEventRow(sql, existing.id);
     }
     insertEventRow(sql, event, expirationOf(event), ingestedAt);
@@ -824,27 +1090,36 @@ function applyAddressDeletion(sql: SqlStorage, address: string, deletion: NostrE
   if (!Number.isInteger(kind) || pubkey !== deletion.pubkey) return;
   if (!isReplaceableKind(kind) && !isAddressableKind(kind)) return;
 
+  // Both partitions on both branches: a NIP-09 deletion names an address,
+  // and an author deleting their own address means all of it. See the
+  // partition rule above.
   if (isAddressableKind(kind)) {
-    const candidates = sql
-      .exec<{ id: string; created_at: number; tags: string }>(
-        `SELECT id, created_at, tags FROM events WHERE pubkey = ? AND kind = ? AND created_at <= ?`,
-        pubkey,
-        kind,
-        deletion.created_at,
-      )
-      .toArray();
+    const candidates = acrossScopes((scope) =>
+      sql
+        .exec<{ id: string; created_at: number; tags: string }>(
+          `SELECT id, created_at, tags FROM events WHERE pubkey = ? AND kind = ? AND created_at <= ? AND is_group = ?`,
+          pubkey,
+          kind,
+          deletion.created_at,
+          scope,
+        )
+        .toArray(),
+    );
     for (const c of candidates) {
       if (dTagValue(JSON.parse(c.tags) as string[][]) === d) deleteAndTombstone(sql, c.id);
     }
   } else {
-    const candidates = sql
-      .exec<{ id: string }>(
-        `SELECT id FROM events WHERE pubkey = ? AND kind = ? AND created_at <= ?`,
-        pubkey,
-        kind,
-        deletion.created_at,
-      )
-      .toArray();
+    const candidates = acrossScopes((scope) =>
+      sql
+        .exec<{ id: string }>(
+          `SELECT id FROM events WHERE pubkey = ? AND kind = ? AND created_at <= ? AND is_group = ?`,
+          pubkey,
+          kind,
+          deletion.created_at,
+          scope,
+        )
+        .toArray(),
+    );
     for (const c of candidates) deleteAndTombstone(sql, c.id);
   }
 }
@@ -920,21 +1195,36 @@ function vanishTargets(
   cutoffCreatedAt: number,
   limit: number,
 ): { id: string }[] {
-  return sql
-    .exec<{ id: string }>(
-      `SELECT id FROM events WHERE pubkey = ? AND created_at <= ?
-       UNION
-       SELECT id FROM events WHERE kind = ? AND created_at <= ?
-         AND id IN (SELECT event_id FROM event_tags WHERE tag_name = 'p' AND tag_value = ?)
-       LIMIT ?`,
-      requester,
-      cutoffCreatedAt,
-      GIFT_WRAP_KIND,
-      cutoffCreatedAt,
-      requester,
-      limit,
-    )
-    .toArray();
+  // Once per partition, and the partition pin reaches the tag subquery too
+  // -- see the partition rule above, and filters.ts for why a tag lookup
+  // that names no partition cannot use the pair either. A vanish covers
+  // everything the requester has here, group events included: NIP-62 binds
+  // the relay to erase, and an erasure that skipped the partition the
+  // requester happened to post in would be a compliance failure rather
+  // than a saving.
+  //
+  // `limit` is applied per partition and again by the caller's slice, so
+  // one drain batch stays bounded by the figure limits.ts paces it at.
+  return acrossScopes((scope) =>
+    sql
+      .exec<{ id: string }>(
+        `SELECT id FROM events WHERE pubkey = ? AND created_at <= ? AND is_group = ?
+         UNION
+         SELECT id FROM events WHERE kind = ? AND created_at <= ? AND is_group = ?
+           AND id IN (SELECT event_id FROM event_tags WHERE is_group = ? AND tag_name = 'p' AND tag_value = ?)
+         LIMIT ?`,
+        requester,
+        cutoffCreatedAt,
+        scope,
+        GIFT_WRAP_KIND,
+        cutoffCreatedAt,
+        scope,
+        scope,
+        requester,
+        limit,
+      )
+      .toArray(),
+  ).slice(0, limit);
 }
 
 // Whether this relay holds anything a vanish request would remove.
@@ -1104,19 +1394,46 @@ export function vanishSummary(sql: SqlStorage): VanishSummary {
   };
 }
 
+// What a READER is allowed to see, as opposed to what one query asks for.
+//
+// `scopes` is the partitions of `events` this read covers: the public rows
+// alone for every unauthenticated client, both for a reader the relay has
+// authorised (relay.ts handleReqInner). It is a list rather than a boolean
+// because it is not a filter condition -- each partition is a separate
+// query, for the reason filters.ts FilterQueryOptions.scope gives.
+export interface ReadOptions {
+  excludeGiftWraps?: boolean;
+  scopes?: readonly GroupScope[];
+}
+
 export function queryFilter(
   sql: SqlStorage,
   filter: Filter,
   nowSec: number,
-  options?: FilterQueryOptions,
+  options: ReadOptions = {},
 ): NostrEvent[] {
+  const scopes = options.scopes ?? [PUBLIC_SCOPE];
   const parts = expandFilter(filter);
-  const only = parts[0];
-  if (parts.length === 1 && only !== undefined) return runFilterQuery(sql, only, nowSec, options);
+  const perQuery = (scope: GroupScope): FilterQueryOptions => ({
+    ...(options.excludeGiftWraps === undefined ? {} : { excludeGiftWraps: options.excludeGiftWraps }),
+    scope,
+    // The tag scan budget is shared across the partitions this read
+    // covers, so an authorised read costs what limits.ts prices a tag
+    // filter at rather than twice it -- see FilterQueryOptions.
+    tagScanDivisor: scopes.length,
+  });
+
+  const onlyPart = parts[0];
+  const onlyScope = scopes[0];
+  if (parts.length === 1 && scopes.length === 1 && onlyPart !== undefined && onlyScope !== undefined) {
+    return runFilterQuery(sql, onlyPart, nowSec, perQuery(onlyScope));
+  }
 
   const byId = new Map<string, NostrEvent>();
-  for (const part of parts) {
-    for (const event of runFilterQuery(sql, part, nowSec, options)) byId.set(event.id, event);
+  for (const scope of scopes) {
+    for (const part of parts) {
+      for (const event of runFilterQuery(sql, part, nowSec, perQuery(scope))) byId.set(event.id, event);
+    }
   }
   const merged = [...byId.values()].sort(compareEvents);
   return filter.limit === undefined ? merged : merged.slice(0, filter.limit);
@@ -1276,7 +1593,7 @@ export function queryFilters(
   sql: SqlStorage,
   filters: Filter[],
   nowSec: number,
-  options?: FilterQueryOptions,
+  options?: ReadOptions,
 ): NostrEvent[] {
   const byId = new Map<string, NostrEvent>();
   for (const filter of filters) {
@@ -1474,14 +1791,254 @@ export interface AllowedPubkey {
   reason: string | null;
 }
 
+// The NIP-86 allowpubkey path, and the only one that writes
+// `source = 'owner'`. An existing row is PROMOTED rather than left alone:
+// an operator typing this command means the grant to outlive whatever the
+// group does next, and a kind-9001 remove-user must not be able to revoke
+// it afterwards. See schema.ts `allowed_pubkeys.source`.
 export function allowPubkey(sql: SqlStorage, pubkey: string, reason: string | null, nowSec: number): void {
   sql.exec(
-    `INSERT INTO allowed_pubkeys (pubkey, reason, allowed_at) VALUES (?, ?, ?)
-       ON CONFLICT(pubkey) DO UPDATE SET reason = excluded.reason, allowed_at = excluded.allowed_at`,
+    `INSERT INTO allowed_pubkeys (pubkey, reason, allowed_at, source) VALUES (?, ?, ?, 'owner')
+       ON CONFLICT(pubkey) DO UPDATE SET reason = excluded.reason, allowed_at = excluded.allowed_at,
+                                         source = 'owner'`,
     pubkey,
     reason,
     nowSec,
   );
+}
+
+// ---------------------------------------------------------------------
+// NIP-29 group membership (src/nip29.ts), and the group's half of the
+// allowlist beside it. Two nested lists: a row in `group_members` says a
+// pubkey may write `h`-tagged events, a row in `allowed_pubkeys` says it
+// may write here at all, and a member needs both -- see schema.ts
+// `allowed_pubkeys.source` for why the second one has to remember who
+// created it.
+// ---------------------------------------------------------------------
+
+// The row a new member needs in order to reach the relay at all -- written
+// by kind-9000 put-user and by a redeemed kind-9021 join request, which is
+// why the reason is the caller's to supply rather than a constant here.
+// DO NOTHING on conflict rather than an upsert. A pubkey already carrying
+// an owner-granted allowance keeps it as owner-granted: put-user must
+// never demote a deliberate grant into one remove-user can reclaim, which
+// an upsert writing `source = 'invite'` would do silently. And a pubkey
+// already carrying an invite-granted one needs nothing changed.
+export function allowPubkeyForGroup(
+  sql: SqlStorage,
+  pubkey: string,
+  reason: string,
+  nowSec: number,
+): void {
+  sql.exec(
+    `INSERT INTO allowed_pubkeys (pubkey, reason, allowed_at, source)
+       VALUES (?, ?, ?, 'invite')
+       ON CONFLICT(pubkey) DO NOTHING`,
+    pubkey,
+    reason,
+    nowSec,
+  );
+}
+
+// The inverse, and deliberately narrower than "delete the row": only what
+// the group itself granted comes back out. `AND source = 'invite'` is the
+// whole point of that column.
+export function revokeGroupAllowance(sql: SqlStorage, pubkey: string): void {
+  sql.exec(`DELETE FROM allowed_pubkeys WHERE pubkey = ? AND source = 'invite'`, pubkey);
+}
+
+export function addGroupMember(sql: SqlStorage, pubkey: string, nowSec: number): void {
+  sql.exec(`INSERT INTO group_members (pubkey, added_at) VALUES (?, ?) ON CONFLICT(pubkey) DO NOTHING`,
+    pubkey, nowSec);
+}
+
+export function removeGroupMember(sql: SqlStorage, pubkey: string): void {
+  sql.exec(`DELETE FROM group_members WHERE pubkey = ?`, pubkey);
+}
+
+// The write-path check (nip29.ts authorizeGroupWrite). Reached only for an
+// event carrying an `h` tag whose author is not the owner, so ordinary
+// traffic never pays it.
+export function isGroupMember(sql: SqlStorage, pubkey: string): boolean {
+  return sql.exec(`SELECT 1 FROM group_members WHERE pubkey = ?`, pubkey).toArray().length > 0;
+}
+
+// Ordered by pubkey, which makes the regenerated kind-39002 member list a
+// function of the member SET alone. That is what lets nip29.ts decide
+// whether to write a new one by comparing tags: ordered by `added_at`
+// instead, removing a member and adding them back would move them to the
+// end and rewrite an event whose membership had not changed.
+export function listGroupMembers(sql: SqlStorage): string[] {
+  return sql
+    .exec<{ pubkey: string }>(`SELECT pubkey FROM group_members ORDER BY pubkey ASC`)
+    .toArray()
+    .map((r) => r.pubkey);
+}
+
+// Group members with no `allowed_pubkeys` row: the containment the two
+// nested lists are supposed to have, checked once a day by
+// auditMaintainedCounts above. M rows plus an indexed seek each, where M
+// is the member count.
+export function groupMembersWithoutAllowance(sql: SqlStorage): string[] {
+  return sql
+    .exec<{ pubkey: string }>(
+      `SELECT m.pubkey FROM group_members m
+         LEFT JOIN allowed_pubkeys a ON a.pubkey = m.pubkey
+        WHERE a.pubkey IS NULL
+        ORDER BY m.added_at ASC`,
+    )
+    .toArray()
+    .map((r) => r.pubkey);
+}
+
+// ---------------------------------------------------------------------
+// NIP-29 invite codes (src/nip29.ts). One row per kind-9009 the owner
+// publishes; the row, not the event, is what a kind-9021 join request is
+// checked against -- see schema.ts `group_invites`.
+// ---------------------------------------------------------------------
+
+export interface GroupInvite {
+  code: string;
+  created_at: number;
+  expires_at: number;
+  redeemed_at: number | null;
+  redeemed_by: string | null;
+  revoked_at: number | null;
+}
+
+// What a presented code turned out to be. Four of the five are refusals,
+// and nip29.ts collapses all of them into ONE message on the wire -- this
+// distinction exists for the owner's log line and for the NIP-86 methods,
+// never for the person who presented the code. See handleJoinRequest.
+export type InviteOutcome = "redeemed" | "unknown" | "revoked" | "spent" | "expired";
+
+export function lookupInvite(sql: SqlStorage, code: string): GroupInvite | null {
+  return (
+    sql
+      .exec<{
+        code: string;
+        created_at: number;
+        expires_at: number;
+        redeemed_at: number | null;
+        redeemed_by: string | null;
+        revoked_at: number | null;
+      }>(
+        `SELECT code, created_at, expires_at, redeemed_at, redeemed_by, revoked_at
+           FROM group_invites WHERE code = ?`,
+        code,
+      )
+      .toArray()[0] ?? null
+  );
+}
+
+export function createInvite(sql: SqlStorage, code: string, createdAt: number, expiresAt: number): void {
+  sql.exec(
+    `INSERT INTO group_invites (code, created_at, expires_at) VALUES (?, ?, ?)`,
+    code,
+    createdAt,
+    expiresAt,
+  );
+}
+
+// Outstanding means redeemable right now: unspent, unrevoked, unexpired.
+// The same three conditions as listUnusedInvites below and as the
+// redeemable branch of redeemInvite -- stated three times because they
+// are three different statements, and kept identical because a row this
+// count admits and a redemption refuses would be a cap the owner cannot
+// clear by using the invites it is counting.
+export function countOutstandingInvites(sql: SqlStorage, nowSec: number): number {
+  return (
+    sql
+      .exec<{
+        n: number
+      }>(
+        `SELECT COUNT(*) AS n FROM group_invites
+          WHERE redeemed_at IS NULL AND revoked_at IS NULL AND expires_at > ?`,
+        nowSec,
+      )
+      .toArray()[0]?.n ?? 0
+  );
+}
+
+export interface UnusedInvite {
+  code: string;
+  created_at: number;
+  expires_at: number;
+}
+
+export function listUnusedInvites(sql: SqlStorage, nowSec: number): UnusedInvite[] {
+  return sql
+    .exec<{ code: string; created_at: number; expires_at: number }>(
+      `SELECT code, created_at, expires_at FROM group_invites
+        WHERE redeemed_at IS NULL AND revoked_at IS NULL AND expires_at > ?
+        ORDER BY created_at DESC`,
+      nowSec,
+    )
+    .toArray();
+}
+
+// Classify, then spend -- both here, so SINGLE USE is a property of one
+// statement rather than of a caller's ordering.
+//
+// The UPDATE repeats every condition the SELECT above just checked, which
+// looks redundant and is not the same claim: the SELECT decides what to
+// TELL the owner, the UPDATE decides what to WRITE, and only the second
+// one has to be safe against two redemptions of the same code. A Durable
+// Object is single-threaded and nothing awaits between these two
+// statements, so today they cannot disagree; the guard is what keeps that
+// true if a future caller ever puts something between them.
+//
+// The classification order is revoked, then spent, then expired, because
+// a row can be more than one at once and the owner wants the most
+// decisive reason: an invite that was revoked and has since also lapsed
+// was revoked, and saying "expired" would describe the clock instead of
+// the act.
+export function redeemInvite(
+  sql: SqlStorage,
+  code: string,
+  pubkey: string,
+  nowSec: number,
+): InviteOutcome {
+  const invite = lookupInvite(sql, code);
+  if (invite === null) return "unknown";
+  if (invite.revoked_at !== null) return "revoked";
+  if (invite.redeemed_at !== null) return "spent";
+  if (invite.expires_at <= nowSec) return "expired";
+  sql.exec(
+    `UPDATE group_invites SET redeemed_at = ?, redeemed_by = ?
+      WHERE code = ? AND redeemed_at IS NULL AND revoked_at IS NULL AND expires_at > ?`,
+    nowSec,
+    pubkey,
+    code,
+    nowSec,
+  );
+  return "redeemed";
+}
+
+// What a revoke did. A separate type from InviteOutcome above, which
+// describes a REDEMPTION -- reusing it would have made "revoked" mean
+// "this revoke succeeded" in one function and "this code was already dead
+// when you presented it" in the other.
+export type RevokeOutcome = "revoked" | "unknown" | "spent" | "already-revoked";
+
+// NIP-86 revokeinvite (src/nip86.ts). Says exactly why a revoke did
+// nothing -- here the caller IS the owner, so there is nobody to keep the
+// distinction from, which is the opposite of the join path's rule.
+//
+// A spent invite is left alone rather than marked revoked: it is already
+// unusable, and overwriting its history would lose `redeemed_by`, which
+// is the only record of who the code let in.
+//
+// An EXPIRED but unspent invite is revoked normally rather than reported
+// as already-dead. The owner saying they meant it dead outlives the clock
+// having made it so, and the row is what an admin reads back later.
+export function revokeInvite(sql: SqlStorage, code: string, nowSec: number): RevokeOutcome {
+  const invite = lookupInvite(sql, code);
+  if (invite === null) return "unknown";
+  if (invite.revoked_at !== null) return "already-revoked";
+  if (invite.redeemed_at !== null) return "spent";
+  sql.exec(`UPDATE group_invites SET revoked_at = ? WHERE code = ? AND redeemed_at IS NULL`, nowSec, code);
+  return "revoked";
 }
 
 export function unallowPubkey(sql: SqlStorage, pubkey: string): void {

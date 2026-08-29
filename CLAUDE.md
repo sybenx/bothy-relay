@@ -8,21 +8,31 @@ A single-user nostr relay that deploys in one click and runs on the Cloudflare W
 - Exactly one Durable Object (`Relay`, [src/relay.ts](src/relay.ts)), addressed by `idFromName("relay")`. SQLite-backed. All protocol state, storage, and subscriptions live here.
 - WebSocket Hibernation API throughout (`acceptWebSocket`, `webSocketMessage`/`webSocketClose`/`alarm`), `setWebSocketAutoResponse` for ping/pong. The Durable Object must never open an outbound connection — doing so breaks hibernation. The Worker owns every outbound connection (claim-time profile lookup, backfill fetches) on the DO's behalf.
 - TOFU ownership: unclaimed until `POST /api/claim` binds a pubkey, permanently, with no signature required (`OWNER_PUBKEY` env var skips this and disables the endpoint). Every event is still signature-verified regardless of owner.
-- Writes are owner-gated, with two exceptions: `ALLOW_FOLLOWS` (opt-out, on unless set to `"false"`) also accepts the owner's kind-3 follow list (cached from the owner's own stored contact list, refreshed immediately when the owner publishes a new one to this relay, with hourly cron as the fallback for when it arrived some other way — never fetched per event); kind-1059 gift wraps (NIP-59) are accepted from anyone, p-tag-addressed to the owner, gated by their own storage cap and per-IP throttle on top of the general write caps below. [docs/rungs.md](docs/rungs.md) describes this kind of escalation generically, in terms of who may write and what bounds the volume — bothy implements rung 3 (follows may write) with kind-1059 gift wraps layered in as an instance of rung 2 (addressed mail).
+- Writes are owner-gated, with two exceptions: `ALLOW_FOLLOWS` (opt-out, on unless set to `"false"`) also accepts the owner's kind-3 follow list (cached from the owner's own stored contact list, refreshed immediately when the owner publishes a new one to this relay, with hourly cron as the fallback for when it arrived some other way — never fetched per event); kind-1059 gift wraps (NIP-59) are accepted from anyone, p-tag-addressed to the owner, gated by their own storage cap and per-IP throttle on top of the general write caps below. [docs/rungs.md](docs/rungs.md) describes this kind of escalation generically, in terms of who may write and what bounds the volume — bothy implements rung 3 (follows may write) with kind-1059 gift wraps layered in as an instance of rung 2 (addressed mail). NIP-29 invites are not a rung: the ladder classifies WHO may write, and an invite enrols one named individual into the allowlist rung 1 already describes — bounded by the owner's issuance rate and `MAX_OUTSTANDING_INVITES`, not by a new class of writer.
 - Gift wrap reads require NIP-42 AUTH as the p-tagged recipient, and the gate is **omission, not refusal**: a filter naming kind 1059 is refused from `f.kinds` alone with no storage access, and a filter that names no `kinds` is answered normally with the kind-1059 rows dropped from the query (`filters.ts excludeGiftWraps`). It used to decide by probing storage — re-run the filter restricted to 1059, refuse if anything came back — and that made the refusal itself the answer: an unauthenticated `{"#p":[owner],"since":S,"until":U,"limit":1}` said `auth-required` when a wrap fell inside the window and `EOSE` when none did, so bisecting since/until yielded exact arrival windows and an exact inbox count without ever naming 1059. Refusal leaks; omission does not. In SQL and never in memory afterwards, because a client asking for 20 and receiving 8 has counted the wraps in its own window.
+- NIP-29 group events — any event carrying an `h` tag, of any kind, PLUS the relay-generated 39000-series, which carries a `d` tag and no `h` ([src/groups.ts](src/groups.ts)) — are held in a separate PARTITION of `events`/`event_tags` (`is_group`) and omitted from every unauthenticated read. Kind-agnostic, because NIP-29 scopes a group by that tag and not by a kind range: a kind-1 note, a kind-7 reaction and a kind-30023 post are all group events if they name a group. The exclusion covers four surfaces, not one — REQ results, `broadcast()` (a subscription registered before an event arrives is never re-examined by the REQ-time gate, which is why gift wraps gate there separately too), `liveBroadcast()` (the `/live` feed has no authentication at all), and the public counters on `/api/stats` (polling `totalEvents` while holding a `/live` socket dates every arrival to the second — the same shape the gift wrap review found). Same omit-don't-refuse rule as gift wraps: a filter that NAMES a group (`{"#h":[...]}`) is refused with `auth-required` from the filter alone, and a filter that does not is answered normally with the group's rows omitted. Reads are gated on the owner's NIP-42 identity, because membership is not modelled on the READ side yet — it is on the write side, which is a real asymmetry: a member can write to the group and cannot read it back (see "What it refuses to be" below). The 39000-series was the hole in that partition, and it was open for exactly one release: `isGroupEvent` tested the `h` tag, and NIP-29 puts the group id of the relay-generated events in a `d` tag "instead of the `h` tag" — so kind-39001 (the admin list) and kind-39002 (the member list), the two events that enumerate the group's membership in `p` tags, carried no `h`, landed in the PUBLIC partition, and were served to any unauthenticated client that asked. The exclusion covered every event in the group except the list of who was in it. `isGroupMetadataKind` closes it by KIND, over the whole 39000–39005 range, and not by `d` tag: `d` is the generic addressable identifier every kind in 30000–39999 carries, so it names a group only in that range and cannot be the test. `filterNamesGroup` widens the same way — a filter naming one of those kinds is refused from `kinds` alone, exactly as a filter naming 1059 is, while a filter naming only `#d` is answered by omission, since refusing on `d` would refuse reads of unrelated addressable kinds that happen to share an identifier. The exclusion is a partition seek, not a post-filter: `is_group` is carried as partial index PAIRS (`WHERE is_group = 0` / `= 1`) rather than as a widened key column, because a widened key column changes the plan of every query that does not name it — measured, the owner's own authenticated `{"#p":[owner],"kinds":[1059]}` read went from 601 rows to 204,701 under a widened index, against 567 under partial pairs (see `src/groups.ts` and `schema.ts INDEXES` for the full reasoning and measurements).
+- NIP-29 group WRITES ([src/nip29.ts](src/nip29.ts)): one group, id `_` (`groups.ts TOP_LEVEL_GROUP_ID`), owner as sole admin. Kinds 9000 put-user, 9001 remove-user, 9002 edit-metadata and 9009 create-invite are implemented; the rest of NIP-29's 9000–9020 moderation range is refused BY NAME rather than stored as an inert group note, since a kind-9005 delete-event answered `["OK", id, true]` that deletes nothing is worse than a refusal. Kind 9007 create-group is deliberately absent: NIP-29 has no creation step ("what happens is just that relays will create rules around some specific ids"), and with one group whose id is a constant there is nothing to create — 9002 edit-metadata is what brings the group's metadata into being. The group id is enforced on moderation events only, where it selects what gets mutated; ordinary `h`-tagged traffic naming some other id is still partitioned and still gated by the one member list, because deciding what a group IS belongs at the partition and not at the write gate.
+- **NIP-29 invites** (kind 9009 create-invite, kind 9021 join request). An invite code is a BEARER TOKEN — the relay cannot authenticate who will present it, which is the point: an invite link has to work for somebody whose npub does not exist until they click it. So the controls are lifetime, count, guessability and guess rate, all in `limits.ts`: single use (one code admits one pubkey, spent thereafter), mandatory expiry (7 days by default, 30 at most, refused rather than clamped when a `kind:9009` asks for longer, since a clamped invite is a link the client goes on describing wrongly), a 16-character minimum (the only guessing floor a relay can enforce over a code it did not generate — length is not entropy, and the per-IP throttle of 5 join requests/minute is what actually bounds the deliberate case), and `MAX_OUTSTANDING_INVITES` = 64, which bounds the NIP-86 list rather than the owner. A code this relay has ever issued is never reissued: an upsert would hand its original redeemer a second admission and overwrite the only record of who it let in. Redeeming writes BOTH nested lists, `source = 'invite'`, so a 9001 remove-user reclaims it exactly as it reclaims a put-user's grant.
+- **The join request is the third path dispatched above both write gates**, necessarily — somebody joining is by definition not in `allowed_pubkeys`, so `isAllowedWriter` would refuse the one event whose whole purpose is getting them past it. It therefore owes the group partition what the other two owe it, and pays the same way NIP-62 vanish does: **nothing is stored**. A kind-9021 carries an `h` tag, so storing one would put a stranger's event into the group partition through a path no group authorization gates — the gift wrap defect below, rebuilt. The only event a successful join produces is this relay's own regenerated kind-39002, which is the canonical record of the membership anyway. Signature verification runs BEFORE the invite lookup, inverting this project's cheapest-first convention on purpose: refusing a bad code ahead of a bad signature would let a caller offer guesses under junk signatures and tell a real code from a fake one by which complaint came back.
+- **A refused join says one thing, whatever went wrong.** Spent, expired, revoked and unknown are four different states and all four get `JOIN_REFUSAL_MESSAGE` verbatim — "spent" or "expired" would confirm the code was REAL, which confirms this relay hosts a group somebody was invited to, and "unknown" against a guess confirms the opposite; either way the refusal becomes a one-bit oracle tested a guess at a time, which is exactly what the gift wrap read gate was before it stopped deciding by probing storage. A request naming another group id, and one carrying no code at all, get the same string too: answering "wrong group id" would confirm which id this relay does host. The owner gets the distinction through a channel a stranger cannot read — a `console.warn` naming the reason (with the code truncated to 12 characters and `JSON.stringify`d, since it is attacker-chosen text going into a log) and the two NIP-86 methods. What is NOT hidden is timing: a known code costs one row read more than an unknown one before the same refusal. Levelling that with a dummy read would be defending against an adversary who can already do better by other means.
+- **`closed` stays on the generated kind-39000, and the note predicting its removal is what changed.** It was read as "join requests are ignored"; NIP-29's own sentence is "If a group is `closed`, join requests are not honored unless they include an invite code", which is precisely what this relay now does. Invite-only IS the closed group; `open` would be the tag that lies.
+- **Two nested lists.** `allowed_pubkeys` is the outer one (relay-wide write access, what `ownership.ts isAllowedWriter` consults); `group_members` is the inner one (permission to write an `h`-tagged event, on top of that). `relay.ts handleEventInner` calls `nip29.ts authorizeGroupWrite` UNDER the relay-wide gate, never beside it, and three integer comparisons return early for any event that is neither group-scoped nor moderation, so ordinary writes pay nothing. `allowed_pubkeys.source` is `owner` or `invite`: put-user and a redeemed kind-9021 both write the row a new member needs as `invite`, remove-user deletes only `invite` rows, and a NIP-86 `allowpubkey` on an existing row PROMOTES it to `owner` — an explicit act outranks the group's bookkeeping, and the promotion is one-way. Without that column remove-user would have two options and both are wrong: revoke a grant the owner made deliberately, or let every ex-member keep writing forever.
+- **The relay signing its own events** is new to this codebase, and the rule is: bypass the GATE, never the BOOKKEEPING. A relay-generated 39000/39001/39002 never enters `handleEventInner` — there is nobody to authorize — but it goes through `storage.ts storeEvent`, the same function every client write reaches, so it pays the maintained counters, both hour buckets, the stamped `row_cost`, the `is_group` partition and the addressable-replacement rule exactly as any other event does. There is no second insert path and there must never be one: half of `storeEvent` reimplemented is half of the budget accounting missing, and the accounting is the part nothing would notice was wrong. `test/nip29-groups.test.ts` asserts it by running the daily counter audit — which recounts the table rather than trusting the counters — over a relay whose only events are relay-generated. The secret key stays behind `relay-identity.ts signAsRelay`, which is handed a 32-byte hash and returns a signature; `nip29.ts` builds the event and computes its id through the same `validate.ts computeEventId` every client event goes through, so these verify like any other event.
+- The three are regenerated only when their own content changes, compared tag-by-tag before writing — the same measure-before-writing rule `ownership.ts refreshFollows` applies to the follow cache and for the same reason: a membership change touches neither the admin list nor the metadata, and rewriting all three anyway would delete and re-insert two unchanged addressable events every time. Each regeneration is stamped `max(now, previous + 1)` rather than `now`, because NIP-01 breaks a `created_at` tie on an addressable event by LOWEST id — two membership changes in the same wall-clock second would otherwise produce a member list that loses to the one it replaces about half the time, and lose SILENTLY, since `storeEvent` reports success with `stored: null`. The generated 39000 carries the operator's `name`/`picture`/`banner`/`about` from the triggering 9002 (or forward from the previous document, so an unrelated regeneration cannot blank the group's name) and then the policy tags `private`/`restricted`/`hidden`/`closed`, which are facts about what this relay enforces rather than preferences a 9002 expresses. `closed` is the one expected to come off, when invites land.
 - NIP-09 deletion and NIP-62 vanish requests both tombstone ids (`deleted_ids`) so a deleted event — gift wraps especially, since the sender keeps their own signed copy — can't be replayed back into storage.
 - Live feed (`/live`) is a separate, unauthenticated, push-only WebSocket channel for the admin page, capped at 5 concurrent connections and a 10-minute server-enforced lifetime (DO alarm). Never sends gift wraps or event content, only kind/time/truncated id.
-- NIP-86 relay management API: `banevent`/`allowevent`/`listbannedevents`, `banpubkey`/`unbanpubkey`/`listbannedpubkeys`, `allowpubkey`/`unallowpubkey`/`listallowedpubkeys`, `blockip`/`unblockip`/`listblockedips`, and `changerelayname`/`changerelaydescription`/`changerelayicon`, plus `supportedmethods`. Authenticated by a NIP-98 event ([src/nip98.ts](src/nip98.ts)) signed by the owner, with the `payload` tag required rather than optional; verification runs in the Worker so a forged request costs no DO time, and storage mutations go to the DO by RPC (`Relay.manage`). Phase one shipped only the methods that cost nothing on the per-event write path; phase two (`banpubkey`/`allowpubkey`) is the one addition that does, landed only once a metrics baseline existed to compare against — see CLAUDE.md "The budget". The kind allowlist methods answer with an explanation rather than a generic unknown-method error, since bothy stores every kind deliberately.
+- NIP-86 relay management API: `banevent`/`allowevent`/`listbannedevents`, `banpubkey`/`unbanpubkey`/`listbannedpubkeys`, `allowpubkey`/`unallowpubkey`/`listallowedpubkeys`, `blockip`/`unblockip`/`listblockedips`, `changerelayname`/`changerelaydescription`/`changerelayicon`, and `listunusedinvites`/`revokeinvite`, plus `supportedmethods`. Authenticated by a NIP-98 event ([src/nip98.ts](src/nip98.ts)) signed by the owner, with the `payload` tag required rather than optional; verification runs in the Worker so a forged request costs no DO time, and storage mutations go to the DO by RPC (`Relay.manage`). Phase one shipped only the methods that cost nothing on the per-event write path; phase two (`banpubkey`/`allowpubkey`) is the one addition that does, landed only once a metrics baseline existed to compare against — see CLAUDE.md "The budget". The kind allowlist methods answer with an explanation rather than a generic unknown-method error, since bothy stores every kind deliberately. `listunusedinvites`/`revokeinvite` are bothy's own — NIP-86 defines no invite methods — and they are the deliberate MIRROR of the join path's uniform refusal: here the caller is the owner, authenticated by a NIP-98 signature over this exact request, so spent, already-revoked and never-issued are each named in full. There is no creation method to match them: an invite is created by publishing a kind-9009, which is a signed part of the group's history, and a second way in over HTTP would put one act on two paths with only one of them recorded in the group.
 - `banevent` writes both a `banned_events` row and a `deleted_ids` tombstone: the ban is what the operator reads back, the tombstone is what actually refuses a re-send or a backfill replay. `listbannedevents` reads `banned_events`, never `deleted_ids` — the latter holds NIP-09 and NIP-62 deletions too. `allowevent` is the one place in the codebase that deletes a tombstone.
 - `banpubkey`/`allowpubkey` are two independent lists (`banned_pubkeys`/`allowed_pubkeys`), not opposite ends of one — unlike `allowevent`, `unbanpubkey` and `unallowpubkey` each just delete their own row. `ownership.ts isAllowedWriter` checks `banned_pubkeys` before the follows lookup, unconditionally for every non-owner write, so a banned pubkey is refused even if it's also a follow; it checks `allowed_pubkeys` only on the path already about to reject (owner-only mode, or "not a follow"), so that lookup costs nothing on the common accept path. The owner's own pubkey can never be banned — `banpubkey` refuses the call outright rather than accepting it and having no effect.
 - IP blocks are checked exactly once per WebSocket connection in `Relay.fetch`, never per message, and never on the management endpoint — blocking your own address must not lock you out of the API that unblocks it. Blocking the caller's own address refuses once and names an exact confirmation string to pass back as the reason.
 - The NIP-11 document also carries `pubkey` (the owner's, from `getOwnerPubkey` — omitted while unclaimed) and `contact` (the owner's kind-0 `website`, omitted if absent). Neither has an environment-variable or NIP-86 rung: name/description/icon do because an operator may want the relay to present differently from the person, and a contact address has no such split. `website` and not `nip05` or `lud16` — see `resolveContact`.
+- The relay has its own signing keypair, generated once at schema-init time and unrelated to `pubkey`/`OWNER_PUBKEY` above — see [src/relay-identity.ts](src/relay-identity.ts). NIP-29 requires 39000-series group metadata events to be "signed by the relay keypair directly"; `src/nip29.ts` is what does that signing. The public half is `self` on the NIP-11 document — the standard field for it (nips/11.md "Self"), and the one NIP-29 points a client at for verifying 39000-series events — and `relayPubkey` on `/api/stats`, both unconditionally present (unlike `pubkey`, this doesn't depend on claim status). It shipped for one release as `relay_pubkey`, a name of our own invention, which was harmless while nothing signed anything and became a conformance bug the moment `nip29.ts` started generating events. The secret half is never exposed anywhere — not `/api/stats`, not NIP-11, not NIP-86, not a log line.
 - Relay name, description and icon resolve through one chain in [src/nip11.ts](src/nip11.ts): environment variable, then stored value (NIP-86 `change*`), then the owner's kind-0 (`name`/`about`/`picture`), then a hardcoded default. A `change*` call under a set environment variable still stores the value and says the variable is winning — store and warn, never silently discard. An empty string clears the stored value; NIP-86 defines no unset operation, so this is bothy's convention and is documented in the README. Every successful `change*` response carries an error-field note teaching that escape hatch and pointing at the NIP-11 document as the readback. A name derived from the owner's kind-0 renders possessively ("Aaron's relay", always `'s`); a chosen name from any other rung is used verbatim. `resolveName` backs both the NIP-11 document and `/api/stats`, so the two can never disagree.
 - One-shot backfill pulls the owner's own historical events from their kind-10002 write relays, resumable across cron ticks, reserving at most half the daily rows-written budget so it never competes with the owner's live traffic.
 
 ## What it refuses to be
 
-No payments/zaps, no multi-region/D1/read-replica scaling, no NIP-05 hosting, no media/blossom uploads, no community moderation tooling (no moderator roles, no invite system, no report queue — the NIP-86 management API is the owner administering their own relay, which is a different thing), no public write mode, no continuous multi-relay sync (backfill is one-shot only). See [README.md](README.md) "What this is not".
+No more than one group. Membership is created by the owner publishing a put-user, by a stranger redeeming an invite the owner issued (kind 9009/9021), or by hand through NIP-86 `allowpubkey` for the outer list — and no other way: no self-service join without a code, no request queue for an uninvited kind-9021 to wait in (there is no moderator to hold it for, so it is refused rather than held), no roles beyond the single owner-admin (no kind-39003, because one role every admin has and no moderation event can grant is not information a client can act on), no member-side READS (still gated on the owner's NIP-42 identity), no group deletion or event pinning (kinds 9008/9010), no subgroups, no timeline references, no LiveKit, no payments/zaps, no multi-region/D1/read-replica scaling, no NIP-05 hosting, no media/blossom uploads, no community moderation tooling (no moderator roles, no invite system, no report queue — the NIP-86 management API is the owner administering their own relay, which is a different thing), no public write mode, no continuous multi-relay sync (backfill is one-shot only). See [README.md](README.md) "What this is not".
 
 ## Configuration
 
@@ -58,7 +68,8 @@ which carry about five single-letter tags each).
 ### Rows written, per stored event
 
 ```
-9 + 3 × (single-letter tag count)
+measured   9 + 3 × (single-letter tag count)
+charged   12 + 4 × (single-letter tag count)   <- deliberately high, see below
 ```
 
 Six for the event row: one base row, one for the implicit unique index behind
@@ -69,6 +80,29 @@ rowid-aliased, so one row apiece). Three per indexed tag row: the row and its tw
 indexes. A bare note costs 9, a reply carrying `#e` and `#p` costs 15, a real note
 carrying about five tags costs 24. A delete is a write too, so a replacement or a
 NIP-09 deletion costs this shape again, plus 2 for a tombstone.
+
+`eventRowCost` charges more than an event costs, on purpose. The three
+REQ-serving indexes on `events` and the tag lookup index are declared as
+partial PAIRS keyed on `is_group` (one half over the public partition, one
+over the group partition), and a stored row satisfies exactly one half of
+each pair — so it pays one index entry per pair, exactly what the single
+index it replaced cost. `EVENT_BASE_ROW_COST` is
+`2 + indexesOn("events").length` and counts the halves separately, so a real
+five-tag note is charged 32 and spends 24.
+
+Left wrong, because every consumer of that number is a GUARD and an
+over-estimate makes each of them stricter rather than looser:
+`BACKFILL_PAGE_SIZE` fetches smaller pages, `VANISH_BATCH_SIZE` drains fewer
+events per tick, `hasBackfillHeadroom` stops sooner, and the `row_cost`
+stamped on each row reads high. Slower, never overrunning — the same
+direction `eventRemovalBudget` is deliberately wrong in.
+[test/hibernation.test.ts](test/hibernation.test.ts) pins the measured cost,
+the charged cost and the gap between them, so the wrongness cannot drift and
+a fix cannot land quietly. The one place it is NOT safe is
+`auditMaintainedCounts`' rows-written check, which is a floor: a floor above
+what the meter can report is a daily false alarm, so that one comparison
+converts the stamped sum back through `eventRowCostMeasured`. When the
+derivation is fixed, the two become equal and that arithmetic goes with it.
 
 The three counter rows are the price of `/api/stats` no longer scanning or
 sampling anything at all — 3 rows written per event against ~1,100 events/day
@@ -122,11 +156,83 @@ adding an index updates the admin page, backfill's headroom guard and
 `BACKFILL_PAGE_SIZE`'s sizing at once. `events.row_cost` stamps the figure at
 insert time so `estimateRowsWrittenSince` can sum a column.
 
+### Rows written, per NIP-29 membership change
+
+Measured (`test/nip29-groups.test.ts`), at a 21-member list going to 22:
+
+```
+the kind-9000 itself      9 + 3 x 2 tags (`h`, `p`)                  15
+group_members row         1 base + 1 PK index                         2
+allowed_pubkeys row       1 base + 1 PK index                         2
+removing the old 39002    22 tag rows + 1 event row + 3 counters      26
+storing the new 39002     9 + 3 x 23 tags                             78
+                                                                    ---
+                                                                    123
+```
+
+The kind-39002 member list dominates, and it is **replaced in place, not
+accumulated** — it is an addressable kind, so `storeEvent`'s addressable
+branch removes the previous version keyed by (pubkey, kind, `d`). No
+tombstone: a replacement is not a deletion. It grows at 3 rows per member
+on the insert and 1 on the removal, so **~4 rows per member per membership
+change on top of a fixed ~45**. A twenty-person group churns ~123 rows per
+change; a two-hundred-person one would churn ~845. Against the 100,000/day
+ceiling that is ~800 membership changes a day at twenty members and ~118 at
+two hundred — which was written down as the number to look at before this
+grew a self-service join path, since a join path is what turns "the owner
+occasionally adds somebody" into a rate strangers choose. It has now grown
+one, and the section below is that arithmetic.
+
+The kind-39000 metadata and kind-39001 admin list are NOT in that figure:
+neither changed, so neither was rewritten. Regenerating all three on every
+membership change would have added ~60 rows to it for no change in content.
+Re-adding a member who is already in the group costs 15 — the moderation
+event, which is part of the group's canonical history, and nothing else.
+
+### Rows written, per invite and per join
+
+Measured (`test/nip29-invites.test.ts`), against the same 21-member list:
+
+```
+issuing an invite (kind 9009)
+  the kind-9009 itself      9 + 3 x 1 indexed tag (`h`)                12
+  group_invites row         1 base + 1 PK index                         2
+  regeneration              nothing changed                             0
+                                                                      ---
+                                                                       14
+
+redeeming one (kind 9021)
+  the kind-9021 itself      NOT STORED                                  0
+  spending the invite       1 row updated in place                      1
+  group_members row         1 base + 1 PK index                         2
+  allowed_pubkeys row       1 base + 1 PK index                         2
+  removing the old 39002    22 tag rows + 1 event row + 3 counters      26
+  storing the new 39002     9 + 3 x 23 tags                            78
+                                                                      ---
+                                                                      109
+```
+
+The kind-9009 costs 12 and not 15 because `code` is a multi-character tag
+name and `event_tags` indexes single letters only — the code lives in the
+event body, where a reader entitled to the group partition can see it and
+no tag filter can be pointed at it.
+
+A join is CHEAPER than the put-user it replaces (109 against 123): the 15
+rows a kind-9000 spends on its own event row and tags become the 1 row the
+invite spends marking itself spent, because the request is never stored.
+The member list dominates either way, so the ~4 rows per member per
+membership change holds unchanged. What is new is who chooses the rate, and
+`MAX_OUTSTANDING_INVITES` is what bounds it: 64 live invites redeemed all at
+once is ~7,000 rows, ~7% of the daily ceiling. A refused join writes **0**.
+
 ### Rows read, by path
 
 | Path | Rows read |
 |---|---|
 | REQ filter, `ids` | 1 per id, × combinations |
+| Group exclusion, any filter | 0 — it is a partition seek, not a post-filter |
+| REQ filter, reader authorised for the group | × 2, one query per partition |
+| Any `events` lookup that names no partition | the whole table — see below |
 | REQ filter, `#<letter>` tag | ~2 per matching tag row |
 | REQ filter served by an index | combinations × (2 × limit + 1) |
 | Gift wrap exclusion, tag-driven filter | 0 — bounded by the tag subquery's own LIMIT |
@@ -137,19 +243,23 @@ insert time so `estimateRowsWrittenSince` can sum a column.
 | `ingested24h` + `rowsWrittenToday` (`readIngestCounts`) | ≤ 25 bucket rows for the pair, one statement, maintained |
 | `followsListAt` | 1 |
 | `/api/stats`, any request | ~10 measured, ≤ ~61 bounded; independent of E, F and of the ingest window |
-| `auditMaintainedCounts`, once a day | E + F + ≤ 51 bucket rows (one scan of `events`, one of `follows`) |
+| `auditMaintainedCounts`, once a day | E + F + M + ≤ 51 bucket rows (one scan of `events`, one of `follows`, one of `group_members`) |
 | Backfill tick | bounded by today's ingest count (headroom check) + ~2 per event in the page |
 | Live write, regular kind | 0–2, plus 3 for the counter updates |
 | Replaceable/addressable replacement | ~2 per tag on the replaced event |
 | NIP-62 vanish, per event removed | ~2 per tag on that event |
 | `giftWrapCount`, per gift wrap accepted | ~0 |
+| NIP-29 moderation event | ~3 for the relay's own group state, + the regeneration's own |
+| Group write, non-owner | 1 for the membership lookup |
+| Join request, refused | 1–3 — the owner, the membership, and the invite row if it got that far |
+| Join request, accepted | the above + ~3 for the regeneration |
 | Cron refreshes | ~7 + 2F |
 | WebSocket connect | 1–2 |
 | NIP-11 document / NIP-98 owner lookup | 2 |
 | `initSchema`, per Durable Object constructor, schema hash matches | 1 |
 | `initSchema`, per Durable Object constructor, schema hash mismatch | ~66 |
 
-F is the follow count. `initSchema` runs in the constructor, so it is paid per
+F is the follow count and M the group's member count. `initSchema` runs in the constructor, so it is paid per
 wake from hibernation, not once per deploy — which is why the row above is
 split in two. It used to reconcile the full `TABLES`/`INDEXES` declaration
 unconditionally on every wake: measured live, 55 rows read/wake, ~94,000
@@ -165,6 +275,21 @@ reconcile completes without throwing, so a migration that dies partway
 leaves the previous hash in place for the next wake to retry rather than
 being mistaken for one that finished. See the header comment on `initSchema`
 in [src/schema.ts](src/schema.ts).
+
+The partition is what makes the group exclusion affordable, and it imposes a
+rule: SQLite uses a partial index only for a query whose `WHERE` implies the
+index's predicate, so **every query against `events`/`event_tags` names a
+partition** or reads the table. Measured at 50,000 group events, `SELECT id
+FROM events WHERE pubkey = ? AND kind = ?`: 2 rows pinned, 2 rows run once per
+partition (`storage.ts acrossScopes`), **51,500** with no pin. A post-filter
+instead of a partition would have cost 1,090 rows on a
+`{"kinds":[1],"limit":20}` priced at 41, and 26,050 at limit 500 — one REQ
+frame over the whole per-REQ cap, invisible to `boundFilter`. Nothing an
+unauthenticated client can reach costs more than it did before the partition
+existed; an authorised reader (two queries, one per partition) costs at most
+2×. See `src/groups.ts` and `schema.ts INDEXES` for the reasoning behind
+partial pairs over a widened index, which took the owner's own gift wrap read
+from 601 rows to 204,701.
 
 `combinations` is the number of queries `filters.ts expandFilter` runs for a
 filter — its `authors` × `kinds` cross-product. The `2` is the index entry plus
@@ -491,6 +616,41 @@ usefully — what it structurally cannot do.
   permanent damage one event can do; a per-pubkey rate limit bounds how fast;
   `NON_OWNER_STORAGE_BYTES` reserves half the 5GB ceiling for the owner. Gift
   wraps carry their own count cap and per-IP throttle on top.
+- **Group disclosure.** Events carrying an `h` tag — and the
+  relay-generated 39000-series, which carries a `d` tag instead and so
+  had to be recognised by kind, the admin and member lists being exactly
+  what a private group must not publish — live in their own
+  partition of `events` and are omitted from every unauthenticated read, on
+  all four surfaces that reach one: REQ results, the push to already-open
+  subscriptions, the `/live` feed, and the public counters on `/api/stats`.
+  A filter naming a group is refused from the filter alone; one that does
+  not is answered with the rows omitted, so the answer does not depend on
+  what the group holds. The exclusion is a partition seek rather than a
+  post-filter, so it costs nothing and no filter can be shaped to read past
+  it.
+- **Injection INTO the group, by the paths that skip both write gates.**
+  A kind-1059 gift wrap carrying an `h` tag used to land in the group
+  partition without passing `authorizeGroupWrite` at all, since gift
+  wraps are dispatched above both gates and `storeEvent` partitions on
+  the tag alone. It was documented as harmless on the grounds that it
+  wrote INTO the partition rather than out of it, which described the
+  wrong audience: an authenticated reader of that partition receives the
+  injected event, so it was unauthenticated injection into a private
+  group's feed, bounded by nothing but the gift wrap caps. Now refused
+  outright — a wrap addressed by `p` tag to one recipient has no
+  meaningful use for a group tag, so there was no legitimate case to
+  preserve — and refused by `isGroupEvent`, the same predicate the
+  partition uses, so the two cannot drift into a rule that refuses one
+  shape while the partition catches another. The other two gate-skipping
+  paths store no event at all (NIP-62 vanish, kind-9021 join), which is
+  why neither has the equivalent hole.
+- **Invite abuse.** An invite code is a bearer token this relay cannot
+  authenticate, so it is bounded on four axes at once: single use, a
+  mandatory expiry, a length floor, and a per-IP throttle on join
+  requests. Every refusal is identical on the wire, so the refusal cannot
+  be used as an oracle for testing guesses, and the schnorr verify runs
+  ahead of the invite lookup so a junk signature cannot be used as one
+  either.
 - **Gift wrap disclosure.** Reads of kind-1059 require NIP-42 AUTH as the
   p-tagged recipient. A filter naming 1059 is refused from `kinds` alone; a
   filter that names no kinds is served with the wraps omitted. The gate
@@ -528,9 +688,40 @@ usefully — what it structurally cannot do.
   a progress total and an age, never the pubkeys: the endpoint is public and
   unauthenticated, and itemising the rows published exactly which identities
   had asked this relay to erase them.
+- **Coarse channels around the group counters.** `/api/stats` publishes only
+  the public half of every count, but `storageBytes` grows with every stored
+  event whatever partition it is in, `rowsWrittenToday` is deliberately whole
+  (it is the owner's budget meter, and a budget figure that under-reports the
+  day's spend is worse than one that leaks traffic shape), and the `reads`
+  diagnostic moves with group REQs. All three are coarser than a per-event
+  counter and all three remain.
+- **Group membership, on the READ side.** Writes are gated on it
+  (`nip29.ts authorizeGroupWrite`); reads are still gated on the owner's
+  NIP-42 identity alone, so a member can write to the group and cannot
+  read it back. Two gates widen together when that lands —
+  `handleReqInner`'s and `broadcast()`'s — or a member subscribed before an
+  event arrives silently gets nothing.
+- **A member who was let into the group and not into the relay.** The two
+  nested lists are two tables and two writes, and `nip29.ts applyModeration`
+  is the only thing that writes both. If they come apart, the outer gate
+  refuses the member's events with a message about follows that names no
+  group at all — cause and effect with nothing connecting them.
+  `storage.ts auditMaintainedCounts` checks the containment once a day and
+  logs it, detect-only like everything else there: repairing it would mean
+  that function granting relay write access on the strength of a row it has
+  just decided it cannot trust. What it STORES in `last_drift` is a count,
+  never the pubkeys — `/api/stats` reads that column back and is public.
 - **Anyone reading anything that is not a gift wrap.** There is no read
   authentication and none is planned; a personal relay's contents are as public
   as the notes in it.
+- **An invited member, once they are in.** Redeeming an invite writes the
+  OUTER list as well as the inner one, because the outer list is what
+  `isAllowedWriter` consults and a member without that row is a member
+  whose events are refused. So handing somebody an invite link hands them
+  relay-wide write access, not only group write access — bounded by the
+  same caps every other writer pays, revocable the same two ways (kind-9001
+  remove-user, NIP-86 `banpubkey`), and worth stating plainly because the
+  link reads like an invitation to one room.
 - **A compromised follow.** Follows are trusted with writes. The caps bound what
   one can cost, they do not prevent it, and the owner is expected to notice and
   revoke.
@@ -550,19 +741,22 @@ usefully — what it structurally cannot do.
 - [src/index.ts](src/index.ts) — Worker entry: routing, `/api/*`, `scheduled()` cron dispatch.
 - [src/relay.ts](src/relay.ts) — the `Relay` Durable Object: connection lifecycle, NIP-01 message handling, live feed, alarm.
 - [src/relay-stub.ts](src/relay-stub.ts) — the one `idFromName("relay")` accessor, shared so nothing else can shard it.
-- [src/storage.ts](src/storage.ts) / [src/schema.ts](src/schema.ts) — SQLite schema and all read/write queries, including the row-cost accounting. `events.ingested_at` is wall-clock write time and must never be conflated with `created_at`: rows-written accounting and backfill's headroom guard both measure `ingested_at`, because a backfilled event's `created_at` is years old and measuring that made backfill's own writes invisible to the guard restraining them. A column, not a counter table — a counter costs a row write per event, a column costs nothing. The same argument added `events.row_cost` in v0.7.2: each event's rows-written cost is stamped at insert time so `estimateRowsWrittenSince` sums a column instead of rebuilding the figure from a `LEFT JOIN event_tags` with no index behind it, which read every tag row in the table to answer a question about the 24h window. The same argument runs the other way for `maintained_counts`/`event_hour_counts`, which DO pay a row write per event: there the alternative was a read that grew without bound, so 2 fixed rows against an event already costing 6 to 21 is the cheaper side. See CLAUDE.md "The budget".
-- [src/filters.ts](src/filters.ts) — REQ filter parsing, SQL query building, in-memory match testing for live broadcast, `FilterQueryOptions.excludeGiftWraps` (the NIP-42 read gate, expressed as omission — see "What it is"), and `expandFilter`, which splits one filter into the cross-product of its `authors` × `kinds` singletons. That split is what lets an index serve `ORDER BY created_at DESC LIMIT n`: a key column pinned to one value arrives sorted, `kind IN (1, 7)` does not, so a multi-kind filter defeats an index as thoroughly as no index at all. `storage.ts queryFilter` re-merges and re-slices to `limit`, so the split is invisible on the wire.
+- [src/storage.ts](src/storage.ts) / [src/schema.ts](src/schema.ts) — SQLite schema and all read/write queries, including the row-cost accounting. `storage.ts` states the partition rule once, above its first use, and every lookup below obeys it: pin `is_group` to one value, or run once per value; a lookup that names neither reads the whole table. `insertEventRow`/`deleteEventRow` stamp the partition onto the event row, its tag rows and both halves of every maintained counter, so "what an event is" and "what gets stored about it" stay the same lines of code. `events.ingested_at` is wall-clock write time and must never be conflated with `created_at`: rows-written accounting and backfill's headroom guard both measure `ingested_at`, because a backfilled event's `created_at` is years old and measuring that made backfill's own writes invisible to the guard restraining them. A column, not a counter table — a counter costs a row write per event, a column costs nothing. The same argument added `events.row_cost` in v0.7.2: each event's rows-written cost is stamped at insert time so `estimateRowsWrittenSince` sums a column instead of rebuilding the figure from a `LEFT JOIN event_tags` with no index behind it, which read every tag row in the table to answer a question about the 24h window. The same argument runs the other way for `maintained_counts`/`event_hour_counts`, which DO pay a row write per event: there the alternative was a read that grew without bound, so 2 fixed rows against an event already costing 6 to 21 is the cheaper side. See CLAUDE.md "The budget".
+- [src/filters.ts](src/filters.ts) — REQ filter parsing, SQL query building, in-memory match testing for live broadcast, `FilterQueryOptions.excludeGiftWraps` (the NIP-42 read gate, expressed as omission — see "What it is"), `FilterQueryOptions.scope`/`tagScanDivisor` (the group partition: every query this file builds pins `is_group`, tag subqueries included, and a reader entitled to both partitions runs the filter twice with the tag scan budget split between them rather than paid twice), and `expandFilter`, which splits one filter into the cross-product of its `authors` × `kinds` singletons. That split is what lets an index serve `ORDER BY created_at DESC LIMIT n`: a key column pinned to one value arrives sorted, `kind IN (1, 7)` does not, so a multi-kind filter defeats an index as thoroughly as no index at all. `storage.ts queryFilter` re-merges and re-slices to `limit`, so the split is invisible on the wire.
 - [src/nostr.ts](src/nostr.ts) — wire types and kind-range classifiers (replaceable/ephemeral/addressable).
 - [src/validate.ts](src/validate.ts) — event id computation and schnorr signature verification (`@noble/curves`).
 - [src/ownership.ts](src/ownership.ts) — owner pubkey resolution, TOFU claim, follow-list cache, profile/icon refresh. `getOwnerPubkey` runs `OWNER_PUBKEY` through `normalizePubkey` like every other pubkey boundary in the project, memoised on the raw string because it sits on the write path. It did not, and returned the variable verbatim while every comparison target is lowercase hex — so an operator setting an npub (the form every client shows them) got a relay where the owner could not write, could not read their own gift wraps, and could not be addressed by one, silently. A malformed value now resolves to null, which reads as unclaimed and is visible; `index.ts` still gates `/api/claim` on the variable being *set*, so this fails closed rather than reopening TOFU.
+- [src/relay-identity.ts](src/relay-identity.ts) — this relay's own signing keypair, distinct from the owner's pubkey and from `OWNER_PUBKEY`. NIP-29 requires 39000-series group metadata events to be "signed by the relay keypair directly," and `src/nip29.ts` is the only caller of `signAsRelay`. Generated once, at schema-init time (`schema.ts` `seedRelayIdentity`) rather than at claim — `claim()` is skipped entirely under `OWNER_PUBKEY` (`relay.ts`), and this identity has to exist under that mode too, the same reason `follows.fetched_at` lives off the `owner` table rather than on it. Exposed as `self` on the NIP-11 document (nips/11.md's own field for a relay identity independent of its administrator, and the one NIP-29 names) and `relayPubkey` on `/api/stats`, both always present since it doesn't depend on claim status; the secret key is read only by `signAsRelay`, which is handed a 32-byte hash and returns a signature, and never leaves that file.
+- [src/groups.ts](src/groups.ts) — what makes an event a group event (an `h` tag on any kind, or a kind in the relay-generated 39000–39005 range, which names its group in `d` and would otherwise fall right through the `h` test), the id of the one group this relay hosts, the two scopes of the `is_group` partition, and `acrossScopes`, the once-per-partition form every lookup that is not about one partition in particular has to take. Also `filterNamesGroup`, which is what lets the read gate tell "this client asked for a group" from "this client asked for something the group happens to be in" without touching storage.
 - [src/host.ts](src/host.ts) — this deployment's own host, learned from request traffic; lets backfill skip self-seeding.
 - [src/pubkey.ts](src/pubkey.ts) / [src/bech32.ts](src/bech32.ts) — npub/hex normalization.
 - [src/profile-lookup.ts](src/profile-lookup.ts) — best-effort kind-0 lookup from well-known relays, runs in the Worker only, plus the isolate-local cache in front of it (`lookupProfileCached`). The cache is not `caches.default`: the Cache API needs a custom domain (developers.cloudflare.com/workers/runtime-apis/cache/, checked 2026-08-27) and bothy deploys to `workers.dev`, so it would silently no-op on the deployment shape this project exists for. Negative results are cached and concurrent lookups for one pubkey are coalesced — without both, the cache would miss on exactly the traffic it exists to absorb.
 - [src/backfill.ts](src/backfill.ts) / [src/backfill-worker.ts](src/backfill-worker.ts) — backfill state machine (DO-side, pure) and outbound fetch orchestration (Worker-side).
-- [src/limits.ts](src/limits.ts) — every numeric abuse/budget cap in the project, each commented with what it bounds. The three write-path caps (event size, per-pubkey rate, non-owner storage share) are enforced in `relay.ts acceptEvent` before id/signature verification, exempt the owner from two of the three, and are each raisable or disablable by env var — disabled only by the exact string `"off"`, never by any truthy value. Also `boundFilter`, the read-abuse guard: it prices a REQ filter (`combinations × (2 × limit + 1)` on an index path, `combinations × ids.length` on the primary key, where `combinations` comes from `expandFilter` itself) against the index set declared in `schema.ts`, clamps the limit until the query is affordable, and refuses what no limit can fix — plus `MAX_FILTER_COMBINATIONS`, which refuses on query count alone, ahead of the price, because a lowered limit removes rows and never statements, and `MAX_QUERY_BOUND_PARAMS`, which refuses on the number of `?` placeholders the query would bind, ahead of the price, because a lowered limit removes neither `ids.length` nor a tag's value count — the shape a live filter naming enough ids exploited to pass `MAX_FILTER_ROWS_READ` while still exceeding SQLite's own 100-bound-parameter ceiling and crashing with an uncaught `SQLITE_ERROR`. It replaced `isUnconstrainedFilter`, which asked whether a field was *present* rather than what the query *cost* and so admitted the two shapes that read the whole table. The one cap NOT declared here is the HTTP rate limit: Cloudflare's runtime enforces it from `wrangler.jsonc` before any of this code runs, so a number here would be decorative and could silently disagree with the one in force — `limits.ts` carries the pointer and the reasoning instead.
+- [src/limits.ts](src/limits.ts) — every numeric abuse/budget cap in the project, each commented with what it bounds. The invite block (`INVITE_DEFAULT_TTL_SECONDS`, `INVITE_MAX_TTL_SECONDS`, `MIN_INVITE_CODE_LENGTH`, `MAX_OUTSTANDING_INVITES`, `MAX_JOIN_REQUESTS_PER_IP_PER_WINDOW`) is five caps around one word: a bearer token the relay cannot authenticate leaves only lifetime, count, guessability and guess rate to bound, and each constant is one of those. The three write-path caps (event size, per-pubkey rate, non-owner storage share) are enforced in `relay.ts acceptEvent` before id/signature verification, exempt the owner from two of the three, and are each raisable or disablable by env var — disabled only by the exact string `"off"`, never by any truthy value. Also `boundFilter`, the read-abuse guard: it prices a REQ filter (`combinations × (2 × limit + 1)` on an index path, `combinations × ids.length` on the primary key, where `combinations` comes from `expandFilter` itself) against the index set declared in `schema.ts`, clamps the limit until the query is affordable, and refuses what no limit can fix — plus `MAX_FILTER_COMBINATIONS`, which refuses on query count alone, ahead of the price, because a lowered limit removes rows and never statements, and `MAX_QUERY_BOUND_PARAMS`, which refuses on the number of `?` placeholders the query would bind, ahead of the price, because a lowered limit removes neither `ids.length` nor a tag's value count — the shape a live filter naming enough ids exploited to pass `MAX_FILTER_ROWS_READ` while still exceeding SQLite's own 100-bound-parameter ceiling and crashing with an uncaught `SQLITE_ERROR`. It replaced `isUnconstrainedFilter`, which asked whether a field was *present* rather than what the query *cost* and so admitted the two shapes that read the whole table. The one cap NOT declared here is the HTTP rate limit: Cloudflare's runtime enforces it from `wrangler.jsonc` before any of this code runs, so a number here would be decorative and could silently disagree with the one in force — `limits.ts` carries the pointer and the reasoning instead.
 - [src/exhaustion.ts](src/exhaustion.ts) — classifies a Cloudflare free-tier allowance being consumed and names which one; `index.ts` wraps both `fetch` and `scheduled` with it. Exists because the last outage's only symptom was an admin page that loaded the word "bothy" and no numbers — `public/` is served from `env.ASSETS` and never touches the DO, so the one part still working was the part that proved nothing. Matching is substring signatures against error text Cloudflare does not document as stable, so it fails useful rather than silent: the raw message is always logged, the resource name only added when a signature matches. Non-exhaustion errors are logged and rethrown, never converted into a quiet 503.
 - [src/read-metrics.ts](src/read-metrics.ts) — **diagnostic, and expected to be removed**: in-memory attribution of rows *read* to the code path that caused them, surfaced as `reads` on `/api/stats`. Added after the live relay exhausted the 5,000,000 rows-read/day allowance under ordinary operation and nothing here could say which path spent it. Counters live in memory, never in storage — a counter costing a row write to measure a row read repeats the mistake CLAUDE.md "The budget" already rejected — so they reset on eviction and describe proportions, not daily totals. Every `SqlStorage` access in the DO goes through `instrumentSql`, so a query can be mislabelled into `unattributed` but never missed. See CLAUDE.md "The budget" for the per-call costs and the arithmetic against the ceiling.
 - [src/nip11.ts](src/nip11.ts) — relay info document, and the name/description/icon resolution chain shared with `/api/stats`.
+- [src/nip29.ts](src/nip29.ts) — group writes: the moderation events a client may send (`authorizeGroupWrite`, called by `relay.ts handleEventInner` under the relay-wide gate), and the 39000-series state this relay generates and signs in response (`applyModeration`, called by `acceptEvent` exactly where a kind-5 reaches `applyDeletion`, because the moderation event is itself part of the group's canonical history and is stored before it is acted on). Holds the two-nested-lists rule in full. Everything it writes goes through `storage.ts storeEvent` — the gate is what a relay-signed event skips, not the bookkeeping. Also `handleJoinRequest`, the kind-9021 admission path, which is the one function here reached by a pubkey the relay has never authorized: it stores nothing, refuses everything with one identical message (`JOIN_REFUSAL_MESSAGE` — four distinguishable refusals would be an oracle for testing guesses), and logs the real reason where only the owner can read it. `authorizeCreateInvite` beside it holds the kind-9009 policy, refusing rather than clamping, so a client is never told `true` about a lifetime the relay did not grant.
 - [src/nip86.ts](src/nip86.ts) — management API method dispatch (runs in the DO; touches storage, opens nothing).
 - [src/nip98.ts](src/nip98.ts) — HTTP auth verification for the management API (runs in the Worker only). Deliberately does not know who the owner is: establishing that costs a Durable Object round trip, which is the most expensive thing an unauthenticated caller can provoke on this path, so `verifyNip98` answers only what the request itself can answer and `index.ts` asks the DO afterwards (`ownerReason`).
 - [public/index.html](public/index.html) — the static admin page (claim form, stats, live feed).
@@ -574,7 +768,7 @@ usefully — what it structurally cannot do.
 - Protocol errors go back as `["OK", id, false, "reason: message"]` or `["CLOSED", subid, "reason: message"]` with the NIP-01 machine-readable prefix (`invalid:`, `restricted:`, `blocked:`, `rate-limited:`, `auth-required:`, `duplicate:`). Never fail silently.
 - Comments explain *why*, especially anything hibernation- or budget-related — most modules carry inline notes on their row-write cost or CPU cost and point at CLAUDE.md "The budget" for the measured baseline.
 - Cheapest/most-certain rejections run before expensive ones on every write path: ownership check and tombstone check both precede schnorr verification.
-- Indexes are declared once, as data, in `schema.ts INDEXES`, and three things read that declaration: `limits.ts boundFilter` (which filters are affordable), `schema.ts eventRowCost` (what an event costs to write), and `limits.ts BACKFILL_PAGE_SIZE`/`VANISH_BATCH_SIZE` (how much work fits in a cron tick). Four on `events` — `(pubkey, kind, created_at)`, `(kind, created_at)`, `(pubkey, created_at)`, `(ingested_at)` covering `row_cost` — and two on `event_tags` — `(tag_name, tag_value, created_at)` and `(event_id)`. Adding another index therefore changes both the guard and the write accounting on its own; what it must NOT change silently is the measured baseline, so re-run `test/hibernation.test.ts`'s rows-written assertions and update the schema.ts comment and CLAUDE.md "The budget". Every accepted read filter must be answerable from one of these — that is enforced by cost, not by requiring a particular field.
+- Indexes are declared once, as data, in `schema.ts INDEXES`, and three things read that declaration: `limits.ts boundFilter` (which filters are affordable), `schema.ts eventRowCost` (what an event costs to write), and `limits.ts BACKFILL_PAGE_SIZE`/`VANISH_BATCH_SIZE` (how much work fits in a cron tick). Seven on `events` — `(pubkey, kind, created_at)`, `(kind, created_at)` and `(pubkey, created_at)`, each declared TWICE as a partial pair (`WHERE is_group = 0` / `= 1`), plus `(ingested_at)` covering `row_cost` — and three on `event_tags` — `(tag_name, tag_value, created_at)` as a partial pair, and `(event_id)`. A row satisfies one half of each pair, so a pair costs one row written per stored row, exactly what the single index it replaced cost; `eventRowCost` counts the halves separately and therefore over-charges, deliberately (see "The budget"). An index whose DEFINITION changes must change its NAME — `CREATE INDEX IF NOT EXISTS` will not redefine one and reports no error — and `initSchema` then drops whatever the declaration no longer carries. Adding another index therefore changes both the guard and the write accounting on its own; what it must NOT change silently is the measured baseline, so re-run `test/hibernation.test.ts`'s rows-written assertions and update the schema.ts comment and CLAUDE.md "The budget". Every accepted read filter must be answerable from one of these — that is enforced by cost, not by requiring a particular field.
 - Verify Cloudflare's own platform limits against live docs before relying on a number in a file — they change between compatibility dates. CLAUDE.md "The budget" cites the source and date at each point of use rather than assuming a cached number still holds.
 - Pin dependency versions; don't float to `latest` mid-project.
 - Commit directly to `main`. Never create a branch, and never open a pull
@@ -599,7 +793,7 @@ npm run cf-typegen   # regenerate worker-configuration.d.ts
 Two kinds of assertion live in the same suite ([test/](test)):
 
 1. **Protocol conformance** — NIP-01 REQ/EVENT/CLOSE/EOSE, filters, replaceable/addressable/ephemeral storage rules, NIP-09/40/42/59/62, and NIP-86/98 management. Reject paths are asserted as carefully as accept paths.
-2. **Budget/hibernation regression** — [test/hibernation.test.ts](test/hibernation.test.ts) asserts the object becomes eligible to hibernate after the last message, and pins the per-event rows-written cost against a real `SqlStorageCursor.rowsWritten`; [test/read-cost.test.ts](test/read-cost.test.ts) pins rows read per query shape. These assertions are the budget baseline — there is no separate file of recorded numbers to fall out of step with them.
+2. **Budget/hibernation regression** — [test/hibernation.test.ts](test/hibernation.test.ts) asserts the object becomes eligible to hibernate after the last message, and pins the per-event rows-written cost against a real `SqlStorageCursor.rowsWritten`; [test/nip29-groups.test.ts](test/nip29-groups.test.ts) pins the per-membership-change cost the same way; [test/read-cost.test.ts](test/read-cost.test.ts) pins rows read per query shape. These assertions are the budget baseline — there is no separate file of recorded numbers to fall out of step with them.
 
 See [docs/test-notes.md](docs/test-notes.md) for suite layout, fixture rationale, and the couple of places tests drop below the wire protocol to real storage (documented exceptions, not the norm).
 

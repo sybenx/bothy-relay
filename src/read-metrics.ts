@@ -72,6 +72,18 @@ export const READ_PATHS = [
   // gift wrap count, and storeEvent's own replaceable/addressable
   // lookups.
   "write",
+  // nip29.ts applyModeration: the membership writes a moderation event
+  // triggers, plus the read of this relay's own three group state events
+  // and whichever of them gets regenerated. Separate from "write" because
+  // it is a cost only a moderation event pays, and averaging it into the
+  // per-event bucket would misdescribe both.
+  "groupState",
+  // nip29.ts handleJoinRequest: the owner/membership/ban lookups a
+  // kind-9021 pays, the invite row it redeems, and the member list the
+  // relay regenerates when one succeeds. Separate from "write" because a
+  // join stores no event at all -- folding it in would put reads into a
+  // per-event bucket for a path that never writes an event row.
+  "join",
   // relay.ts fetch(): recordHost plus the once-per-connection
   // isIpBlocked lookup.
   "connect",

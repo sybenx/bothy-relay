@@ -121,6 +121,7 @@ export function buildRelayInfo(
   stored: RelaySettings,
   profile: OwnerProfile,
   ownerPubkey: string | null,
+  relayPubkey: string,
 ): Record<string, unknown> {
   const info: Record<string, unknown> = {
     name: resolveName(env, stored, profile),
@@ -133,7 +134,15 @@ export function buildRelayInfo(
     // listed -- it is verified here only as NIP-86's authentication
     // (src/nip98.ts), and this relay offers no general NIP-98 HTTP auth
     // a client could use for anything else.
-    supported_nips: [1, 9, 11, 40, 42, 59, 62, 86],
+    // 29 is listed for what is actually implemented, which is a subset and
+    // is stated as one in the group's own metadata: one group, one admin,
+    // put-user/remove-user/edit-metadata, and relay-generated
+    // 39000/39001/39002 signed by `self` above. What a NIP-29 client will
+    // find missing is advertised by the group document itself -- `closed`
+    // (no join requests or invites yet) and `hidden`/`private` (metadata
+    // and messages are owner-only reads) -- rather than left for it to
+    // discover by being refused. See CLAUDE.md "What it refuses to be".
+    supported_nips: [1, 9, 11, 29, 40, 42, 59, 62, 86],
     // Points at the upstream project, not the deployer's own cloned repo
     // -- the NIP requires a URL identifying the implementation, not the
     // deployment, and every deploy button clone shares this same software.
@@ -196,6 +205,26 @@ export function buildRelayInfo(
   if (ownerPubkey) {
     info.pubkey = ownerPubkey;
   }
+  // This relay's own signing identity (src/relay-identity.ts), and
+  // deliberately not `pubkey`: that field already means "who administers
+  // this relay" (above), while this is the key the relay signs its own
+  // events with -- a different key with a different purpose.
+  //
+  // `self` is the NIP-11 field for it (nips/11.md "Self": "A relay MAY
+  // maintain an identity independent from its administrator using the
+  // `self` field"), and it is the name NIP-29 points a client at: the
+  // 39000-series group state events "MUST be created by the relay master
+  // key only (as stated by the NIP-11 `self` pubkey)". It shipped for one
+  // release as `relay_pubkey`, a name of our own invention, which was
+  // harmless while nothing signed anything and became a conformance bug
+  // the moment src/nip29.ts started generating events -- a client
+  // following the spec looks for `self` and would have found no key to
+  // verify them against.
+  //
+  // Unlike `pubkey`, never omitted: it is generated at schema-init time
+  // (schema.ts seedRelayIdentity) and exists independently of claim
+  // status, so there is no unclaimed-relay state where it is unknown.
+  info.self = relayPubkey;
   const contact = resolveContact(profile);
   if (contact) {
     info.contact = contact;
@@ -208,8 +237,9 @@ export function nip11Response(
   stored: RelaySettings,
   profile: OwnerProfile,
   ownerPubkey: string | null,
+  relayPubkey: string,
 ): Response {
-  return new Response(JSON.stringify(buildRelayInfo(env, stored, profile, ownerPubkey)), {
+  return new Response(JSON.stringify(buildRelayInfo(env, stored, profile, ownerPubkey, relayPubkey)), {
     headers: {
       "Content-Type": "application/nostr+json",
       // NIP-11 is fetched cross-origin by web clients before they ever

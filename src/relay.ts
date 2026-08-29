@@ -12,10 +12,19 @@ import {
 import { matchesAnyFilter, parseFilter } from "./filters";
 import { recordHost } from "./host";
 import {
+  ALL_SCOPES,
+  filterNamesGroup,
+  type GroupScope,
+  isGroupEvent,
+  PUBLIC_SCOPE,
+} from "./groups";
+import {
   boundFilter,
   DAILY_ROWS_READ_LIMIT,
   DAILY_ROWS_WRITTEN_LIMIT,
   GIFT_WRAP_RATE_LIMIT_WINDOW_MS,
+  JOIN_REQUEST_RATE_LIMIT_WINDOW_MS,
+  MAX_JOIN_REQUESTS_PER_IP_PER_WINDOW,
   LIVE_FEED_MAX_LIFETIME_MS,
   MAX_EVENTS_PER_REQ,
   MAX_CONN_STATE_BYTES,
@@ -34,12 +43,20 @@ import {
   STORAGE_BYTES_LIMIT,
   utcDayStartSeconds,
 } from "./limits";
+import {
+  applyModeration,
+  authorizeGroupWrite,
+  handleJoinRequest,
+  isSupportedModerationKind,
+  JOIN_REQUEST_KIND,
+} from "./nip29";
 import { handleManagementCall, type ManagementResponse } from "./nip86";
 import { resolveIcon, resolveName, type OwnerProfile } from "./nip11";
 import { version } from "../package.json";
 import {
   type Filter,
   GIFT_WRAP_KIND,
+  isEphemeralKind,
   type NostrEvent,
   pTagValues,
   VANISH_KIND,
@@ -57,6 +74,7 @@ import {
 import type { Profile } from "./profile-lookup";
 import { normalizePubkey } from "./pubkey";
 import { instrumentSql, readMetricsSnapshot, type ReadMetricsSnapshot, withReadPath } from "./read-metrics";
+import { getRelayPubkey } from "./relay-identity";
 import { initSchema } from "./schema";
 import {
   applyDeletion,
@@ -231,6 +249,15 @@ export class Relay extends DurableObject<Env> {
   // risk on the one write path anyone can use without being the owner.
   private giftWrapRateLimits = new Map<string, { windowStart: number; count: number }>();
 
+  // The same shape again, for kind-9021 join requests -- the other write
+  // path a stranger can reach. Keyed by IP and held in memory for the
+  // same reasons and with the same eviction caveat (limits.ts
+  // JOIN_REQUEST_RATE_LIMIT_WINDOW_MS/MAX_JOIN_REQUESTS_PER_IP_PER_WINDOW).
+  // A separate counter from the gift wrap one because they bound
+  // different things: that one bounds rows written, this one bounds
+  // guesses at a bearer token.
+  private joinRateLimits = new Map<string, { windowStart: number; count: number }>();
+
   // Per-PUBKEY write counter (limits.ts PUBKEY_RATE_LIMIT_WINDOW_MS/
   // MAX_EVENTS_PER_PUBKEY_PER_WINDOW). The two maps above are keyed by IP
   // and a writer with several addresses walks around both; a follow's
@@ -361,7 +388,12 @@ export class Relay extends DurableObject<Env> {
   //
   // RPC method, called directly by the Worker (src/index.ts) rather than
   // over fetch() -- this is the only code path that may write the `owner`
-  // row (ownership.ts).
+  // row (ownership.ts). Nothing to do here for the relay's own signing
+  // identity (src/relay-identity.ts): it is seeded at schema-init time,
+  // before this constructor's caller can reach any RPC method, precisely
+  // so it exists whether or not this claim ever runs -- OWNER_PUBKEY
+  // skips claim() entirely, and that deployment shape needs the identity
+  // too.
   async claim(
     rawPubkey: unknown,
     profile?: Profile,
@@ -389,18 +421,27 @@ export class Relay extends DurableObject<Env> {
   // caller (nip11.ts) falls back to hardcoded defaults in all those cases.
   async getIdentity(
     host?: string,
-  ): Promise<{ profile: OwnerProfile; settings: RelaySettings; ownerPubkey: string | null }> {
+  ): Promise<{
+    profile: OwnerProfile;
+    settings: RelaySettings;
+    ownerPubkey: string | null;
+    relayPubkey: string;
+  }> {
     return this.metered(() =>
       withReadPath("identity", () => {
         const sql = this.sql;
         if (host) recordHost(sql, host);
         // The owner pubkey rides along rather than costing a second RPC:
         // NIP-11 now publishes it (nip11.ts), and getOwnerPubkey is an
-        // env read plus at most one indexed row.
+        // env read plus at most one indexed row. The relay's own pubkey
+        // (src/relay-identity.ts) rides the same way -- one more row,
+        // already guaranteed to exist by initSchema (schema.ts
+        // seedRelayIdentity).
         return {
           profile: getOwnerProfile(sql, this.env),
           settings: getRelaySettings(sql),
           ownerPubkey: getOwnerPubkey(sql, this.env),
+          relayPubkey: getRelayPubkey(sql),
         };
       }),
     );
@@ -435,6 +476,13 @@ export class Relay extends DurableObject<Env> {
     version: string;
     claimed: boolean;
     ownerPubkey: string | null;
+    // This relay's own signing identity (src/relay-identity.ts), never
+    // the owner's -- generated once at schema-init time and guaranteed
+    // to exist regardless of claim status, unlike ownerPubkey above.
+    // NIP-29 requires 39000-series group metadata events to be "signed
+    // by the relay keypair directly"; this is that identity's public
+    // half, so a client can verify what it signs once that work lands.
+    relayPubkey: string;
     // Maintained, not counted: storage.ts readMaintainedCounts reads one
     // row of `maintained_counts`, which insertEventRow and deleteEventRow
     // move. Exact and current -- it was a COUNT(*) over `events` served
@@ -595,6 +643,9 @@ export class Relay extends DurableObject<Env> {
     // and fall through to ~3E rows of recomputation; there is nothing
     // left here that can miss.
     const counts = readMaintainedCounts(sql);
+    // Both halves of the created_at buckets, one statement, ~26 rows --
+    // the public figure published below is the difference.
+    const windowed = countEvents24h(sql, nowSec);
     // The last two computed figures on this document, now maintained as
     // well -- both out of `ingest_hour_counts` in one statement, at most
     // 25 rows. They were a cache row on a five-minute clock, because each
@@ -610,16 +661,45 @@ export class Relay extends DurableObject<Env> {
       version,
       claimed: owner !== null,
       ownerPubkey: owner,
+      // One more row, from the singleton relay_identity table -- see
+      // CLAUDE.md "The budget" for /api/stats' overall read cost.
+      relayPubkey: getRelayPubkey(sql),
       // Both maintained: the row read above, plus at most 26 bucket rows.
       // Current as of this request.
-      totalEvents: counts.events,
-      events24h: countEvents24h(sql, nowSec),
+      // Group events are SUBTRACTED from every count on this document.
+      // /api/stats is public and unauthenticated, and the security review
+      // that produced the gift wrap read gate found the same shape here:
+      // hold a /live socket, poll a total that moves with every stored
+      // event, and each arrival the feed does not announce is dated to the
+      // second. Group events have exactly that shape, so the counters are
+      // maintained in two halves (schema.ts `group_events`/`group_n`) and
+      // only the public half is published.
+      //
+      // WHAT THIS DOES NOT FIX, stated here because the fields sit on the
+      // same document and a reader will assume otherwise:
+      //
+      //   storageBytes       `sql.databaseSize`, which grows with every
+      //                      stored event whatever partition it is in. Page
+      //                      granularity blurs it, a busy group still moves
+      //                      it, and nothing short of not reporting it
+      //                      would change that.
+      //   rowsWrittenToday   deliberately whole. It is the owner's budget
+      //                      meter, and a budget figure that under-reports
+      //                      the day's real spend is worse than one that
+      //                      leaks the shape of the traffic producing it.
+      //   reads              the read-metrics diagnostic, whose per-path
+      //                      counters move with group REQs like any other.
+      //
+      // All three are coarser channels than a per-event counter, and all
+      // three remain.
+      totalEvents: counts.events - counts.groupEvents,
+      events24h: windowed.total - windowed.group,
       // Maintained, out of the ingest-hour buckets read above -- at most
       // 25 rows for the pair, current as of this request. They were the
       // two numbers most worth being current and the two that cost the
       // most to be, which is what a cache was papering over; bucketing
       // made the tension disappear rather than trading it.
-      ingested24h: ingest.ingested24h,
+      ingested24h: ingest.ingested24h - ingest.ingestedGroup24h,
       storageBytes: sql.databaseSize,
       rowsWrittenToday: ingest.rowsWrittenToday,
       storageBytesLimit: STORAGE_BYTES_LIMIT,
@@ -906,6 +986,15 @@ export class Relay extends DurableObject<Env> {
       this.handleGiftWrap(ws, event);
       return;
     }
+    // NIP-29 join request. Necessarily above isAllowedWriter and not
+    // beside it: somebody joining is by definition not in
+    // `allowed_pubkeys` yet, so the relay-wide gate would refuse the one
+    // event whose entire purpose is to get them past it. The authority is
+    // the invite code -- see nip29.ts handleJoinRequest.
+    if (event.kind === JOIN_REQUEST_KIND) {
+      this.handleJoin(ws, event);
+      return;
+    }
 
     // Ownership is checked before id/signature validity, not after.
     // Schnorr verification is the most expensive per-event operation
@@ -922,6 +1011,18 @@ export class Relay extends DurableObject<Env> {
       return;
     }
 
+    // NIP-29 group writes sit UNDER the gate above rather than beside it:
+    // `allowed_pubkeys` and the follow list say whether this pubkey may
+    // write to this relay at all, and only then does src/nip29.ts say
+    // whether it may write to the group. Three integer comparisons decide
+    // that an ordinary event is none of that file's business, so this
+    // costs nothing on the path every non-group write takes.
+    const groupAuth = authorizeGroupWrite(sql, event, auth.isOwner, nowSeconds());
+    if (!groupAuth.ok) {
+      ok(ws, event.id, false, groupAuth.message);
+      return;
+    }
+
     this.acceptEvent(ws, sql, event, auth.isOwner);
   }
 
@@ -933,6 +1034,38 @@ export class Relay extends DurableObject<Env> {
   // abuse controls below, on top of the general per-connection rate
   // limit already applied to every message in webSocketMessage.
   private handleGiftWrap(ws: WebSocket, event: NostrEvent): void {
+    // THE ONE CHECK THAT HAS TO COME FIRST, and not for cost reasons.
+    //
+    // This path is dispatched ABOVE both write gates, so nothing below it
+    // ever consults nip29.ts authorizeGroupWrite -- and storeEvent
+    // partitions by groups.ts isGroupEvent, which asks only whether the
+    // event carries an `h` tag and not who sent it. A kind-1059 carrying
+    // one therefore landed in the group partition without any group
+    // authorization at all: unauthenticated injection into a private
+    // group's feed, delivered to every reader entitled to that partition,
+    // bounded by nothing but the gift wrap caps below.
+    //
+    // Refused rather than partitioned differently, because a gift wrap
+    // carrying a group tag is not a thing that means anything. NIP-59
+    // addresses a wrap to a recipient by `p` tag and the sender is a
+    // throwaway key; a group tag on top of that names a feed the wrap's
+    // own recipient rule already contradicts. There is nothing to
+    // preserve, so the safe answer and the correct answer are the same.
+    //
+    // Tested with isGroupEvent and not with a hand-rolled `h` lookup, so
+    // that what is refused here is exactly what would have been
+    // partitioned there -- the two cannot drift apart into a rule that
+    // refuses one shape while the partition catches another.
+    if (isGroupEvent(event)) {
+      ok(
+        ws,
+        event.id,
+        false,
+        "invalid: a gift wrap is mail addressed to this relay's owner and cannot carry a group tag",
+      );
+      return;
+    }
+
     const sql = this.sql;
     const owner = getOwnerPubkey(sql, this.env);
     if (owner === null) {
@@ -965,6 +1098,78 @@ export class Relay extends DurableObject<Env> {
     // acceptEvent's exemptions should follow who signed it, not who this
     // path usually is.
     this.acceptEvent(ws, sql, event, event.pubkey === owner);
+  }
+
+  // NIP-29 (nips/29.md) join request: "Any user can send a kind 9021
+  // event to the relay in order to request admission to the group."
+  //
+  // The decision itself is nip29.ts handleJoinRequest -- what belongs
+  // here is the wire-level work that has to happen before any invite code
+  // is looked at, and the ORDER of it is the part that matters.
+  private handleJoin(ws: WebSocket, event: NostrEvent): void {
+    // Size first, for the reason acceptEvent states about its own copy of
+    // this check: it is the only check whose result bounds the cost of
+    // the rest, and idMatchesContent below re-serializes and hashes the
+    // whole event. A join request never reaches acceptEvent, so it would
+    // otherwise be the one unauthenticated write path with no size bound
+    // in front of the hash.
+    const byteCap = maxEventBytes(this.env);
+    if (byteCap !== null && JSON.stringify(event).length > byteCap) {
+      ok(ws, event.id, false, `invalid: event exceeds the maximum size of ${byteCap} bytes`);
+      return;
+    }
+
+    // Ahead of schnorr, because it is what bounds how often schnorr gets
+    // paid on behalf of somebody this relay has not authorized -- the
+    // same ordering and the same in-memory counter shape handleGiftWrap
+    // uses above.
+    if (this.isJoinRateLimited(getState(ws).ip)) {
+      ok(ws, event.id, false, "rate-limited: too many join requests from this connection, slow down");
+      return;
+    }
+
+    // AHEAD OF THE INVITE LOOKUP, which inverts this project's
+    // cheapest-first convention on purpose. If a bad code were refused
+    // before a bad signature, a caller could offer guessed codes under
+    // junk signatures and learn which ones are real from which complaint
+    // came back -- the signature check would become a free oracle over
+    // the relay's live invites. Verifying first costs ~1.1ms of CPU on an
+    // unauthenticated request; the throttle above is what bounds how
+    // often that bill arrives.
+    if (!idMatchesContent(event)) {
+      ok(ws, event.id, false, "invalid: id does not match the hash of its contents");
+      return;
+    }
+    if (!verifySignature(event)) {
+      ok(ws, event.id, false, "invalid: signature verification failed");
+      return;
+    }
+
+    const result = withReadPath("join", () =>
+      handleJoinRequest(this.sql, this.env, event, nowSeconds()),
+    );
+    ok(ws, event.id, result.accepted, result.message);
+    // The regenerated member list, if this join changed one. Group state
+    // is group state: broadcast() drops it for any socket not
+    // authenticated as the owner, and it is deliberately not routed
+    // through liveBroadcast -- the same handling acceptEvent gives the
+    // events applyModeration returns.
+    for (const generated of result.generated) {
+      this.broadcast(generated);
+    }
+  }
+
+  // See limits.ts JOIN_REQUEST_RATE_LIMIT_WINDOW_MS/
+  // MAX_JOIN_REQUESTS_PER_IP_PER_WINDOW.
+  private isJoinRateLimited(ip: string): boolean {
+    const now = Date.now();
+    const entry = this.joinRateLimits.get(ip);
+    if (!entry || now - entry.windowStart >= JOIN_REQUEST_RATE_LIMIT_WINDOW_MS) {
+      this.joinRateLimits.set(ip, { windowStart: now, count: 1 });
+      return false;
+    }
+    entry.count++;
+    return entry.count > MAX_JOIN_REQUESTS_PER_IP_PER_WINDOW;
   }
 
   // See limits.ts GIFT_WRAP_RATE_LIMIT_WINDOW_MS/MAX_GIFT_WRAPS_PER_IP_PER_WINDOW
@@ -1170,9 +1375,23 @@ export class Relay extends DurableObject<Env> {
     // than the storage read below and far cheaper than schnorr. The owner
     // is exempt: they cannot meaningfully abuse their own relay, and a
     // client replaying a backlog after being offline is a normal thing for
-    // an owner to do and an abnormal thing for a follow to do.
+    // an owner to do and an abnormal thing for a follow to do. Ephemeral
+    // kinds are exempt too: this throttle exists to bound rows written
+    // (limits.ts MAX_EVENTS_PER_PUBKEY_PER_WINDOW), and storeEvent writes
+    // zero rows for an ephemeral event -- there is nothing here for the
+    // cap to bound. What an ephemeral event actually costs is a schnorr
+    // verify and a broadcast, and the per-IP message throttle
+    // (RATE_LIMIT_MAX_MESSAGES) already shapes both of those. Left gated
+    // on the cap being enabled at all, so `"off"` still disables every
+    // pubkey-keyed check in one place rather than this one silently
+    // surviving it.
     const eventCap = maxEventsPerPubkeyPerWindow(this.env);
-    if (!isOwner && eventCap !== null && this.isPubkeyRateLimited(event.pubkey, eventCap)) {
+    if (
+      !isOwner &&
+      eventCap !== null &&
+      !isEphemeralKind(event.kind) &&
+      this.isPubkeyRateLimited(event.pubkey, eventCap)
+    ) {
       ok(ws, event.id, false, "rate-limited: too many events from this pubkey, slow down");
       return;
     }
@@ -1227,6 +1446,21 @@ export class Relay extends DurableObject<Env> {
     if (event.kind === 5 && result.stored) {
       applyDeletion(sql, event);
     }
+    // NIP-29 moderation, applied exactly where a kind-5 reaches
+    // applyDeletion above and for the same reason: the moderation event is
+    // itself part of the group's canonical history, so it is stored first
+    // and acted on second. Scoped separately from "write" because the
+    // regeneration it triggers is a cost of its own -- reading the relay's
+    // three group state events and replacing whichever changed -- and
+    // folding it into the per-event write bucket would make every REQ-cost
+    // projection over that bucket describe a path most events never take.
+    //
+    // The events it returns are the relay's OWN, already stored by
+    // storeEvent; they are broadcast below beside the client's.
+    const generated =
+      isSupportedModerationKind(event.kind) && result.stored
+        ? withReadPath("groupState", () => applyModeration(sql, this.env, event, nowSeconds()))
+        : [];
     ok(ws, event.id, result.ok, result.message);
 
     if (result.stored) {
@@ -1245,6 +1479,15 @@ export class Relay extends DurableObject<Env> {
       }
       this.broadcast(result.stored);
       this.liveBroadcast(result.stored);
+    }
+    // Group state is group state: broadcast() drops these for any socket
+    // not authenticated as the owner, and liveBroadcast refuses them
+    // outright, both on the strength of groups.ts isGroupEvent -- which now
+    // recognises the relay-generated 39000-series by kind. Deliberately not
+    // routed through liveBroadcast at all, since it would refuse them
+    // anyway and calling it would only invite someone to "fix" that later.
+    for (const event of generated) {
+      this.broadcast(event);
     }
   }
 
@@ -1315,6 +1558,42 @@ export class Relay extends DurableObject<Env> {
     // answer. At the common single-filter REQ the share IS the cap, so
     // nothing about the ordinary case moves.
     const perFilterBudget = Math.floor(MAX_FILTER_ROWS_READ / Math.max(1, rawFilters.length));
+
+    // Who this connection is, resolved once and used by both read gates
+    // below. One owner lookup rather than two, and none at all on the
+    // unauthenticated path -- `authedPubkey` is undefined there, so the
+    // `&&` short-circuits before the storage read, which is the property
+    // the gift wrap gate was rewritten to have and must not lose.
+    //
+    // Group reads are gated on the same identity as gift wrap reads for
+    // now, because that is the only identity this relay knows: NIP-29
+    // membership is not modelled yet. When it is, this is the line that
+    // widens -- and broadcast() below has to widen with it, or a member
+    // subscribed before an event arrives gets nothing.
+    //
+    // WIDENING THIS TO MEMBERS HANDS THEM EVERY UNUSED INVITE CODE, and
+    // that is a security decision rather than a scope one. A kind-9009
+    // create-invite is a stored, served group event carrying its code in
+    // a `code` tag (nip29.ts), so it sits in the partition this line
+    // guards. An invite code is a BEARER TOKEN: reading one is as good as
+    // being handed it, so a member who can read the group can mint
+    // memberships, and owner-only invites stop being owner-only without
+    // anything in the write path changing. Widen this and the 9009 needs
+    // an answer FIRST -- keep it owner-only, strip the code from what is
+    // served, or stop storing it as a served event. test/nip29-invites.ts
+    // ("what a member can read") fails if this line widens without one,
+    // deliberately, so the discovery is a red suite and not a comment
+    // somebody had to happen to read.
+    const authedAsOwner =
+      state.authedPubkey !== undefined && state.authedPubkey === getOwnerPubkey(this.sql, this.env);
+    const mayReadGiftWraps = authedAsOwner;
+    const mayReadGroups = authedAsOwner;
+    // Which partitions this read covers. Passed into boundFilter because
+    // it multiplies the query count -- storage.ts runs the filter once per
+    // partition -- so an authorised reader is priced for what it actually
+    // costs rather than for half of it.
+    const scopes: readonly GroupScope[] = mayReadGroups ? ALL_SCOPES : [PUBLIC_SCOPE];
+
     const filters: Filter[] = [];
     for (const raw of rawFilters) {
       const filter = parseFilter(raw);
@@ -1322,7 +1601,7 @@ export class Relay extends DurableObject<Env> {
         send(ws, ["CLOSED", subId, "error: malformed filter"]);
         return;
       }
-      const bound = boundFilter(filter, perFilterBudget);
+      const bound = boundFilter(filter, perFilterBudget, scopes.length);
       if (!bound.ok) {
         send(ws, ["CLOSED", subId, bound.reason]);
         return;
@@ -1362,8 +1641,27 @@ export class Relay extends DurableObject<Env> {
     // The owner lookup is now inside the authenticated branch, so an
     // unauthenticated REQ -- every public read this relay serves -- pays
     // neither the probe nor the owner's two rows.
-    const mayReadGiftWraps =
-      state.authedPubkey !== undefined && state.authedPubkey === getOwnerPubkey(this.sql, this.env);
+    // Group events are gated the same way, and split the same way: a
+    // filter that NAMES a group (`{"#h":[...]}`, groups.ts
+    // filterNamesGroup) is refused from the filter alone, with no storage
+    // access, because the client has already said what it wants and being
+    // told to authenticate tells it nothing. A filter that does not name
+    // one is answered normally with the group's events omitted -- refusing
+    // that would make the refusal itself the answer, which is precisely
+    // the leak the gift wrap storage probe turned out to be.
+    if (!mayReadGroups && filters.some(filterNamesGroup)) {
+      if (state.authedPubkey === undefined) {
+        if (!state.challenge) {
+          state.challenge = crypto.randomUUID();
+          setState(ws, state);
+        }
+        send(ws, ["AUTH", state.challenge]);
+        send(ws, ["CLOSED", subId, "auth-required: authentication required to read group events"]);
+      } else {
+        send(ws, ["CLOSED", subId, "restricted: not allowed to read group events"]);
+      }
+      return;
+    }
     if (!mayReadGiftWraps && filters.some((f) => f.kinds?.includes(GIFT_WRAP_KIND))) {
       if (state.authedPubkey === undefined) {
         if (!state.challenge) {
@@ -1408,6 +1706,7 @@ export class Relay extends DurableObject<Env> {
     // stays open, so the two have to agree.
     const events = queryFilters(this.sql, filters, nowSeconds(), {
       excludeGiftWraps: !mayReadGiftWraps,
+      scopes,
     }).slice(0, MAX_EVENTS_PER_REQ);
     for (const event of events) {
       send(ws, ["EVENT", subId, event]);
@@ -1481,7 +1780,22 @@ export class Relay extends DurableObject<Env> {
     // liveBroadcast below already refuses kind 1059 for its permanently
     // unauthenticated channel. Owner looked up only on the gated kind so
     // the common path stays free of the extra read.
-    const gated = event.kind === GIFT_WRAP_KIND;
+    // Group events are gated here for exactly the reason gift wraps are,
+    // and it is worth restating because this is the surface an exclusion
+    // applied only to REQ results would miss entirely: a subscription
+    // registered BEFORE an event arrives is never re-examined by the
+    // REQ-time gate. `{"kinds":[1]}` from an unauthenticated client is a
+    // standing request that matches the group's kind-1 events as they are
+    // stored, and without this line every one of them would be pushed
+    // down that socket the moment it lands.
+    //
+    // Same identity as handleReqInner's gate, and it has to widen with it
+    // when NIP-29 membership lands -- including the invite-code hazard
+    // stated in full there. A kind-9009 reaches this line the moment the
+    // owner publishes one, so widening HERE leaks a live code to any
+    // member holding a matching subscription, without a REQ ever being
+    // sent. Both gates, one decision.
+    const gated = event.kind === GIFT_WRAP_KIND || isGroupEvent(event);
     const owner = gated ? getOwnerPubkey(this.sql, this.env) : null;
     for (const ws of this.ctx.getWebSockets()) {
       // ctx.getWebSockets() with no tag argument returns every socket,
@@ -1513,7 +1827,13 @@ export class Relay extends DurableObject<Env> {
   // something sensitive) doesn't leak its body to whoever has the admin
   // page open.
   private liveBroadcast(event: NostrEvent): void {
-    if (event.kind === GIFT_WRAP_KIND) return;
+    // Group events never reach the live feed, on the same terms as gift
+    // wraps and for the same reason: this channel has no authentication
+    // at all (the admin page is static and unsigned), so every viewer is
+    // permanently the unauthenticated case. Even the redacted notice this
+    // sends -- kind, time, eight hex characters of id -- would time every
+    // message in the group to the second for anyone who opened the page.
+    if (event.kind === GIFT_WRAP_KIND || isGroupEvent(event)) return;
     const live = this.ctx.getWebSockets(LIVE_FEED_TAG);
     if (live.length === 0) return;
     const notice = JSON.stringify({ kind: event.kind, created_at: event.created_at, id: event.id.slice(0, 8) });
