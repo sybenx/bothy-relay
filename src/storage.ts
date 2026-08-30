@@ -3,8 +3,11 @@ import {
   acrossScopes,
   GROUP_SCOPE,
   type GroupScope,
+  isGroupEvent,
+  isGroupMetadataKind,
   PUBLIC_SCOPE,
   scopeOf,
+  TOP_LEVEL_GROUP_ID,
 } from "./groups";
 import {
   EVENT_BASE_ROW_COST,
@@ -17,6 +20,7 @@ import {
 } from "./schema";
 import { addRowsWritten, takeRowsWritten, unlandedRowsWritten, withReadPath } from "./read-metrics";
 import { normalizeIp } from "./ip";
+import { getRelayPubkey } from "./relay-identity";
 import {
   dTagValue,
   type Filter,
@@ -847,6 +851,237 @@ export function auditMaintainedCounts(sql: SqlStorage, nowSec: number): void {
   );
 }
 
+// One-time correction for events that were flagged is_group = 1 for two
+// reasons that turned out to be the same shape: groups.ts isGroupEvent
+// used to accept ANY `h` tag as this relay's group, and separately used to
+// accept ANY 39000-series event as this relay's group metadata regardless
+// of who signed it. Two populations, one partition, one migration:
+//
+//   1. An ordinary `h`-tagged event backfilled from the owner's own
+//      history that names some OTHER relay's NIP-29 group -- reached here
+//      because backfill fetches wherever the owner's events were
+//      published, not only what was written to this relay.
+//   2. A 39000-series event NOT signed by this relay's own identity
+//      (relay-identity.ts) -- reached the same way, and refused at the
+//      source now (storeEvent below); this migration is what cleans up
+//      any that got in before that refusal existed. Checked by SIGNER,
+//      not by `d`, for the reason storeEvent's own comment gives: a
+//      forged `d` reading TOP_LEVEL_GROUP_ID would defeat a `d`-tag check.
+//
+// Both make an event unreadable to anyone who is not a member of the one
+// group this relay actually hosts -- population 1 hides a stranger's
+// unrelated content behind a membership list that has nothing to do with
+// it, population 2 sits in the partition as a second, indistinguishable
+// candidate for "this group's member list" alongside the relay's genuine
+// one, which is worse than hidden: it is ambiguous.
+//
+// THE TWO POPULATIONS ARE FIXED DIFFERENTLY, and that is deliberate.
+// Population 1 is de-flagged into the PUBLIC partition -- it is somebody
+// else's ordinary content, wrongly gated, and belongs there once ungated.
+// Population 2 is DELETED outright, not de-flagged, because de-flagging
+// alone does not close the ambiguity it exists to fix: an owner-or-member
+// reader is the one actually entitled to ask `{"kinds":[39002]}`, and that
+// reader's REQ merges BOTH partitions (relay.ts handleReqInner: `scopes =
+// mayReadGroups ? ALL_SCOPES : [PUBLIC_SCOPE]`), so a de-flagged copy
+// would still turn up alongside this relay's genuine member list -- the
+// exact ambiguity this migration exists to end, surviving for the one
+// audience it matters to. De-flagging population 2 would also be a NEW
+// disclosure: an entirely ordinary, group-unrelated `{"authors":[owner]}`
+// from an unauthenticated client would start returning it once it sat in
+// the public partition, since filterNamesGroup only refuses a filter that
+// NAMES a group or a metadata kind, and an authors-only filter does
+// neither. Deletion is safe unconditionally because storeEvent's own
+// signer check (below) means no event shaped like this can ever be
+// re-admitted -- there is nothing left to preserve and nothing this purge
+// could need to run twice for.
+//
+// BATCHED, and deliberately without a separate cursor. Every call asks the
+// group partition's own indexes for up to `limit` candidates -- the same
+// bounded-request shape hasVanishTargets/drainVanish already use to make a
+// cost this relay cannot avoid a fixed one instead of a table scan. `limit`
+// is VANISH_BATCH_SIZE at the one call site (relay.ts runCronInner) --
+// reused rather than a constant invented for this, because both fixes
+// share its cost shape: population 1's UPDATE moves a row's `is_group`
+// between partitions, retiring its old partial-index entries and writing
+// new ones, and population 2's DELETE removes them outright -- the same
+// index-maintenance cost schema.ts eventRemovalBudget prices for a
+// removal, which is exactly what VANISH_BATCH_SIZE is paced against.
+//
+// EACH CANDIDATE'S FIX RUNS INSIDE storage.transactionSync, which is what
+// makes a crash mid-fix leave NO residue at all, rather than merely a
+// SAFE one.
+//
+// Cloudflare's SQLite-backed Durable Object storage commits each
+// `SqlStorage.exec()` call independently; there is no cross-statement
+// atomicity without asking for it, and asking for it with raw SQL is
+// refused outright ("please use the state.storage.transaction() or
+// state.storage.transactionSync() APIs instead of the SQL BEGIN
+// TRANSACTION or SAVEPOINT statements", confirmed against the real
+// runtime). transactionSync's actual contract, also confirmed directly:
+// an exception thrown inside its closure rolls back every write the
+// closure made, including writes issued through instrumentSql's Proxy
+// wrapper around the same underlying connection (relay.ts's `this.sql`
+// is never the raw object). That is exactly what an interrupted cron
+// tick needs: either the whole read-check-fix sequence for one candidate
+// happened, or none of it did. A crash between population 1's `events`
+// flip and its `event_tags` flip therefore cannot leave the two columns
+// disagreeing -- the transaction that would have produced that
+// disagreement never committed anything, and the SAME candidate query
+// rediscovers the row on the next call exactly as it was before this
+// call started. Same for population 2's deleteEventRow: either the row
+// and its counters are gone, or nothing happened.
+//
+// This replaces an earlier version of this migration that relied on
+// STATEMENT ORDERING instead -- candidacy keyed to whichever field the
+// fix touched first, so a re-run could not double-decrement a counter.
+// That version could still leave a stale `event_tags.is_group` behind on
+// a crash between the two flips, reasoned about at the time as a safe,
+// bounded, one-row residue. It was not: filters.ts buildFilterQuery's
+// tag-filter subquery (`SELECT event_id FROM event_tags WHERE is_group =
+// ? AND tag_name = ? AND tag_value IN (...)`) reads event_tags.is_group
+// DIRECTLY to decide which ids a `#<letter>`-tag-filtered REQ returns, in
+// whichever partition the reader is scoped to -- an access decision, not
+// a cosmetic one, and "safe direction" was the wrong standard to hold it
+// to. transactionSync removes the crash window the residue depended on,
+// rather than reasoning about what it would have left behind.
+//
+// Guarded by relay_meta.group_scope_fixed exactly the way
+// backfill_meta.exhaust_reset_applied guards backfill.ts
+// resetWronglyExhaustedRelays: 0 until a call finds nothing left to fix,
+// then permanently 1, so a relay with nothing wrong -- and every relay
+// going forward, once this has run -- pays one bounded, index-seeked
+// query and never asks again.
+//
+// Population 1's candidate id is still re-checked against the real,
+// corrected isGroupEvent before anything is written -- an event can carry
+// more than one `h` tag, and groupIdOf reads only the FIRST one, so a
+// second, mismatched tag on an event that is genuinely ours must not be
+// reclassified. Population 2 needs no such recheck: `pubkey` is a single
+// column, not a repeatable tag, so the SQL condition IS the authoritative
+// answer.
+//
+// A NOTE ON WHAT "BOUNDED" DOES NOT PROMISE, for population 1: an event
+// with a genuinely matching FIRST `h` tag and an extra, different one
+// after it is a false positive every single call re-selects and
+// re-skips, so a relay holding one never sees group_scope_fixed flip to
+// 1 -- every future cron tick pays this one bounded, index-seeked query
+// forever rather than zero. That is still bounded (the same cost every
+// time, never a scan that grows with E), just not self-terminating. No
+// real NIP-29 client emits two `h` tags with different values, so this is
+// a cost this relay accepts rather than a case worth a second piece of
+// state to track.
+export function fixMisclassifiedGroupEvents(
+  sql: SqlStorage,
+  storage: DurableObjectStorage,
+  limit: number,
+): number {
+  const alreadyFixed =
+    sql.exec<{ group_scope_fixed: number }>(`SELECT group_scope_fixed FROM relay_meta LIMIT 1`).toArray()[0]
+      ?.group_scope_fixed ?? 1;
+  if (alreadyFixed) return 0;
+
+  const relayPubkey = getRelayPubkey(sql);
+
+  const candidates = sql
+    .exec<{ event_id: string }>(
+      `SELECT DISTINCT event_id FROM (
+         SELECT et.event_id FROM event_tags et JOIN events e ON e.id = et.event_id
+          WHERE et.is_group = 1 AND e.is_group = 1 AND et.tag_name = 'h' AND et.tag_value <> ?
+         UNION ALL
+         SELECT id AS event_id FROM events
+          WHERE is_group = 1 AND kind BETWEEN 39000 AND 39005 AND pubkey <> ?
+       ) LIMIT ?`,
+      TOP_LEVEL_GROUP_ID,
+      relayPubkey,
+      limit,
+    )
+    .toArray();
+
+  if (candidates.length === 0) {
+    sql.exec(`UPDATE relay_meta SET group_scope_fixed = 1`);
+    return 0;
+  }
+
+  let fixed = 0;
+  for (const { event_id } of candidates) {
+    // The whole read-check-fix sequence for ONE candidate, atomically --
+    // see the header comment above for why this is a transaction rather
+    // than an ordering argument. Returns whether this candidate was
+    // actually corrected, so a false positive (population 1's recheck) or
+    // a row already gone (a previous call's completed fix) costs nothing
+    // and changes nothing.
+    const wasFixed = storage.transactionSync((): boolean => {
+      const row = sql
+        .exec<EventRow & { ingested_at: number | null }>(
+          `SELECT id, pubkey, created_at, kind, tags, content, sig, ingested_at
+             FROM events WHERE id = ? AND is_group = 1`,
+          event_id,
+        )
+        .toArray()[0];
+      if (row === undefined) return false;
+      const event = rowToEvent(row);
+
+      if (isGroupMetadataKind(event.kind)) {
+        // Population 2 is PURGED, not reclassified -- de-flagging it
+        // into the public partition would leave it exactly as ambiguous
+        // as it was in the group partition, just for a different
+        // audience. The owner-or-member reader who is actually entitled
+        // to ask `{"kinds":[39002]}` reads BOTH partitions merged
+        // (relay.ts handleReqInner: `scopes = mayReadGroups ?
+        // ALL_SCOPES : [PUBLIC_SCOPE]`), so a de-flagged copy would still
+        // turn up alongside this relay's genuine member list -- the
+        // exact ambiguity the partition-only fix was supposed to end,
+        // just surviving for the one audience it matters to. Worse, an
+        // unauthenticated `{"authors":[owner]}` (an entirely ordinary
+        // query, unrelated to groups) would start returning it once it
+        // sat in the public partition, since filterNamesGroup only
+        // refuses a filter that NAMES a group or a metadata kind -- an
+        // authors-only filter does neither. Deletion is what
+        // storeEvent's refusal made safe to do unconditionally: no
+        // signer-mismatched event in this kind range can ever be
+        // re-admitted, so there is nothing to preserve and nothing this
+        // purge could need to run again for.
+        //
+        // deleteEventRow is the existing single removal choke point
+        // (defined above in this file) -- reusing it means this pays
+        // exactly the event_tags cleanup and counter decrements a live
+        // NIP-09 deletion would, through the one place that keeps "what
+        // an event is" and "what gets stored about it" in the same
+        // lines of code.
+        deleteEventRow(sql, event_id);
+        return true;
+      }
+
+      // Population 1: the false-positive guard the header comment
+      // describes. An event can carry more than one `h` tag, and
+      // groupIdOf reads only the FIRST one, so a second, mismatched tag
+      // on an event that is genuinely ours must not be reclassified.
+      if (isGroupEvent(event)) return false;
+
+      sql.exec(`UPDATE events SET is_group = 0 WHERE id = ?`, event_id);
+      sql.exec(`UPDATE event_tags SET is_group = 0 WHERE event_id = ?`, event_id);
+      // Mirrors bumpEventCounters'/deleteEventRow's decrement exactly,
+      // minus the `events`/`n` halves -- this is a reclassification, not
+      // a removal, so the total event count does not move, only which
+      // half of it is "group".
+      sql.exec(`UPDATE maintained_counts SET group_events = group_events - 1`);
+      sql.exec(
+        `UPDATE event_hour_counts SET group_n = group_n - 1 WHERE hour = ?`,
+        hourBucket(row.created_at),
+      );
+      if (row.ingested_at !== null) {
+        sql.exec(
+          `UPDATE ingest_hour_counts SET group_n = group_n - 1 WHERE hour = ?`,
+          hourBucket(row.ingested_at),
+        );
+      }
+      return true;
+    });
+    if (wasFixed) fixed += 1;
+  }
+  return fixed;
+}
+
 // ---------------------------------------------------------------------
 // THE PARTITION RULE, stated once and obeyed by every query below.
 //
@@ -971,6 +1206,43 @@ export function storeEvent(sql: SqlStorage, event: NostrEvent, ingestedAt: numbe
   }
 
   if (isAddressableKind(event.kind)) {
+    // NIP-29: 39000-series group metadata events "MUST be created by the
+    // relay master key only... Relays shouldn't accept these events if
+    // they're signed by anyone else." nip29.ts authorizeGroupWrite already
+    // refuses every client-submitted one of these outright, unconditionally
+    // -- but that gate sits ABOVE storeEvent, on the live write path only.
+    // backfill.ts applyBackfillPage is the other caller of storeEvent, and
+    // it bypasses that gate entirely: it can pull in anything the owner
+    // ever personally signed, including a kind in this range signed under
+    // their OWN key rather than the relay's, if they (or some client bug)
+    // ever published one elsewhere.
+    //
+    // Checked by SIGNER, not by the `d` tag it carries. groups.ts
+    // isGroupEvent used to accept a metadata-kind event with a missing or
+    // empty `d` as "ours" on the reasoning that hiding is safer than
+    // disclosing -- which protected against disclosure but not against
+    // AMBIGUITY: a bare `{"kinds":[39002]}` still can't tell that
+    // malformed row apart from this relay's own genuine member list, both
+    // landing in the same partition. Checking the `d` value instead of the
+    // signer would not have fixed that either -- a forged kind-39002
+    // signed by the owner's own key with `d` set to read TOP_LEVEL_GROUP_ID
+    // would pass a `d`-tag check and be genuinely indistinguishable from
+    // this relay's real member list to any `#d`-scoped filter too. The
+    // signer is the one thing a forgery cannot fake: only
+    // relay-identity.ts signAsRelay ever produces a signature this check
+    // accepts, and every event it signs (nip29.ts applyModeration) always
+    // stamps `d` as TOP_LEVEL_GROUP_ID correctly -- so a metadata-kind
+    // event that reaches insertEventRow below is guaranteed well-formed,
+    // and groups.ts isGroupEvent no longer needs a malformed case at all.
+    //
+    // Refused the same way a superseded replacement is (ok: true, nothing
+    // stored) rather than as a protocol-level error: the only caller that
+    // reaches this branch with such an event is backfill, which reads
+    // `stored` and nothing else (CLAUDE.md storage-semantics: "dropped
+    // rather than stored" is the same rule ephemeral kinds follow above).
+    if (isGroupMetadataKind(event.kind) && event.pubkey !== getRelayPubkey(sql)) {
+      return { ok: true, message: "", stored: null };
+    }
     const d = dTagValue(event.tags);
     // Both partitions, for the reason the replaceable branch above gives.
     const candidates = acrossScopes((scope) =>

@@ -1,10 +1,13 @@
 // NIP-29 group events, and the four surfaces they have to be excluded
 // from for an unauthenticated reader.
 //
-// An event belongs to a group when it carries an `h` tag (src/groups.ts) --
-// KIND-AGNOSTIC, so a kind-1 note, a kind-7 reaction and a kind-30023
-// long-form post are all group events if they name a group, and none of
-// the tests below lean on a kind range.
+// An event belongs to THIS RELAY'S group when it carries an `h` tag naming
+// TOP_LEVEL_GROUP_ID (src/groups.ts isGroupEvent) -- KIND-AGNOSTIC, so a
+// kind-1 note, a kind-7 reaction and a kind-30023 long-form post are all
+// group events if they name this relay's group, and none of the tests
+// below lean on a kind range. An `h` tag naming some OTHER group is a
+// different thing entirely -- see test/backfill.test.ts for that case,
+// which this file does not cover.
 //
 // The four surfaces, each with its own describe block, because each one
 // is reached by a different code path and an exclusion applied to one of
@@ -25,10 +28,10 @@ import { env, exports } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { buildFilterQuery } from "../src/filters";
-import { GROUP_SCOPE, isGroupEvent, PUBLIC_SCOPE, TOP_LEVEL_GROUP_ID } from "../src/groups";
+import { GROUP_MEMBERS_KIND, GROUP_SCOPE, isGroupEvent, PUBLIC_SCOPE, TOP_LEVEL_GROUP_ID } from "../src/groups";
 import { PUT_USER_KIND } from "../src/nip29";
 import type { Relay } from "../src/relay";
-import { auditMaintainedCounts, readMaintainedCounts } from "../src/storage";
+import { auditMaintainedCounts, fixMisclassifiedGroupEvents, readMaintainedCounts } from "../src/storage";
 import { signEvent } from "./helpers/event";
 import { isolateStorage } from "./helpers/isolate";
 import { type Keypair, OWNER_PUBKEY_HEX, OWNER_SECRET_KEY_HEX, randomKeypair } from "./helpers/keys";
@@ -36,7 +39,11 @@ import { connectLiveFeed, connectRelay, publish, type RelayConn } from "./helper
 
 isolateStorage();
 
-const GROUP_ID = "bothy-test-group";
+// This relay hosts exactly one group, TOP_LEVEL_GROUP_ID -- isGroupEvent
+// now scopes the partition to that id specifically (groups.ts), so these
+// fixtures tag their notes with it directly rather than with an arbitrary
+// id of the test's own choosing.
+const GROUP_ID = TOP_LEVEL_GROUP_ID;
 
 function stub() {
   return env.RELAY.get(env.RELAY.idFromName("relay"));
@@ -74,26 +81,28 @@ async function authenticateAsOwner(conn: RelayConn, secretKeyHex = OWNER_SECRET_
 
 // Puts a pubkey into the group through the path the owner actually uses:
 // a kind-9000 put-user, which writes BOTH nested lists (src/nip29.ts).
-// Tagged with TOP_LEVEL_GROUP_ID rather than the GROUP_ID these tests
-// write their notes under, because membership is one relay-wide list and
-// the partition is id-agnostic -- which is exactly why a member admitted
-// to `_` reads this file's group traffic as well.
-async function makeMember(): Promise<Keypair> {
+// Tagged with TOP_LEVEL_GROUP_ID, same as GROUP_ID above -- this relay
+// hosts exactly one group and moderation events are always checked
+// against that id (nip29.ts authorizeGroupWrite), whatever id ordinary
+// group traffic happens to carry.
+// The put-user event itself is `h`-tagged into TOP_LEVEL_GROUP_ID, same as
+// GROUP_ID now, so it is returned alongside the keypair: a test collecting
+// `{"#h": [GROUP_ID]}` sees this moderation event in the results too, and
+// needs its id to say so.
+async function makeMember(): Promise<Keypair & { putUserId: string }> {
   const member = randomKeypair();
   const conn = await connectRelay();
-  const [, , ok] = await publish(
-    conn,
-    signEvent(OWNER_SECRET_KEY_HEX, {
-      kind: PUT_USER_KIND,
-      tags: [
-        ["h", TOP_LEVEL_GROUP_ID],
-        ["p", member.pubkeyHex],
-      ],
-    }),
-  );
+  const putUser = signEvent(OWNER_SECRET_KEY_HEX, {
+    kind: PUT_USER_KIND,
+    tags: [
+      ["h", TOP_LEVEL_GROUP_ID],
+      ["p", member.pubkeyHex],
+    ],
+  });
+  const [, , ok] = await publish(conn, putUser);
   expect(ok).toBe(true);
   conn.close();
-  return member;
+  return { ...member, putUserId: putUser.id };
 }
 
 async function collect(conn: RelayConn, subId: string, filter: unknown): Promise<string[]> {
@@ -123,6 +132,24 @@ describe("what makes an event a group event", () => {
     expect(isGroupEvent(signEvent(OWNER_SECRET_KEY_HEX, { kind: 1, tags: [["h", ""]] }))).toBe(false);
   });
 
+  // THE DEFECT THIS FIXES: isGroupEvent used to count ANY `h` tag as this
+  // relay's group, which meant an event backfilled from the owner's own
+  // history -- authored by them, but published to a DIFFERENT relay
+  // hosting a DIFFERENT NIP-29 group -- got filed into this relay's group
+  // partition anyway. That made a stranger's group content unreadable to
+  // anyone who is not a member of the one group this relay actually
+  // hosts. See test/backfill.test.ts for the same case exercised through
+  // applyBackfillPage and the stored `is_group` column.
+  it("does not count an `h` tag naming some OTHER relay's group", () => {
+    for (const kind of [1, 7, 11, 1063, 10002, 30023]) {
+      expect(
+        isGroupEvent(
+          signEvent(OWNER_SECRET_KEY_HEX, { kind, tags: [["h", "some-other-relays-group"]] }),
+        ),
+      ).toBe(false);
+    }
+  });
+
   it("stores the partition on the event row and on every one of its tag rows", async () => {
     const conn = await connectRelay();
     const group = groupNote("in the group", [["p", OWNER_PUBKEY_HEX]]);
@@ -149,6 +176,278 @@ describe("what makes an event a group event", () => {
         .map((r) => r.is_group);
       expect(tagScopes.length).toBeGreaterThan(0);
       expect(tagScopes.every((s) => s === GROUP_SCOPE)).toBe(true);
+    });
+  });
+});
+
+describe("fixMisclassifiedGroupEvents: the one-time partition correction", () => {
+  // storeEvent can no longer produce a row shaped like this -- scopeOf
+  // already uses the corrected isGroupEvent -- which is exactly why a
+  // relay that stored one under the OLD, id-agnostic test needs a
+  // migration rather than a guard on the write path. This inserts
+  // straight into storage the way the pre-fix code would have, bypassing
+  // storeEvent entirely, to stand in for that relay's existing data.
+  it("clears is_group on a pre-existing row naming a foreign group, leaves a real one alone, and keeps the counters consistent", async () => {
+    await runInDurableObject(stub(), async (_instance: Relay, state) => {
+      const sql = state.storage.sql;
+      const now = Math.floor(Date.now() / 1000);
+      const hour = Math.trunc(now / 3600);
+
+      const foreign = signEvent(OWNER_SECRET_KEY_HEX, {
+        kind: 1,
+        content: "wrongly filed under the old id-agnostic test",
+        tags: [["h", "someone-elses-group"]],
+        created_at: now,
+      });
+      sql.exec(
+        `INSERT INTO events
+           (id, pubkey, created_at, kind, tags, content, sig, expiration, ingested_at, row_cost, is_group)
+         VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, 1)`,
+        foreign.id,
+        foreign.pubkey,
+        foreign.created_at,
+        foreign.kind,
+        JSON.stringify(foreign.tags),
+        foreign.content,
+        foreign.sig,
+        now,
+        12,
+      );
+      sql.exec(
+        `INSERT INTO event_tags (tag_name, tag_value, event_id, created_at, is_group)
+         VALUES ('h', ?, ?, ?, 1)`,
+        "someone-elses-group",
+        foreign.id,
+        now,
+      );
+      sql.exec(`UPDATE maintained_counts SET events = events + 1, group_events = group_events + 1`);
+      sql.exec(
+        `INSERT INTO event_hour_counts (hour, n, group_n) VALUES (?, 1, 1)
+           ON CONFLICT(hour) DO UPDATE SET n = n + 1, group_n = group_n + 1`,
+        hour,
+      );
+      sql.exec(
+        `INSERT INTO ingest_hour_counts (hour, n, group_n, rows_written) VALUES (?, 1, 1, 21)
+           ON CONFLICT(hour) DO UPDATE SET n = n + 1, group_n = group_n + 1, rows_written = rows_written + 21`,
+        hour,
+      );
+
+      // A real member of this relay's own group, stored the same way --
+      // the migration must not touch this one.
+      const ours = groupNote("really ours");
+      await (async () => {
+        const conn = await connectRelay();
+        await publish(conn, ours);
+        conn.close();
+      })();
+
+      const before = readMaintainedCounts(sql);
+
+      expect(fixMisclassifiedGroupEvents(sql, state.storage, 100)).toBe(1);
+
+      const foreignRow = sql
+        .exec<{ is_group: number }>(`SELECT is_group FROM events WHERE id = ?`, foreign.id)
+        .toArray()[0];
+      expect(foreignRow?.is_group).toBe(PUBLIC_SCOPE);
+      const foreignTag = sql
+        .exec<{ is_group: number }>(`SELECT is_group FROM event_tags WHERE event_id = ?`, foreign.id)
+        .toArray()[0];
+      expect(foreignTag?.is_group).toBe(PUBLIC_SCOPE);
+
+      const oursRow = sql
+        .exec<{ is_group: number }>(`SELECT is_group FROM events WHERE id = ?`, ours.id)
+        .toArray()[0];
+      expect(oursRow?.is_group).toBe(GROUP_SCOPE);
+
+      const after = readMaintainedCounts(sql);
+      expect(after.events).toBe(before.events);
+      expect(after.groupEvents).toBe(before.groupEvents - 1);
+
+      // Idempotent: the guard flag is now set, so a second call finds
+      // nothing (the row already dropped out of `is_group = 1`) and costs
+      // one bounded, empty query rather than repeating the fix.
+      expect(fixMisclassifiedGroupEvents(sql, state.storage, 100)).toBe(0);
+
+      // And the counters this migration touched stay internally
+      // consistent with the table -- auditMaintainedCounts finds no drift.
+      sql.exec(`UPDATE maintained_counts SET audited_at = NULL`);
+      auditMaintainedCounts(sql, now);
+      expect(readMaintainedCounts(sql).drift).toBeNull();
+    });
+  });
+
+  // The migration itself cannot produce this state any more -- each
+  // candidate's read-check-fix sequence runs inside storage.transactionSync,
+  // so a crash mid-fix rolls back to exactly where it started (see the
+  // header comment above). This constructs the half-flipped state by hand
+  // instead -- events.is_group already 0, event_tags and every counter
+  // still describing it as a group event -- as a hostile-input-style
+  // check: whatever produced a row shaped like this (a hand edit, a bug
+  // somewhere else entirely), a re-run must not find it, must not touch
+  // its counters again, and must not double-decrement group_events. It
+  // is also the reason candidacy is keyed to events.is_group rather than
+  // the tag row's own copy: with the tag-row-keyed version this migration
+  // used before, this exact row would still match the tag-index seek and
+  // the call below would decrement group_events a second time.
+  it("does not double-decrement a row it finds already half-flipped by something else", async () => {
+    await runInDurableObject(stub(), async (_instance: Relay, state) => {
+      const sql = state.storage.sql;
+      const now = Math.floor(Date.now() / 1000);
+      const hour = Math.trunc(now / 3600);
+
+      const foreign = signEvent(OWNER_SECRET_KEY_HEX, {
+        kind: 1,
+        content: "wrongly filed, then half-fixed",
+        tags: [["h", "someone-elses-group"]],
+        created_at: now,
+      });
+      sql.exec(
+        `INSERT INTO events
+           (id, pubkey, created_at, kind, tags, content, sig, expiration, ingested_at, row_cost, is_group)
+         VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, 1)`,
+        foreign.id,
+        foreign.pubkey,
+        foreign.created_at,
+        foreign.kind,
+        JSON.stringify(foreign.tags),
+        foreign.content,
+        foreign.sig,
+        now,
+        12,
+      );
+      sql.exec(
+        `INSERT INTO event_tags (tag_name, tag_value, event_id, created_at, is_group)
+         VALUES ('h', ?, ?, ?, 1)`,
+        "someone-elses-group",
+        foreign.id,
+        now,
+      );
+      sql.exec(`UPDATE maintained_counts SET events = events + 1, group_events = group_events + 1`);
+      sql.exec(
+        `INSERT INTO event_hour_counts (hour, n, group_n) VALUES (?, 1, 1)
+           ON CONFLICT(hour) DO UPDATE SET n = n + 1, group_n = group_n + 1`,
+        hour,
+      );
+      sql.exec(
+        `INSERT INTO ingest_hour_counts (hour, n, group_n, rows_written) VALUES (?, 1, 1, 21)
+           ON CONFLICT(hour) DO UPDATE SET n = n + 1, group_n = group_n + 1, rows_written = rows_written + 21`,
+        hour,
+      );
+
+      // The hand-constructed inconsistency: only events.is_group has
+      // moved. event_tags.is_group, and all three counters, are exactly
+      // as wrong as they were before any fix was attempted.
+      sql.exec(`UPDATE events SET is_group = 0 WHERE id = ?`, foreign.id);
+
+      const stillPending = readMaintainedCounts(sql);
+      expect(stillPending.groupEvents).toBe(1); // untouched by the "crash"
+
+      // The next cron tick's call. It must find nothing for this row --
+      // events.is_group is already 0 -- and so must not touch
+      // group_events, its hour bucket, or its ingest bucket again.
+      expect(fixMisclassifiedGroupEvents(sql, state.storage, 100)).toBe(0);
+
+      const after = readMaintainedCounts(sql);
+      expect(after.groupEvents).toBe(stillPending.groupEvents);
+
+      const bucket = sql
+        .exec<{ group_n: number }>(`SELECT group_n FROM event_hour_counts WHERE hour = ?`, hour)
+        .toArray()[0];
+      expect(bucket?.group_n).toBe(1);
+
+      // What this hand-constructed state leaves behind: event_tags never
+      // caught up with events for this specific id, because nothing in
+      // this test asked it to (the migration itself no longer produces
+      // this gap -- see the comment above). Asserted so a future change
+      // that removes the events.is_group-keyed candidacy check doesn't
+      // silently start double-decrementing a row like this instead.
+      const tagRow = sql
+        .exec<{ is_group: number }>(`SELECT is_group FROM event_tags WHERE event_id = ?`, foreign.id)
+        .toArray()[0];
+      expect(tagRow?.is_group).toBe(GROUP_SCOPE);
+    });
+  });
+
+  // Population 2: a 39000-series event admitted by the pre-fix code
+  // because nothing checked who signed it. De-flagging it into the
+  // public partition would not have ended the ambiguity it causes -- an
+  // owner-or-member reader merges both partitions, so a de-flagged copy
+  // would still sit next to this relay's genuine member list -- so this
+  // one is deleted outright rather than reclassified.
+  it("purges a pre-existing 39000-series row not signed by this relay, rather than de-flagging it", async () => {
+    await runInDurableObject(stub(), async (_instance: Relay, state) => {
+      const sql = state.storage.sql;
+      const now = Math.floor(Date.now() / 1000);
+      const hour = Math.trunc(now / 3600);
+
+      // Signed by the OWNER, not the relay's own identity -- exactly the
+      // shape backfill could admit before storeEvent refused it.
+      const forged = signEvent(OWNER_SECRET_KEY_HEX, {
+        kind: GROUP_MEMBERS_KIND,
+        content: "",
+        tags: [
+          ["d", TOP_LEVEL_GROUP_ID],
+          ["p", randomKeypair().pubkeyHex],
+        ],
+        created_at: now,
+      });
+      sql.exec(
+        `INSERT INTO events
+           (id, pubkey, created_at, kind, tags, content, sig, expiration, ingested_at, row_cost, is_group)
+         VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, 1)`,
+        forged.id,
+        forged.pubkey,
+        forged.created_at,
+        forged.kind,
+        JSON.stringify(forged.tags),
+        forged.content,
+        forged.sig,
+        now,
+        12,
+      );
+      sql.exec(
+        `INSERT INTO event_tags (tag_name, tag_value, event_id, created_at, is_group)
+         VALUES ('d', ?, ?, ?, 1), ('p', ?, ?, ?, 1)`,
+        TOP_LEVEL_GROUP_ID,
+        forged.id,
+        now,
+        forged.tags[1]![1],
+        forged.id,
+        now,
+      );
+      sql.exec(`UPDATE maintained_counts SET events = events + 1, group_events = group_events + 1`);
+      sql.exec(
+        `INSERT INTO event_hour_counts (hour, n, group_n) VALUES (?, 1, 1)
+           ON CONFLICT(hour) DO UPDATE SET n = n + 1, group_n = group_n + 1`,
+        hour,
+      );
+      sql.exec(
+        `INSERT INTO ingest_hour_counts (hour, n, group_n, rows_written) VALUES (?, 1, 1, 24)
+           ON CONFLICT(hour) DO UPDATE SET n = n + 1, group_n = group_n + 1, rows_written = rows_written + 24`,
+        hour,
+      );
+
+      const before = readMaintainedCounts(sql);
+
+      expect(fixMisclassifiedGroupEvents(sql, state.storage, 100)).toBe(1);
+
+      // Gone entirely -- not de-flagged into the public partition.
+      expect(sql.exec(`SELECT 1 FROM events WHERE id = ?`, forged.id).toArray()).toHaveLength(0);
+      expect(sql.exec(`SELECT 1 FROM event_tags WHERE event_id = ?`, forged.id).toArray()).toHaveLength(0);
+
+      // A real removal, unlike population 1's reclassification: BOTH
+      // halves of maintained_counts move, not just the group half.
+      const after = readMaintainedCounts(sql);
+      expect(after.events).toBe(before.events - 1);
+      expect(after.groupEvents).toBe(before.groupEvents - 1);
+
+      // Idempotent, and for the reason deleteEventRow already guards:
+      // nothing left to find.
+      expect(fixMisclassifiedGroupEvents(sql, state.storage, 100)).toBe(0);
+
+      sql.exec(`UPDATE maintained_counts SET audited_at = NULL`);
+      auditMaintainedCounts(sql, now);
+      expect(readMaintainedCounts(sql).drift).toBeNull();
     });
   });
 });
@@ -273,8 +572,12 @@ describe("surface 1: REQ results", () => {
 
     // Naming the group is answered rather than refused now -- the same
     // filter the "restricts, rather than challenges" test above sends
-    // from a pubkey that authenticated and is not a member.
-    expect(await collect(conn, "memberGroup", { "#h": [GROUP_ID] })).toEqual([group.id]);
+    // from a pubkey that authenticated and is not a member. The put-user
+    // that admitted this member is itself `h`-tagged into GROUP_ID (now
+    // the same id as TOP_LEVEL_GROUP_ID), so it is in this result too.
+    expect((await collect(conn, "memberGroup", { "#h": [GROUP_ID] })).sort()).toEqual(
+      [group.id, member.putUserId].sort(),
+    );
     const both = await collect(conn, "memberKinds", { kinds: [1] });
     expect(both.sort()).toEqual([group.id, plain.id].sort());
     conn.close();

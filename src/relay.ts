@@ -16,6 +16,7 @@ import {
   CREATE_INVITE_KIND,
   filterNamesGroup,
   type GroupScope,
+  isAnyGroupEvent,
   isGroupEvent,
   PUBLIC_SCOPE,
 } from "./groups";
@@ -102,6 +103,7 @@ import {
   type VanishSummary,
   eventExists,
   expirationOf,
+  fixMisclassifiedGroupEvents,
   getRelaySettings,
   giftWrapCount,
   hasNonOwnerStorageHeadroom,
@@ -819,6 +821,20 @@ export class Relay extends DurableObject<Env> {
       // be what happens last or backfill would spend the next tick
       // fetching its own history from itself. See purgeSelfRelay.
         purgeSelfRelay(sql);
+        // One-time correction for events wrongly filed into this relay's
+        // group partition (de-flagged into the public one) or wrongly
+        // admitted as this relay's own group metadata (purged outright)
+        // before groups.ts isGroupEvent and storage.ts storeEvent were
+        // scoped to TOP_LEVEL_GROUP_ID and this relay's own signer -- see
+        // storage.ts fixMisclassifiedGroupEvents. VANISH_BATCH_SIZE reused
+        // rather than a new constant: both of that function's writes cost
+        // the same shape VANISH_BATCH_SIZE is already paced against, an
+        // UPDATE moving a row between partial-index partitions or a
+        // DELETE removing one outright. Alongside the relay's own
+        // upkeep, ahead of the vanish drain below, for the reason every
+        // step above it is: this is the relay fixing its own past
+        // mistake, not a cost a stranger's request sizes.
+        fixMisclassifiedGroupEvents(sql, this.ctx.storage, VANISH_BATCH_SIZE);
         // Once a day (paced by maintained_counts.audited_at, not by this
         // tick's frequency), recount `events` and `follows` and log if the
         // maintained counters disagree. E + F rows read, once -- against
@@ -1087,24 +1103,24 @@ export class Relay extends DurableObject<Env> {
     // This path is dispatched ABOVE both write gates, so nothing below it
     // ever consults nip29.ts authorizeGroupWrite -- and storeEvent
     // partitions by groups.ts isGroupEvent, which asks only whether the
-    // event carries an `h` tag and not who sent it. A kind-1059 carrying
-    // one therefore landed in the group partition without any group
-    // authorization at all: unauthenticated injection into a private
-    // group's feed, delivered to every reader entitled to that partition,
-    // bounded by nothing but the gift wrap caps below.
+    // event is IN THIS RELAY'S OWN group. A kind-1059 carrying an `h` tag
+    // naming that group would land in the group partition without any
+    // group authorization at all: unauthenticated injection into a
+    // private group's feed, delivered to every reader entitled to that
+    // partition, bounded by nothing but the gift wrap caps below.
     //
     // Refused rather than partitioned differently, because a gift wrap
     // carrying a group tag is not a thing that means anything. NIP-59
     // addresses a wrap to a recipient by `p` tag and the sender is a
     // throwaway key; a group tag on top of that names a feed the wrap's
     // own recipient rule already contradicts. There is nothing to
-    // preserve, so the safe answer and the correct answer are the same.
-    //
-    // Tested with isGroupEvent and not with a hand-rolled `h` lookup, so
-    // that what is refused here is exactly what would have been
-    // partitioned there -- the two cannot drift apart into a rule that
-    // refuses one shape while the partition catches another.
-    if (isGroupEvent(event)) {
+    // preserve, so the safe answer and the correct answer are the same --
+    // whichever id that group tag names, not only this relay's own, so
+    // this is tested with isAnyGroupEvent (groups.ts) rather than
+    // isGroupEvent: a foreign id makes just as little sense on a wrap as
+    // this relay's own does, and there is no reason to let one through
+    // where the other is refused.
+    if (isAnyGroupEvent(event)) {
       ok(
         ws,
         event.id,
@@ -1422,10 +1438,27 @@ export class Relay extends DurableObject<Env> {
 
     // Per-pubkey write throttle (limits.ts). Still ahead of every
     // id/tombstone/signature check -- it's a Map lookup, so it is cheaper
-    // than the storage read below and far cheaper than schnorr. The owner
-    // is exempt: they cannot meaningfully abuse their own relay, and a
-    // client replaying a backlog after being offline is a normal thing for
-    // an owner to do and an abnormal thing for a follow to do. Ephemeral
+    // than the storage read below and far cheaper than schnorr.
+    //
+    // The owner is exempt -- NOT because ordinary owner traffic cannot
+    // cost anything (it can: an unchanged kind-3 republished by a client
+    // as a matter of course used to trigger a full follow-cache rebuild,
+    // ~3F + 1 rows a touch with no abuse anywhere in it, until
+    // ownership.ts refreshFollows started comparing content instead of
+    // timestamps), but because the budget this cap protects is the
+    // owner's own. CLAUDE.md "Threat model" already draws the line:
+    // "Nothing here defends the relay against its own owner, and the
+    // storage and rate caps deliberately exempt them." Refusing the
+    // owner's events would spend the thing the relay exists for --
+    // storing what they publish, a replayed post-offline backlog
+    // included, which arrives at exactly the burst rate a cap would
+    // refuse -- to conserve a resource that is theirs to spend and whose
+    // spend their own admin page already shows (rowsWrittenToday). And
+    // the kind-3 lesson says a cap here was never the right tool for
+    // that shape anyway: it bounds event FREQUENCY, while the damage was
+    // cost PER EVENT -- a few touches a day, far under any plausible
+    // rate, at ~1,000 rows each. Costs like that get fixed by making
+    // them not scale, not by throttling the principal. Ephemeral
     // kinds are exempt too: this throttle exists to bound rows written
     // (limits.ts MAX_EVENTS_PER_PUBKEY_PER_WINDOW), and storeEvent writes
     // zero rows for an ephemeral event -- there is nothing here for the
