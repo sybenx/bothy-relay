@@ -35,7 +35,17 @@ jobs:
       - name: Restore local config
         # wrangler.jsonc holds the D1/KV/R2 IDs Cloudflare provisioned for this deployment,
         # and .github/ holds this workflow itself — neither must ever be overwritten by upstream.
-        run: git checkout HEAD -- wrangler.jsonc .github/
+        #
+        # `git checkout HEAD -- <path>` only restores paths that exist in HEAD, so a file
+        # upstream *added* under .github/ (a new workflow, say) stayed staged and rode along
+        # into the commit — and GITHUB_TOKEN is a GitHub App token, which GitHub never lets
+        # create or update anything under .github/workflows/, so the push was rejected and the
+        # whole sync failed. Reset the index for these paths back to HEAD, restore the worktree
+        # from it, then clean out whatever upstream added that HEAD never had.
+        run: |
+          git reset -q HEAD -- wrangler.jsonc .github
+          git checkout -q -- wrangler.jsonc .github
+          git clean -qfd wrangler.jsonc .github
 
       - name: Stage deletions
         run: |
