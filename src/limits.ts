@@ -831,6 +831,43 @@ export const PROFILE_CACHE_TTL_MS = 5 * 60 * 1000;
 // isolate memory under a flood of distinct pubkeys, not to serve one.
 export const PROFILE_CACHE_MAX_ENTRIES = 256;
 
+// ---------------------------------------------------------------------
+// The upstream version check (upstream-version.ts), which /api/stats
+// answers with so the admin page can say a newer release exists.
+//
+// Same cache shape and the same reasoning as the block above: isolate-
+// local, because caches.default needs a custom domain and bothy deploys
+// to workers.dev. What differs is the traffic it absorbs. /api/stats is
+// unauthenticated and is loaded on every visit to a public page, and the
+// answer is a version string that changes a few times a month, so an
+// uncached check would point this deployment's IP at githubusercontent
+// once per page view to learn something that was already true an hour
+// ago. Six hours is well under "a release you have not noticed yet" and
+// well over any burst.
+export const UPSTREAM_VERSION_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
+
+// The failure this one bounds is different, so it is cached for minutes
+// rather than hours: a check that failed says nothing about upstream, and
+// retrying an unreachable host every six hours would leave a relay
+// wrongly quiet about an update for a quarter of a day after one blip.
+// Long enough that a githubusercontent outage cannot turn each page view
+// into another outbound attempt, short enough to recover on its own.
+export const UPSTREAM_VERSION_ERROR_CACHE_TTL_MS = 10 * 60 * 1000;
+
+// How long the check waits before giving up, matching profile-lookup.ts's
+// LOOKUP_TIMEOUT_MS shape. It runs concurrently with the getStats round
+// trip (index.ts handleStats), so this is the ceiling on how much a slow
+// GitHub can add to a page load -- and it is a courtesy notice, so the
+// right behaviour when it is slow is to answer without it.
+export const UPSTREAM_VERSION_TIMEOUT_MS = 2500;
+
+// A ceiling on what the check will read before deciding upstream is not
+// serving a package.json. The real file is around 800 bytes; this is
+// generous room above that and still refuses to pull an unbounded body
+// into a Worker's memory because a URL that used to be a small JSON file
+// stopped being one.
+export const UPSTREAM_VERSION_MAX_BYTES = 16 * 1024;
+
 
 
 // How long the Worker's cron tick keeps one outbound backfill socket open
@@ -905,7 +942,8 @@ const GIFT_WRAP_STORAGE_SHARE = STORAGE_BYTES_LIMIT / 40;
 // regardless of event size or count.
 //
 // New gift wraps are refused once reached; the owner deleting old ones
-// (or vanishing them) frees room.
+// (or vanishing them) frees room -- and so does the expiry sweep below,
+// which is what keeps this a count of mail rather than a count of rows.
 //
 // Bounded by MAX_FILTER_ROWS_READ as well as by the storage share, and
 // the second bound is a READ cost sitting on a write-path cap, which
@@ -940,6 +978,43 @@ export function maxGiftWraps(env: Env): number {
 // backfill's headroom check below needs the actual number to reason
 // about, not just a copy used for a progress bar.
 export const DAILY_ROWS_WRITTEN_LIMIT = 100_000;
+
+// Single-letter tags on a gift wrap: the one `p` tag naming its
+// recipient. NIP-59 puts nothing else there -- the sender is a random
+// one-time key and the contents are sealed -- so unlike
+// TAGS_PER_CHAT_MESSAGE above this is the shape of the kind rather than
+// an estimate that had to err high.
+const TAGS_PER_GIFT_WRAP = 1;
+
+// What one cron tick may spend removing expired gift wraps.
+//
+// Bounded TWICE, and the second bound is what makes this one cheap
+// insurance rather than the thing doing the work. maxGiftWraps above is
+// a ceiling on how many gift wraps exist at all, so the largest backlog
+// this sweep can ever face is that ceiling -- 2,048 at the defaults,
+// which at the charged cost of a one-tag event is ~32,000 rows written,
+// inside a single day and very nearly inside a single tick. A per-tick
+// share is still declared, for the reason CHAT_SWEEP_BATCH_SIZE declares
+// one: a backlog that arrives all at once -- every wrap of a 30-day TTL
+// expiring in the same hour -- should drain across ticks rather than be
+// attempted in one, and the remainder costs nothing to carry because the
+// next tick finds it exactly where it left it.
+//
+// Five percent of the day, matching the chat sweep, which at a one-tag
+// event is ~312 wraps a tick and ~7,500 a day: more than the inbox can
+// hold, so the cap is reached in hours and never binds twice.
+//
+// NO DAILY SHARE, for the reason the chat sweep gives and one more. Every
+// wrap this removes was written by this relay first, and writing one cost
+// more than removing it does, so a day's sweeping cannot exceed a day's
+// gift wrap ingest. And that ingest is itself bounded by
+// MAX_GIFT_WRAPS_PER_IP_PER_WINDOW and by maxGiftWraps, which is more
+// than the chat sweep can say about its own input.
+const GIFT_WRAP_SWEEP_TICK_SHARE = DAILY_ROWS_WRITTEN_LIMIT / 20;
+export const GIFT_WRAP_SWEEP_BATCH_SIZE = Math.max(
+  1,
+  Math.floor(GIFT_WRAP_SWEEP_TICK_SHARE / eventRowCost(TAGS_PER_GIFT_WRAP)),
+);
 
 // ---------------------------------------------------------------------
 // Call presence (src/push.ts CALL_PRESENCE_KIND, reference/push.md).
@@ -1346,3 +1421,183 @@ export const VANISH_BATCH_SIZE = Math.max(
   1,
   Math.floor(VANISH_ROWS_SHARE_LIMIT / (eventRemovalBudget(TAGS_PER_REAL_EVENT) * CRON_TICKS_PER_DAY)),
 );
+
+// ---------------------------------------------------------------------
+// Ephemeral group chat (src/storage.ts sweepChat, relay.ts runCron).
+//
+// A conversation among friends is remembered rather than reread. Writing
+// it down permanently turns talk into a record and changes what it was --
+// the voice calls this relay already carries work that way and nobody
+// expects to replay one, and the text sitting beside them had been
+// quietly claiming a different status than the speech it transcribes. So
+// the group's chat expires: not hidden, not archived, deleted.
+//
+// Four rules, and every constant below is one of them:
+//
+//   a conversation ends       when the room has been EMPTY for
+//                             CONVERSATION_IDLE_SECONDS. Everything said
+//                             during it goes when it goes.
+//   speech                    a message sent while somebody else was in
+//                             the room belongs to that conversation.
+//   a note                    a message sent to an empty room is not
+//                             speech. It waits for the next
+//                             conversation, for as long as that takes.
+//   arriving partway through  you see the last CHAT_BACKLOG_SECONDS, not
+//                             the whole session.
+//
+// THE RELAY IS THE ONLY PARTY THAT CAN DO THIS, which is why it is here
+// and not in a client: it is the only one that sees everyone's presence
+// at once, and a client that expired its own copy would be hiding a
+// transcript this relay still held.
+//
+// Scoped to the group's chat and to nothing else. The owner's own notes,
+// backfilled history, gift wraps, the relay-generated 39000-series and
+// the moderation events that produced it are all untouched -- see
+// storage.ts sweepChat for the one kind this covers and why the scope is
+// stated as a kind rather than as a partition.
+// ---------------------------------------------------------------------
+
+// How long the room must stay empty before the conversation it held is
+// over. "Long enough that dinner does not end it, short enough that an
+// evening ends when the evening does."
+//
+// It is a floor rather than an exact interval: the sweep runs on the
+// hourly cron (CRON_TICKS_PER_DAY above), so a conversation is removed
+// between two and three hours after the last person leaves. Erring long
+// is the safe direction -- the failure of being early is deleting
+// something somebody was still going to come back to.
+export const CONVERSATION_IDLE_SECONDS = 2 * 60 * 60;
+
+// How much of a conversation in progress somebody arriving partway
+// through is shown. "Enough to know what is being talked about, not
+// enough to replace asking."
+//
+// This is a READ horizon and not a second expiry: the messages are still
+// there, and everyone who was in the room already has them from their own
+// live subscription. It is what a REQ is clamped to (filters.ts
+// FilterQueryOptions.chatHorizon), and it is also most of where the
+// rows-read saving comes from -- a client that used to page the whole
+// evening back now reads an index range a few minutes wide.
+export const CHAT_BACKLOG_SECONDS = 5 * 60;
+
+// THERE IS NO CEILING ON A NOTE, and its absence is a decision rather
+// than an omission -- stated here because this is where a reader will
+// come looking for the constant that is not here.
+//
+// An earlier draft of this gave a note about a week to be read, on the
+// reasoning that nothing should wait forever on a friend who has gone
+// quiet. That reasoning confuses two different things. Speech is
+// ephemeral because it was heard and is over; a note has not been heard
+// yet, and a thing that has not happened cannot expire. Mail does not
+// vanish because the person it was addressed to is on holiday. The
+// sender is the one who gets to change their mind about a note, and they
+// already can: a NIP-09 kind-5 naming their own message deletes it
+// outright (storage.ts applyDeletion, which reaches the group partition
+// by primary key and tombstones the id like any other deletion).
+//
+// What this costs, plainly, because it is the price of getting the rule
+// right. NOTE_MAX_WAIT_SECONDS was also serving as a backstop under
+// everything else here -- whatever the occupancy watermark believed,
+// nothing outlived a week -- and there is now no such floor. If the
+// watermark is wrong in the direction of "somebody is always here", chat
+// accumulates for as long as it stays wrong. See relay.ts groupOccupants
+// for the one way that happens (a client that holds its socket open
+// indefinitely) and why it is the rule working rather than failing.
+
+// How many people make a room not-empty.
+//
+// TWO, and the second one is the whole distinction between speech and a
+// note: a message is speech when SOMEBODY ELSE could hear it, so the
+// author alone in the room is an empty room from the point of view of the
+// only rule that cares. Named rather than written as a bare `2` in
+// relay.ts because it is a definition and not a threshold.
+export const MIN_ROOM_OCCUPANTS = 2;
+
+// How stale the STORED occupancy watermark may be while the room is
+// occupied -- the coarseness of `chat_state.last_occupied_at`.
+//
+// Derived from what it has to resolve rather than from what it costs,
+// which is the opposite way round from PRESENCE_WRITE_INTERVAL_SECONDS
+// above and deliberately so: presence is written per participant against
+// a five-second beat, so the budget was the binding constraint there,
+// while this is one row for the whole room and the budget is not close.
+// A sixteenth of the idle window is comfortably finer than a boundary
+// measured in hours needs.
+//
+// Checked against the ceiling afterwards, since a derivation that is not
+// is a derivation nobody has priced: 7.5 minutes is 192 writes a day with
+// somebody in the room around the clock, 0.2% of DAILY_ROWS_WRITTEN_LIMIT.
+//
+// Which way the coarseness errs matters more than its size. The watermark
+// is the sweep's cutoff, so a watermark lagging the truth deletes LESS
+// than the rule strictly says -- a message sent in the last few minutes
+// of a conversation may be treated as a note and wait for the next one.
+// That is the right direction: it keeps something a moment too long
+// rather than deleting something a moment too early, and the next
+// conversation's sweep collects it anyway.
+const CHAT_OCCUPANCY_RESOLUTION_DIVISOR = 16;
+export const CHAT_OCCUPANCY_WRITE_INTERVAL_SECONDS =
+  CONVERSATION_IDLE_SECONDS / CHAT_OCCUPANCY_RESOLUTION_DIVISOR;
+
+// Single-letter tags on a kind-9 chat message: `h` naming the group,
+// plus an `e` on a reply. Two, and it is an assumption rather than a
+// measurement -- the only one in this section -- so it is stated where it
+// is used and chosen to err high. Over-estimating tags over-estimates a
+// removal, which shrinks the batch below: slower, never overrunning, the
+// direction TAGS_PER_REAL_EVENT and eventRemovalBudget are both wrong in.
+const TAGS_PER_CHAT_MESSAGE = 2;
+
+// What one cron tick may spend removing chat, and how many messages that
+// buys.
+//
+// NO DAILY SHARE, unlike backfill and the vanish drain above, and the
+// reason is worth stating because its absence looks like an omission.
+// Those two are paced against a share of the day because their volume is
+// chosen by somebody else -- a stranger's vanish request, a relay list of
+// unknown size. This one is bounded by what this relay already stored:
+// every message the sweep removes was written first, and writing one
+// costs MORE than removing it does (eventRowCost against the tag rows,
+// the event row and the three counters). A day's sweeping can therefore
+// never exceed a day's chat ingest, and a day's chat ingest is already
+// inside the ceiling or the relay had a bigger problem than this.
+//
+// What IS needed is a per-tick ceiling, so that a large accumulated
+// backlog -- the first live sweep after an observation period, most
+// obviously -- is drained across ticks rather than attempted at once.
+// Five percent of the day per tick, which at the charged cost of a two-tag
+// message is 250 messages: an ordinary evening's conversation of a few
+// hundred clears in one or two ticks, and a backlog drains at 6,000 a day.
+// storage.ts sweepChat checkpoints the rest, exactly as drainVanish does.
+const CHAT_SWEEP_TICK_SHARE = DAILY_ROWS_WRITTEN_LIMIT / 20;
+export const CHAT_SWEEP_BATCH_SIZE = Math.max(
+  1,
+  Math.floor(CHAT_SWEEP_TICK_SHARE / eventRowCost(TAGS_PER_CHAT_MESSAGE)),
+);
+
+// What the relay is allowed to DO about all of the above.
+//
+// Three states, and the default is the cautious one, which inverts this
+// file's usual only-one-exact-string-disables-it shape (DISABLE_VALUE
+// above, ALLOW_FOLLOWS, UPDATE_CHECK). Those guard a SAFETY limit, so the
+// dangerous act is turning one off and that is what must be spelled out.
+// Here the dangerous act is deletion itself, so it is deletion that has to
+// be spelled out and everything else defaults to watching:
+//
+//   unset, or anything else   REPORTING. Nothing is deleted and nothing is
+//                             withheld from a read. Each cron tick logs
+//                             what it would have removed, so an owner can
+//                             watch it be right for a few days first.
+//   "on"                      DELETING. The sweep removes, and reads are
+//                             clamped to the horizon.
+//   "off"                     Neither. No sweep, no report, no horizon --
+//                             the relay this was before.
+//
+// Reporting rather than off as the default because a feature that ships
+// switched off ships untested on the only deployment that matters.
+export type ChatMode = "off" | "reporting" | "deleting";
+
+export function chatMode(env: Env): ChatMode {
+  if (env.EPHEMERAL_CHAT === "on") return "deleting";
+  if (env.EPHEMERAL_CHAT === DISABLE_VALUE) return "off";
+  return "reporting";
+}

@@ -97,6 +97,22 @@ export const READ_PATHS = [
   // the write path, and averaging it into the per-event bucket would
   // describe a cost no event pays.
   "push",
+  // relay.ts runCron -> storage.ts sweepChat: the chat_state row, the
+  // COUNT behind the report, and whatever the sweep removed. Separate
+  // from "cron" because it is the one step of a tick whose size is set by
+  // how much the room has been talking, and because the whole claim of
+  // ephemeral chat is that this bucket stays proportional to a day's
+  // conversation rather than to the accumulated history -- a bucket
+  // growing with the table is that claim failing.
+  "chatSweep",
+  // relay.ts runCron -> storage.ts sweepExpiredGiftWraps: the walk over
+  // stored gift wraps looking for lapsed ones, plus whatever it removed.
+  // Separate from "chatSweep" and from "cron" because its size is set by
+  // how full the gift wrap inbox is rather than by the day's traffic, and
+  // this is the bucket that would show it: a relay whose inbox is
+  // permanently full pays a walk an hour to establish there is nothing to
+  // reclaim, which is the one cost of this sweep worth watching.
+  "giftWrapSweep",
   // relay.ts fetch(): recordHost plus the once-per-connection
   // isIpBlocked lookup.
   "connect",

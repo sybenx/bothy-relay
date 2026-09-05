@@ -1,6 +1,7 @@
 import { buildFilterQuery, compareEvents, expandFilter, type FilterQueryOptions } from "./filters";
 import {
   acrossScopes,
+  GROUP_CHAT_KIND,
   GROUP_SCOPE,
   type GroupScope,
   isGroupEvent,
@@ -9,6 +10,7 @@ import {
   scopeOf,
   TOP_LEVEL_GROUP_ID,
 } from "./groups";
+import { CHAT_BACKLOG_SECONDS, CONVERSATION_IDLE_SECONDS } from "./limits";
 import {
   EVENT_BASE_ROW_COST,
   EVENT_BASE_ROW_COST_MEASURED,
@@ -1159,6 +1161,99 @@ export function giftWrapCount(sql: SqlStorage): number {
   ).reduce((total, row) => total + row.n, 0);
 }
 
+export interface GiftWrapSweep {
+  // How many wraps this tick actually removed.
+  removed: number;
+  // Whether every expired wrap is now gone, or a remainder waits for the
+  // next tick.
+  done: boolean;
+}
+
+// Removes gift wraps whose NIP-40 `expiration` has passed.
+//
+// WHY THIS EXISTS AT ALL, since nothing else in this file deletes an
+// event for being expired. `filters.ts` hides an expired event from every
+// query -- NIP-40's "SHOULD NOT send expired events to clients, even if
+// they are stored" -- and for every other kind that is the whole of what
+// expiry means here: the row costs storage bytes, which
+// NON_OWNER_STORAGE_SHARE_LIMIT already bounds, and nothing else.
+//
+// Kind 1059 is the exception, because it is the one kind with a cap on
+// how many of it may exist. `giftWrapCount` above counts rows and not
+// mail, so an expired wrap occupies a slot in `maxGiftWraps` that no
+// query will ever serve from, permanently. Left alone, a relay carrying
+// expiring wraps fills its inbox with rows it is hiding and then answers
+// "blocked: gift wrap inbox storage is full" to the owner's real mail --
+// worse at the job it already had, in exchange for nothing.
+//
+// The count is deliberately NOT taught about expiry instead, which is the
+// smaller-looking fix. `SELECT COUNT(*) ... WHERE kind = ? AND is_group =
+// ?` is answered from idx_events_kind_created_* without touching the
+// table; adding `expiration` to it -- a column no index carries -- would
+// fetch every row behind those index entries, doubling a read that
+// relay.ts handleGiftWrap pays on every accepted wrap. And it would fix
+// only half the problem: `maxGiftWraps` is bounded by
+// MAX_FILTER_ROWS_READ as well as by the storage share, because
+// `excludeGiftWraps` skips past every stored wrap to reach the rows it
+// may return, and a dead row costs that skip exactly as a live one does.
+// The rows have to go, not just stop being counted.
+//
+// NO TOMBSTONE, and the argument is stronger here than the one sweepChat
+// makes for the same choice. That path needs `swept_through` to stand in
+// for the tombstones it does not write; this one needs nothing, because
+// the event refuses its own replay: relay.ts acceptEvent drops any event
+// whose `expiration` has passed, the tag is covered by the signature, and
+// so a re-send of the same signed copy is refused forever and for free. A
+// `deleted_ids` row would be a permanent row bought to duplicate a check
+// the event already carries.
+//
+// COST. Oldest first, so a batch that runs out leaves a contiguous
+// remainder and the checkpoint is just "run again next tick" -- the same
+// shape sweepChat and drainVanish use. `ORDER BY created_at ASC` is
+// served by the index rather than sorted, and the walk stops the moment
+// the batch fills, so a tick with work to do reads roughly what it
+// removes. A tick with nothing to do walks the whole kind-1059 range
+// once per partition to establish that, which is bounded by
+// `maxGiftWraps` -- ~2,048 rows at the defaults, ~49,000 a day, about 1%
+// of the rows-read ceiling, and only on a relay whose inbox is
+// permanently full. An ordinary personal inbox of a few dozen wraps pays
+// a few dozen rows an hour, and a relay that has never received one pays
+// nothing at all: there are no index entries to walk.
+//
+// Both partitions. `handleGiftWrap` now refuses a wrap carrying a group
+// tag, but rows stored before it did are still there, and `giftWrapCount`
+// counts both -- so a sweep that cleaned only one would leave the other
+// half of the cap silting up exactly as before.
+export function sweepExpiredGiftWraps(
+  sql: SqlStorage,
+  nowSec: number,
+  limit: number,
+): GiftWrapSweep {
+  const targets = acrossScopes((scope) =>
+    sql
+      .exec<{ id: string }>(
+        `SELECT id FROM events
+           WHERE kind = ? AND is_group = ? AND expiration IS NOT NULL AND expiration <= ?
+           ORDER BY created_at ASC LIMIT ?`,
+        GIFT_WRAP_KIND,
+        scope,
+        nowSec,
+        limit,
+      )
+      .toArray(),
+  );
+
+  // Fewer than asked for across both partitions means neither partition
+  // filled its own limit, so the range is exhausted -- checked against
+  // the limit rather than by re-running the query, the same call
+  // drainVanish and sweepChat both make. Equality counts as not done: two
+  // partitions summing to exactly the limit could still each be holding
+  // more, and re-checking next tick is cheaper than being wrong.
+  const done = targets.length < limit;
+  for (const target of targets.slice(0, limit)) deleteEventRow(sql, target.id);
+  return { removed: Math.min(targets.length, limit), done };
+}
+
 interface StoreResult {
   ok: boolean;
   message: string;
@@ -1681,6 +1776,15 @@ export interface ReadOptions {
   // separate options.
   excludeInvites?: boolean;
   scopes?: readonly GroupScope[];
+  // The oldest `created_at` a kind-9 chat message may be returned at --
+  // see filters.ts FilterQueryOptions.chatHorizon, which is where it is
+  // turned into SQL, and storage.ts chatHorizon, which is where it comes
+  // from. Undefined means no clamp, which is both the reporting mode and
+  // every deployment with EPHEMERAL_CHAT unset.
+  //
+  // Not a permission, unlike the three fields above it: it does not
+  // depend on who is asking, and the owner gets it too.
+  chatHorizon?: number;
 }
 
 export function queryFilter(
@@ -1694,6 +1798,7 @@ export function queryFilter(
   const perQuery = (scope: GroupScope): FilterQueryOptions => ({
     ...(options.excludeGiftWraps === undefined ? {} : { excludeGiftWraps: options.excludeGiftWraps }),
     ...(options.excludeInvites === undefined ? {} : { excludeInvites: options.excludeInvites }),
+    ...(options.chatHorizon === undefined ? {} : { chatHorizon: options.chatHorizon }),
     scope,
     // The tag scan budget is shared across the partitions this read
     // covers, so an authorised read costs what limits.ts prices a tag
@@ -2578,4 +2683,240 @@ export function recordPresence(sql: SqlStorage, pubkey: string, nowSec: number):
 // wrong one for somebody who said they were going.
 export function clearPresence(sql: SqlStorage, pubkey: string): void {
   sql.exec(`DELETE FROM presence WHERE pubkey = ?`, pubkey);
+}
+
+// ---------------------------------------------------------------------
+// Ephemeral group chat (schema.ts `chat_state`, limits.ts's chat block).
+//
+// One row of state and one index seek. Everything here reads or writes
+// that row except sweepChat's own DELETEs, which go through
+// deleteEventRow like every other removal in this file.
+//
+// ONE KIND, and the scope is stated as a kind rather than as a partition
+// on purpose. The group partition holds far more than talk -- reactions,
+// the relay-generated 39000-series, the moderation events that produced
+// it, invite codes -- and none of that is a conversation. Kind 9 is what
+// NIP-29 calls a chat message and what push.ts already raises a
+// notification for, so it is the one kind that expires. A kind-7 reaction
+// to a swept message therefore outlives the message it points at, which
+// is a wart and is left alone deliberately: widening the scope past what
+// was asked for is a worse mistake than a dangling reaction, and this
+// constant is the single place to widen it if that changes.
+// ---------------------------------------------------------------------
+
+export interface ChatState {
+  lastOccupiedAt: number;
+  sweptThrough: number;
+  sweptTotal: number;
+  reportedAt: number;
+  reportedPending: number;
+}
+
+// One row read. The row is seeded by initSchema, so the fallback below is
+// for the one wake between an upgrade and that seed and never for normal
+// operation.
+export function readChatState(sql: SqlStorage): ChatState {
+  const row = sql
+    .exec<{
+      last_occupied_at: number;
+      swept_through: number;
+      swept_total: number;
+      reported_at: number;
+      reported_pending: number;
+    }>(
+      `SELECT last_occupied_at, swept_through, swept_total, reported_at, reported_pending
+         FROM chat_state LIMIT 1`,
+    )
+    .toArray()[0];
+  return {
+    lastOccupiedAt: row?.last_occupied_at ?? 0,
+    sweptThrough: row?.swept_through ?? 0,
+    sweptTotal: row?.swept_total ?? 0,
+    reportedAt: row?.reported_at ?? 0,
+    reportedPending: row?.reported_pending ?? 0,
+  };
+}
+
+// The room was not empty at `nowSec`. One row updated in place, and the
+// caller is expected to have decided both that the room is occupied
+// (relay.ts groupOccupants, against MIN_ROOM_OCCUPANTS) and that the
+// stored value is stale enough to be worth moving (relay.ts's in-memory
+// tier, against CHAT_OCCUPANCY_WRITE_INTERVAL_SECONDS) -- the same
+// two-tier shape recordPresence sits behind, and for the same reason.
+//
+// MAX rather than a plain assignment: an evicted object's in-memory tier
+// is empty, so two entry points in the same second can both decide to
+// write, and a clock that can move backwards is a cutoff that can delete
+// less than the previous sweep already did.
+export function noteRoomOccupied(sql: SqlStorage, nowSec: number): void {
+  sql.exec(`UPDATE chat_state SET last_occupied_at = MAX(last_occupied_at, ?)`, nowSec);
+}
+
+// The oldest `created_at` a read of the group's chat may return.
+//
+// Two rules in one expression, and the MIN is what joins them:
+//
+//   while the room is occupied  last_occupied_at is close to now, so the horizon
+//                               is now - CHAT_BACKLOG_SECONDS: somebody
+//                               arriving partway through sees the last
+//                               few minutes.
+//   while the room is empty     last_occupied_at is older than the
+//                               backlog window, so the horizon is
+//                               last_occupied_at: what a reader sees is
+//                               exactly the notes left since the room
+//                               emptied, and none of the conversation
+//                               before them.
+//
+// The transition between the two is a fade rather than a step, since the
+// backlog window catches up with the watermark over
+// CHAT_BACKLOG_SECONDS after the last person leaves.
+//
+// Not a second expiry. Everyone who was in the room already holds these
+// messages from their own live subscription; this is what a REQ is
+// clamped to, and it is where the rows-read saving comes from between one
+// sweep and the next.
+export function chatHorizon(state: ChatState, nowSec: number): number {
+  return Math.min(nowSec - CHAT_BACKLOG_SECONDS, state.lastOccupiedAt);
+}
+
+// The cutoff one sweep would remove up to: every kind-9 in the group at or
+// before this second is over.
+//
+// ONE RULE, and `last_occupied_at` is the whole of it. Once the room has
+// been empty for CONVERSATION_IDLE_SECONDS, everything said while
+// somebody was still in it goes -- and everything said while somebody was
+// still in it is exactly everything at or before the moment the room was
+// last not-empty. So the watermark that decides when the conversation
+// ended is also the line between what belongs to it and what does not,
+// and the speech/note distinction needs no per-message bookkeeping at
+// all.
+//
+// Nothing bounds a note. A message sent to an empty room sits after this
+// cutoff and keeps sitting there until somebody comes and the watermark
+// moves past it, however long that takes -- see limits.ts, where the
+// ceiling that used to be here is argued out of existence.
+//
+// Returns 0 while the room is in use, which is the ordinary case: a
+// conversation in progress sweeps nothing.
+export function chatSweepCutoff(state: ChatState, nowSec: number): number {
+  return nowSec - state.lastOccupiedAt >= CONVERSATION_IDLE_SECONDS ? state.lastOccupiedAt : 0;
+}
+
+// How many messages that cutoff covers, for the report.
+//
+// A COUNT over idx_events_kind_created_grp, which carries `kind` and
+// `created_at` as its key columns and is partial on `is_group = 1` -- so
+// this is an index range scan and reads one entry per eligible message
+// without touching the table or a single tag row. Bounded by what the
+// group holds rather than by anything this function chooses, which is why
+// the sweep calls it once per cron tick and never per request.
+export function countChatBefore(sql: SqlStorage, cutoff: number): number {
+  const row = sql
+    .exec<{ n: number }>(
+      `SELECT COUNT(*) AS n FROM events WHERE kind = ? AND is_group = ? AND created_at <= ?`,
+      GROUP_CHAT_KIND,
+      GROUP_SCOPE,
+      cutoff,
+    )
+    .toArray()[0];
+  return row?.n ?? 0;
+}
+
+export interface ChatSweep {
+  // What the cutoff was, so the log line can say what it acted on rather
+  // than only how much.
+  cutoff: number;
+  // How many messages the cutoff covered when the sweep began.
+  pending: number;
+  // How many it actually removed -- 0 in reporting mode, whatever it
+  // managed in deleting mode.
+  removed: number;
+  // Whether the cutoff is now fully drained.
+  done: boolean;
+}
+
+// One tick's worth of the sweep.
+//
+// `remove` is what separates reporting from deleting, and it is a
+// parameter rather than an env read so this function has one behaviour to
+// test and the mode is decided once, by the caller. In both modes the
+// report is computed and stored: reporting mode is meant to produce
+// exactly the numbers deleting mode would have acted on.
+//
+// NO TOMBSTONES, which is the one place this departs from every other
+// removal in this file. deleteEventRow rather than deleteAndTombstone:
+// a `deleted_ids` row per message would leave two permanent rows behind
+// for every message deleted, so the relay would accumulate a record of
+// the conversation for as long as it accumulated conversations -- the
+// exact thing being removed, kept in a smaller box. The replay that
+// tombstones exist to refuse is refused instead by `swept_through`, which
+// nip29.ts authorizeGroupWrite compares an incoming chat message's
+// `created_at` against: one integer, refusing every message of every
+// swept conversation at once.
+//
+// Oldest first, so a batch that runs out leaves a contiguous remainder
+// for the next tick, and so the checkpoint below can advance on
+// "returned fewer than asked for" the way drainVanish does.
+export function sweepChat(
+  sql: SqlStorage,
+  state: ChatState,
+  nowSec: number,
+  limit: number,
+  remove: boolean,
+): ChatSweep {
+  const cutoff = chatSweepCutoff(state, nowSec);
+
+  // Nothing new is covered: either the room is in use, or the last sweep
+  // already drained everything this cutoff names. Returns before the
+  // COUNT and before any write, which is what keeps a room standing empty
+  // with an undelivered note in it costing one row read per tick forever
+  // rather than a row written per tick forever. With no ceiling on a note
+  // that is not a rare state -- it is where an unread note lives.
+  if (cutoff <= state.sweptThrough) {
+    return { cutoff, pending: 0, removed: 0, done: true };
+  }
+
+  const pending = countChatBefore(sql, cutoff);
+
+  if (!remove) {
+    // Reporting mode writes the report and nothing else. One row per cron
+    // tick, 24 a day, which is what buys an owner a state to read back
+    // instead of a log line they had to be watching for.
+    sql.exec(`UPDATE chat_state SET reported_at = ?, reported_pending = ?`, nowSec, pending);
+    return { cutoff, pending, removed: 0, done: pending === 0 };
+  }
+
+  const targets = sql
+    .exec<{ id: string }>(
+      `SELECT id FROM events WHERE kind = ? AND is_group = ? AND created_at <= ?
+         ORDER BY created_at ASC LIMIT ?`,
+      GROUP_CHAT_KIND,
+      GROUP_SCOPE,
+      cutoff,
+      limit,
+    )
+    .toArray();
+  for (const target of targets) deleteEventRow(sql, target.id);
+
+  // Fewer than asked for means the range is exhausted, checked against
+  // the limit rather than by re-running the query -- the same call
+  // drainVanish makes, for the same reason.
+  const done = targets.length < limit;
+  // `swept_through` advances only on a completed range. A partial sweep
+  // leaves it where it was: nothing depends on it being current, and a
+  // watermark that ran ahead of the deletion would refuse a replay of a
+  // message still sitting in the table, which is a state with no reader
+  // and no reason to exist.
+  sql.exec(
+    `UPDATE chat_state
+        SET swept_through = MAX(swept_through, ?),
+            swept_total = swept_total + ?,
+            reported_at = ?,
+            reported_pending = ?`,
+    done ? cutoff : 0,
+    targets.length,
+    nowSec,
+    pending,
+  );
+  return { cutoff, pending, removed: targets.length, done };
 }
