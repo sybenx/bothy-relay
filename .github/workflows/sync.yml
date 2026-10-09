@@ -1,6 +1,28 @@
 name: Sync from upstream
 
 on:
+  # Weekly, which is what makes committing this file the whole of turning
+  # auto-update on: there is no second switch to find and nothing to come
+  # back and click. Monday morning UTC, at a minute nowhere near the top
+  # of the hour -- GitHub runs scheduled jobs on a shared queue and delays
+  # the ones piled onto :00 (docs.github.com/actions/reference/workflows-and-actions/events-that-trigger-workflows,
+  # checked 2026-08-31).
+  #
+  # A run against an unchanged upstream pushes nothing and redeploys
+  # nothing (see "Commit and push" below), so the cost of the cadence is
+  # roughly a minute of Actions time a week, free on public repos.
+  #
+  # Worth knowing: GitHub disables scheduled workflows in a repository
+  # with 60 days of no activity and emails the owner, so a relay left
+  # entirely alone can stop checking. A sync that lands a commit is
+  # itself activity, so this only bites when upstream has also been
+  # quiet -- and re-enabling is one button on the Actions tab.
+  schedule:
+    - cron: "23 6 * * 1"
+
+  # Kept beside the schedule, not replaced by it: this is the "check now"
+  # button for someone who has just read about a fix and does not want to
+  # wait until Monday.
   workflow_dispatch:
 
 permissions:
@@ -35,17 +57,7 @@ jobs:
       - name: Restore local config
         # wrangler.jsonc holds the D1/KV/R2 IDs Cloudflare provisioned for this deployment,
         # and .github/ holds this workflow itself — neither must ever be overwritten by upstream.
-        #
-        # `git checkout HEAD -- <path>` only restores paths that exist in HEAD, so a file
-        # upstream *added* under .github/ (a new workflow, say) stayed staged and rode along
-        # into the commit — and GITHUB_TOKEN is a GitHub App token, which GitHub never lets
-        # create or update anything under .github/workflows/, so the push was rejected and the
-        # whole sync failed. Reset the index for these paths back to HEAD, restore the worktree
-        # from it, then clean out whatever upstream added that HEAD never had.
-        run: |
-          git reset -q HEAD -- wrangler.jsonc .github
-          git checkout -q -- wrangler.jsonc .github
-          git clean -qfd wrangler.jsonc .github
+        run: git checkout HEAD -- wrangler.jsonc .github/
 
       - name: Stage deletions
         run: |
