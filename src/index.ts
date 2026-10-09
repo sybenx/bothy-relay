@@ -3,6 +3,7 @@ import { logExhaustion } from "./exhaustion";
 import { HTTP_RATE_LIMIT_PERIOD_SECONDS, secondsUntilUtcMidnight } from "./limits";
 import { MANAGEMENT_CONTENT_TYPE, MEMBER_CALLABLE_METHODS } from "./nip86";
 import { nip11Response } from "./nip11";
+import { verifyClaimAuthEvent } from "./nip42";
 import { ownerReason, verifyNip98 } from "./nip98";
 import { lookupProfileCached } from "./profile-lookup";
 import { normalizeIp } from "./ip";
@@ -16,6 +17,19 @@ function json(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
     status,
     headers: { "Content-Type": "application/json" },
+  });
+}
+
+// Same as json() above, plus CORS_HEADERS -- used only by
+// POST /api/claim-signed, the one endpoint a cross-origin signer has to
+// call directly. Defined here so it sits beside json(); CORS_HEADERS
+// itself is declared further down, beside the NIP-86 preflight it exists
+// for, but referencing it here is safe -- nothing calls this function
+// until long after the whole module has finished evaluating.
+function corsJson(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "Content-Type": "application/json", ...CORS_HEADERS },
   });
 }
 
@@ -72,6 +86,11 @@ async function handleClaim(request: Request, env: Env): Promise<Response> {
     return json({ error: "malformed request body" }, 400);
   }
   const rawPubkey = (body as { pubkey?: unknown } | null)?.pubkey;
+  // Present when the phone that scanned the admin page's QR is the one
+  // claiming (public/index.html's phone view; ownership.ts claimWithNonce).
+  // It authenticates nothing -- this claim is unsigned either way -- and
+  // exists so /api/claim-status can tell the desktop page its QR landed.
+  const rawNonce = (body as { nonce?: unknown } | null)?.nonce;
   // Looked up here, in the stateless Worker, not inside the claim() RPC --
   // an outbound WebSocket from inside the DO would pin it in memory for
   // up to 15 minutes (CLAUDE.md "The budget"; profile-lookup.ts). This
@@ -94,18 +113,28 @@ async function handleClaim(request: Request, env: Env): Promise<Response> {
   // of whoever asked. Now a call that cannot possibly succeed costs at
   // most one indexed read and no outbound traffic at all.
   //
-  // These three checks mirror claim()'s own first three, in the same
-  // order, and none of them replaces it: claim() remains the authority.
+  // The pubkey and owner checks mirror claim()'s own, in the same order
+  // (the claim code's shape is checked here only; whether it is live is a
+  // storage question claim() answers), and none of them replaces it:
+  // claim() remains the authority.
   // The Durable Object is single-threaded, so the check-then-write inside
   // it is what actually makes TOFU atomic, and it still answers
   // "conflict" if it loses a race this pre-check could not have seen.
   if (env.OWNER_PUBKEY) return new Response("not found", { status: 404 });
   if (normalized === null) return json({ error: "invalid pubkey: expected npub1... or 64-char hex" }, 400);
+  if (rawNonce !== undefined && (typeof rawNonce !== "string" || rawNonce.length === 0 || rawNonce.length > 64)) {
+    return json({ error: "malformed claim code" }, 400);
+  }
   if ((await relayStub(env).getOwner()) !== null) return json({ error: "already claimed" }, 409);
 
   const profile = await lookupProfileCached(normalized);
 
-  const result = await relayStub(env).claim(rawPubkey, profile ?? undefined, new URL(request.url).host);
+  const result = await relayStub(env).claim(
+    rawPubkey,
+    profile ?? undefined,
+    new URL(request.url).host,
+    rawNonce,
+  );
   switch (result.status) {
     case "disabled":
       // CLAUDE.md "What it is": "If OWNER_PUBKEY is set in
@@ -115,9 +144,107 @@ async function handleClaim(request: Request, env: Env): Promise<Response> {
       return json({ error: "invalid pubkey: expected npub1... or 64-char hex" }, 400);
     case "conflict":
       return json({ error: "already claimed" }, 409);
+    case "invalid-nonce":
+      return json({ error: "this claim code has expired or was already used -- generate a new one" }, 410);
     case "claimed":
       return json({ pubkey: result.pubkey });
   }
+}
+
+// POST /api/claim-nonce -- the QR claim's setup step, always
+// called by bothy's own admin page (same-origin, no CORS needed) right
+// before it renders a QR. Mints the nonce the QR embeds and the eventual
+// kind-22242 claim event must name -- see src/nip42.ts and CLAUDE.md
+// "What it is" for the full flow.
+async function handleClaimNonce(request: Request, env: Env): Promise<Response> {
+  if (request.method !== "POST") return new Response("method not allowed", { status: 405 });
+
+  const limited = await rateLimited(env.RATE_LIMIT_API, request);
+  if (limited !== null) return limited;
+
+  // Same disabled-check as /api/claim, and for the same reason: cheapest
+  // and most certain first, before the DO is ever touched.
+  if (env.OWNER_PUBKEY) return new Response("not found", { status: 404 });
+
+  const result = await relayStub(env).issueClaimNonce();
+  switch (result.status) {
+    case "disabled":
+      return new Response("not found", { status: 404 });
+    case "conflict":
+      return json({ error: "already claimed" }, 409);
+    case "limited":
+      return json(
+        { error: "blocked: too many claim codes outstanding -- wait for one to expire and try again" },
+        429,
+      );
+    case "issued":
+      return json({ nonce: result.nonce, exp: result.expiresAt });
+  }
+}
+
+// POST /api/claim-signed -- the proof-of-possession claim path. Body is a
+// signed kind-22242 NIP-42 AUTH event naming a nonce issued by
+// /api/claim-nonce and this relay's own host; see src/nip42.ts
+// verifyClaimAuthEvent for the checklist and the README's "Ownership and
+// lifecycle" for the wire contract.
+//
+// Reachable cross-origin, unlike its two siblings above: this is the one
+// call a *signer* makes, from whatever origin it runs on (a native app
+// isn't bound by CORS at all, but a web-based signer is), and the
+// rationale is the same one index.ts already states for the NIP-86
+// management endpoint -- the body is a signed event, there's no cookie or
+// session for a cross-origin caller to borrow, so this widens no
+// authorization. The blanket OPTIONS preflight below already answers for
+// this path; what a plain json() response was missing is the header that
+// lets the browser actually read it.
+async function handleClaimSigned(request: Request, env: Env): Promise<Response> {
+  if (request.method !== "POST") return new Response("method not allowed", { status: 405 });
+
+  const limited = await rateLimited(env.RATE_LIMIT_API, request);
+  if (limited !== null) return limited;
+
+  if (env.OWNER_PUBKEY) return new Response("not found", { status: 404 });
+
+  let raw: unknown;
+  try {
+    raw = await request.json();
+  } catch {
+    return corsJson({ error: "malformed request body" }, 400);
+  }
+
+  const host = new URL(request.url).host;
+  const verified = verifyClaimAuthEvent(raw, host, Math.floor(Date.now() / 1000));
+  if (!verified.ok) return corsJson({ error: verified.reason }, 400);
+
+  const result = await relayStub(env).claimSigned(verified.challenge, verified.pubkey, host);
+  switch (result.status) {
+    case "disabled":
+      return new Response("not found", { status: 404 });
+    case "invalid-nonce":
+      return corsJson({ error: "unknown or expired claim code -- generate a new QR and try again" }, 400);
+    case "conflict":
+      return corsJson({ error: "already claimed" }, 409);
+    case "claimed":
+      return corsJson({ pubkey: result.pubkey });
+  }
+}
+
+// GET /api/claim-status?nonce= -- polled by bothy's own admin page (same
+// origin) while a QR is on screen. Answers forever, claimed or not:
+// there's no outbound call to protect here and nothing sensitive in the
+// answer, and the page's last poll needs to observe the claim landing
+// cleanly rather than race a "setup's over" 404.
+async function handleClaimStatus(request: Request, env: Env): Promise<Response> {
+  const limited = await rateLimited(env.RATE_LIMIT_API, request);
+  if (limited !== null) return limited;
+
+  if (env.OWNER_PUBKEY) return new Response("not found", { status: 404 });
+
+  const nonce = new URL(request.url).searchParams.get("nonce");
+  if (!nonce) return json({ error: "expected a ?nonce= query param" }, 400);
+
+  const status = await relayStub(env).getClaimStatus(nonce);
+  return json({ status });
 }
 
 // NIP-86 relay management (nips/86.md), Worker-side half: read the body,
@@ -244,6 +371,15 @@ async function handleManagement(request: Request, env: Env): Promise<Response> {
 // management call from it failed at the browser: listunusedinvites, which
 // already shipped, and now subscribepush -- which means push could not be
 // turned on from the copy of hearth most people use.
+//
+// The same constant now backs corsJson() above, for POST /api/claim-signed
+// -- the QR/signed claim path's one endpoint a *signer*, not bothy's own
+// admin page, calls directly, from whatever origin it runs on. The
+// argument is identical: the body is a signed event, there is no cookie or
+// session to borrow, so cross-origin costs nothing. Without it, only a
+// native app (which CORS doesn't bind) could ever use that path, and the
+// whole point of building it against plain NIP-42 is that it isn't
+// native-app-only.
 const CORS_HEADERS: Record<string, string> = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "POST, OPTIONS",
@@ -411,6 +547,9 @@ async function route(request: Request, env: Env): Promise<Response> {
   }
 
   if (url.pathname === "/api/claim") return handleClaim(request, env);
+  if (url.pathname === "/api/claim-nonce") return handleClaimNonce(request, env);
+  if (url.pathname === "/api/claim-signed") return handleClaimSigned(request, env);
+  if (url.pathname === "/api/claim-status") return handleClaimStatus(request, env);
   if (url.pathname === "/api/stats") return handleStats(request, env);
   if (url.pathname === "/api/profile") return handleProfile(request, env);
 
