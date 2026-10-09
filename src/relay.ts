@@ -11,6 +11,7 @@ import {
 } from "./backfill";
 import { matchesAnyFilter, parseFilter } from "./filters";
 import {
+  groupIdOf,
   ALL_SCOPES,
   CREATE_INVITE_KIND,
   filterNamesGroup,
@@ -20,6 +21,7 @@ import {
   PUBLIC_SCOPE,
 } from "./groups";
 import {
+  MAX_SCOPED_GROUPS,
   boundFilter,
   MAX_PUSHES_PER_TICK,
   MAX_PUSH_ENDPOINTS_PER_NOTIFICATION,
@@ -113,6 +115,7 @@ import {
 import { getRelayPubkey } from "./relay-identity";
 import { initSchema } from "./schema";
 import {
+  groupHost,
   advancePush,
   applyDeletion,
   beginVanish,
@@ -146,6 +149,7 @@ import {
   eventExists,
   expirationOf,
   fixMisclassifiedGroupEvents,
+  migrateToMultiGroup,
   getRelaySettings,
   getStoredWritePolicy,
   giftWrapCount,
@@ -153,6 +157,7 @@ import {
   hasNonOwnerStorageHeadroom,
   isDeleted,
   isGroupMember,
+  listMemberGroups,
   isIpBlocked,
   queryFilters,
   type RelaySettings,
@@ -1019,6 +1024,16 @@ export class Relay extends DurableObject<Env> {
         // step above it is: this is the relay fixing its own past
         // mistake, not a cost a stranger's request sizes.
         fixMisclassifiedGroupEvents(sql, this.ctx.storage, VANISH_BATCH_SIZE);
+        // The one-time migration to groups-as-rows, beside the correction
+        // above and paced against the same constant for the same reason:
+        // both are the relay fixing its own past, one UPDATE at a time,
+        // and neither is a cost a stranger's request sizes. It has to run
+        // here rather than at deploy because until it does, a relay's
+        // existing group metadata sits where an unauthenticated client
+        // cannot read it -- the state that made a NIP-29 client show no
+        // channels at all -- and nobody redeploys to finish a migration
+        // they cannot see is pending. See storage.ts migrateToMultiGroup.
+        migrateToMultiGroup(sql, this.ctx.storage, VANISH_BATCH_SIZE);
         // Once a day (paced by maintained_counts.audited_at, not by this
         // tick's frequency), recount `events` and `follows` and log if the
         // maintained counters disagree. E + F rows read, once -- against
@@ -1818,7 +1833,7 @@ export class Relay extends DurableObject<Env> {
       // being here. What it does NOT establish on its own is that
       // somebody ELSE is; groupOccupants is what decides that, and it
       // counts sockets rather than authors.
-      if (isGroupEvent(event)) this.noteRoomOccupancy(sql, nowSeconds());
+      if (isGroupEvent(event, groupHost(sql))) this.noteRoomOccupancy(sql, nowSeconds());
       // Push, if this deployment has a key for it -- see notePush below.
       // Placed here, under `result.stored`, so it is reached only by an
       // event that passed every gate, verified its own signature and was
@@ -2000,7 +2015,7 @@ export class Relay extends DurableObject<Env> {
     // kind-9 tagged into somebody else's group id is not a message in
     // this room, and waking this room's members about it would be
     // notifying them of something they cannot read.
-    if (event.kind === GROUP_CHAT_KIND && isGroupEvent(event)) {
+    if (event.kind === GROUP_CHAT_KIND && isGroupEvent(event, groupHost(sql))) {
       withReadPath("push", () => {
         queuePush(sql, "message", event.pubkey, nowSeconds());
         this.pushAlarmWanted = true;
@@ -2370,8 +2385,31 @@ export class Relay extends DurableObject<Env> {
       authedPubkey !== undefined && authedPubkey === getOwnerPubkey(this.sql, this.env);
     const mayReadGiftWraps = authedAsOwner;
     const mayReadInvites = authedAsOwner;
-    const mayReadGroups =
-      authedAsOwner || (authedPubkey !== undefined && isGroupMember(this.sql, authedPubkey));
+    // WHICH groups, not whether. The owner reads every group this relay
+    // hosts, so their list is `undefined` -- unrestricted, which is both
+    // the correct answer and the one that binds no parameters (see
+    // filters.ts FilterQueryOptions.groupIds). Everyone else reads exactly
+    // the groups they are a member of, which for a relay hosting one group
+    // is the same set the boolean used to describe and for a relay hosting
+    // several is the whole point.
+    const readableGroups: readonly string[] | undefined = authedAsOwner
+      ? undefined
+      : authedPubkey === undefined
+        ? []
+        : listMemberGroups(this.sql, authedPubkey);
+    const mayReadGroups = readableGroups === undefined || readableGroups.length > 0;
+    // Bounded because the scoping condition binds a parameter per group and
+    // nothing downstream counts them -- see limits.ts MAX_SCOPED_GROUPS.
+    // Refused with a message that says what to do about it, rather than
+    // silently reading fewer groups than the reader is entitled to.
+    if (readableGroups !== undefined && readableGroups.length > MAX_SCOPED_GROUPS) {
+      send(ws, [
+        "CLOSED",
+        subId,
+        `restricted: you are in more than ${MAX_SCOPED_GROUPS} groups -- name the one you want with "#h"`,
+      ]);
+      return;
+    }
     // Which partitions this read covers. Passed into boundFilter because
     // it multiplies the query count -- storage.ts runs the filter once per
     // partition -- so an authorised reader is priced for what it actually
@@ -2433,7 +2471,11 @@ export class Relay extends DurableObject<Env> {
     // one is answered normally with the group's events omitted -- refusing
     // that would make the refusal itself the answer, which is precisely
     // the leak the gift wrap storage probe turned out to be.
-    if (!mayReadGroups && filters.some(filterNamesGroup)) {
+    // Refused when the filter names a group this reader may not read --
+    // which for an unauthenticated client is every group, and for a member
+    // is every group but their own. A member naming their OWN group is the
+    // ordinary case and is answered, not challenged.
+    if (filters.some((f) => filterNamesGroup(f, readableGroups))) {
       if (state.authedPubkey === undefined) {
         if (!state.challenge) {
           state.challenge = crypto.randomUUID();
@@ -2531,6 +2573,11 @@ export class Relay extends DurableObject<Env> {
       // are not in the partition being read.
       excludeInvites: mayReadGroups && !mayReadInvites,
       scopes,
+      // Which groups the group-partition half of this read may return.
+      // Omitted for the owner, who reads every group -- see filters.ts
+      // FilterQueryOptions.groupIds for why that is a `undefined` rather
+      // than a list naming them all.
+      ...(readableGroups === undefined ? {} : { groupIds: readableGroups }),
     }).slice(0, MAX_EVENTS_PER_REQ);
     for (const event of events) {
       send(ws, ["EVENT", subId, event]);
@@ -2630,17 +2677,24 @@ export class Relay extends DurableObject<Env> {
     // open connections is one lookup, not three, and a broadcast to
     // sockets that are all the owner's or all unauthenticated does none.
     const giftWrap = event.kind === GIFT_WRAP_KIND;
-    const gated = giftWrap || isGroupEvent(event);
+    const gated = giftWrap || isGroupEvent(event, groupHost(this.sql));
     const ownerOnly = giftWrap || event.kind === CREATE_INVITE_KIND;
     const owner = gated ? getOwnerPubkey(this.sql, this.env) : null;
+    // WHICH group this event belongs to, so membership is checked against
+    // that one rather than against "any group at all". A member of A on an
+    // open socket must not be pushed B's traffic, and this is the surface
+    // where that would happen silently: the REQ gate saw a filter naming
+    // no group, admitted it, and never looks again.
+    const eventGroup = gated && !giftWrap ? groupIdOf(event) : null;
     const membership = new Map<string, boolean>();
     const mayReceive = (authed: string | undefined): boolean => {
       if (authed === undefined) return false;
       if (owner !== null && authed === owner) return true;
       if (ownerOnly) return false;
+      if (eventGroup === null) return false;
       let member = membership.get(authed);
       if (member === undefined) {
-        member = isGroupMember(this.sql, authed);
+        member = isGroupMember(this.sql, authed, eventGroup);
         membership.set(authed, member);
       }
       return member;
@@ -2687,7 +2741,7 @@ export class Relay extends DurableObject<Env> {
     // here. Stated rather than left implicit, so a later reading of
     // "members may now read the group" does not arrive at this function
     // and take the absence of a member case for an oversight.
-    if (event.kind === GIFT_WRAP_KIND || isGroupEvent(event)) return;
+    if (event.kind === GIFT_WRAP_KIND || isGroupEvent(event, groupHost(this.sql))) return;
     const live = this.ctx.getWebSockets(LIVE_FEED_TAG);
     if (live.length === 0) return;
     const notice = JSON.stringify({ kind: event.kind, created_at: event.created_at, id: event.id.slice(0, 8) });

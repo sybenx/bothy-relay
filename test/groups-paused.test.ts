@@ -13,7 +13,12 @@
 import { env } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import { GROUP_METADATA_KIND, TOP_LEVEL_GROUP_ID } from "../src/groups";
+import {
+  GROUP_ADMINS_KIND,
+  GROUP_MEMBERS_KIND,
+  GROUP_METADATA_KIND,
+  TOP_LEVEL_GROUP_ID,
+} from "../src/groups";
 import { groupsEnabled } from "../src/limits";
 import { buildRelayInfo } from "../src/nip11";
 import { GROUP_METHODS, handleManagementCall, SUPPORTED_METHODS, supportedMethods } from "../src/nip86";
@@ -66,12 +71,6 @@ describe("the write gate while paused", () => {
           event: signEvent(OWNER_SECRET_KEY_HEX, { kind: EDIT_METADATA_KIND, tags: [["h", TOP_LEVEL_GROUP_ID]] }),
           isOwner: true,
         },
-        // A client-signed relay-metadata kind, which is refused either way
-        // -- while paused it gets the pause message like everything else.
-        {
-          event: signEvent(OWNER_SECRET_KEY_HEX, { kind: GROUP_METADATA_KIND, tags: [["d", TOP_LEVEL_GROUP_ID]] }),
-          isOwner: true,
-        },
       ];
       const messages = new Set<string>();
       for (const { event, isOwner } of shapes) {
@@ -82,16 +81,34 @@ describe("the write gate while paused", () => {
       expect(messages).toEqual(new Set([GROUPS_PAUSED_MESSAGE]));
       expect(GROUPS_PAUSED_MESSAGE).toMatch(/^restricted: /);
 
-      // The same shapes with groups on go through to the ordinary gate --
+      // A client-signed 39000-series event is the one group shape the
+      // pause does NOT answer, and it is deliberate: it is refused whether
+      // groups are paused or not, so naming the pause would imply that
+      // unpausing would let it through. Asserted across the range rather
+      // than at one kind, because the two halves of that range reach the
+      // check by different routes -- 39000/39001 are publicly readable and
+      // so are not group events at all (groups.ts isPubliclyReadableGroupKind),
+      // while 39002+ are -- and an ordering that answered them differently
+      // is exactly the defect this asserts against.
+      for (const kind of [GROUP_METADATA_KIND, GROUP_ADMINS_KIND, GROUP_MEMBERS_KIND]) {
+        const forged = signEvent(OWNER_SECRET_KEY_HEX, { kind, tags: [["d", TOP_LEVEL_GROUP_ID]] });
+        for (const env of [PAUSED, ON]) {
+          const result = authorizeGroupWrite(sql, env, forged, true, 1);
+          expect(result.ok).toBe(false);
+          if (!result.ok) {
+            expect(result.message).not.toBe(GROUPS_PAUSED_MESSAGE);
+            expect(result.message).toContain("signed by this relay itself");
+          }
+        }
+      }
+
+      // The same shapes with groups on go through to the ordinary gate,
       // which admits the owner's chat, the member's note and the two
-      // moderation events, and refuses only the client-signed 39000.
+      // moderation events.
       expect(authorizeGroupWrite(sql, ON, shapes[0]!.event, true, 1).ok).toBe(true);
       expect(authorizeGroupWrite(sql, ON, shapes[1]!.event, false, 1).ok).toBe(true);
       expect(authorizeGroupWrite(sql, ON, shapes[2]!.event, true, 1).ok).toBe(true);
       expect(authorizeGroupWrite(sql, ON, shapes[3]!.event, true, 1).ok).toBe(true);
-      const metadata = authorizeGroupWrite(sql, ON, shapes[4]!.event, true, 1);
-      expect(metadata.ok).toBe(false);
-      if (!metadata.ok) expect(metadata.message).not.toBe(GROUPS_PAUSED_MESSAGE);
     });
   });
 

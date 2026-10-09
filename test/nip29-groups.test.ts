@@ -26,7 +26,13 @@ import {
   PUBLIC_SCOPE,
   TOP_LEVEL_GROUP_ID,
 } from "../src/groups";
-import { applyModeration, EDIT_METADATA_KIND, PUT_USER_KIND, REMOVE_USER_KIND } from "../src/nip29";
+import {
+  applyModeration,
+  CREATE_GROUP_KIND,
+  EDIT_METADATA_KIND,
+  PUT_USER_KIND,
+  REMOVE_USER_KIND,
+} from "../src/nip29";
 import type { Relay } from "../src/relay";
 import { auditMaintainedCounts, readMaintainedCounts, storeEvent } from "../src/storage";
 import { computeEventId } from "../src/validate";
@@ -35,6 +41,10 @@ import { isolateStorage } from "./helpers/isolate";
 import { callManagement } from "./helpers/management";
 import { OWNER_PUBKEY_HEX, OWNER_SECRET_KEY_HEX, randomKeypair } from "./helpers/keys";
 import { collectStored, connectRelay, publish, type RelayConn } from "./helpers/socket";
+
+// This relay hosts one group in these tests; `isGroupEvent` asks rather
+// than comparing against a constant, because a group is now a row.
+const hosts = (id: string) => id === TOP_LEVEL_GROUP_ID;
 
 isolateStorage();
 
@@ -69,6 +79,27 @@ async function authenticateAsOwner(conn: RelayConn): Promise<void> {
     ],
   });
   conn.send(["AUTH", authEvent]);
+  const [, , ok] = await conn.nextMessage();
+  expect(ok).toBe(true);
+}
+
+// Authenticates a connection as an arbitrary key. Same shape as
+// authenticateAsOwner above; the trigger is a filter gated by shape alone
+// so it works before anything is stored.
+async function authenticateAs(conn: RelayConn, secretKeyHex: string): Promise<void> {
+  conn.send(["REQ", "challengeTrigger", { kinds: [1059] }]);
+  const [, challenge] = await conn.nextMessage();
+  await conn.nextMessage(); // CLOSED, auth-required
+  conn.send([
+    "AUTH",
+    signEvent(secretKeyHex, {
+      kind: 22242,
+      tags: [
+        ["relay", "wss://example.com"],
+        ["challenge", challenge as string],
+      ],
+    }),
+  ]);
   const [, , ok] = await conn.nextMessage();
   expect(ok).toBe(true);
 }
@@ -113,11 +144,23 @@ describe("the 39000-series and the group partition", () => {
   // and were served to any unauthenticated client that asked for them. The
   // exclusion covered every event in the group except the list of who was
   // in it.
-  it("counts the relay-generated kinds as group events, by kind and not by tag", () => {
-    for (const kind of [39000, 39001, 39002, 39003, 39004, 39005]) {
+  it("gates the relay-generated kinds by what they disclose, not by their range", () => {
+    // The partition means "does reading this need a membership check", and
+    // the 39000-series is split down the middle by that question. 39000 is
+    // the group's name and picture and 39001 is its admins, which on this
+    // relay is the owner, whose pubkey the NIP-11 document already
+    // publishes unauthenticated -- neither tells a stranger anything they
+    // could not already have. 39002 is the member list, which is the whole
+    // thing a private group is keeping back.
+    for (const kind of [GROUP_METADATA_KIND, GROUP_ADMINS_KIND]) {
       const event = signEvent(OWNER_SECRET_KEY_HEX, { kind, tags: [["d", TOP_LEVEL_GROUP_ID]] });
-      expect(isGroupEvent(event)).toBe(true);
-      // The `h` rule would have said no -- there is no `h` tag here.
+      expect(isGroupEvent(event, hosts)).toBe(false);
+      // Still no `h` tag -- the split is by kind, not by tag shape.
+      expect(event.tags.some((t) => t[0] === "h")).toBe(false);
+    }
+    for (const kind of [GROUP_MEMBERS_KIND, 39003, 39004, 39005]) {
+      const event = signEvent(OWNER_SECRET_KEY_HEX, { kind, tags: [["d", TOP_LEVEL_GROUP_ID]] });
+      expect(isGroupEvent(event, hosts)).toBe(true);
       expect(event.tags.some((t) => t[0] === "h")).toBe(false);
     }
     // A malformed one -- naming no group at all -- is NOT group state by
@@ -132,16 +175,18 @@ describe("the 39000-series and the group partition", () => {
     // malformed one (like this one, signed by the owner rather than the
     // relay) never reaches storage to need hiding. See test/backfill.test.ts
     // for that refusal exercised through storeEvent directly.
-    expect(isGroupEvent(signEvent(OWNER_SECRET_KEY_HEX, { kind: 39002 }))).toBe(false);
+    expect(isGroupEvent(signEvent(OWNER_SECRET_KEY_HEX, { kind: 39002 }), hosts)).toBe(false);
     // Neighbouring addressable kinds are untouched -- `d` identifies every
     // addressable event there is, so this cannot be a `d`-tag rule.
-    expect(isGroupEvent(signEvent(OWNER_SECRET_KEY_HEX, { kind: 30023, tags: [["d", "post"]] }))).toBe(
-      false,
-    );
-    expect(isGroupEvent(signEvent(OWNER_SECRET_KEY_HEX, { kind: 39006, tags: [["d", "_"]] }))).toBe(false);
+    expect(
+      isGroupEvent(signEvent(OWNER_SECRET_KEY_HEX, { kind: 30023, tags: [["d", "post"]] }), hosts),
+    ).toBe(false);
+    expect(
+      isGroupEvent(signEvent(OWNER_SECRET_KEY_HEX, { kind: 39006, tags: [["d", "_"]] }), hosts),
+    ).toBe(false);
   });
 
-  it("stores generated group state in the group partition", async () => {
+  it("splits generated group state across the two partitions", async () => {
     const conn = await connectRelay();
     const member = randomKeypair();
     expect((await publish(conn, putUser(member.pubkeyHex)))[2]).toBe(true);
@@ -155,16 +200,23 @@ describe("the 39000-series and the group partition", () => {
         )
         .toArray();
       expect(rows.length).toBe(4); // the 9000, plus 39000/39001/39002
-      for (const row of rows) expect(row.is_group).toBe(GROUP_SCOPE);
-      // Nothing at all landed in the public partition.
+      const byKind = new Map(rows.map((r) => [r.kind, r.is_group]));
+      // The moderation event and the member list need a membership check.
+      expect(byKind.get(PUT_USER_KIND)).toBe(GROUP_SCOPE);
+      expect(byKind.get(GROUP_MEMBERS_KIND)).toBe(GROUP_SCOPE);
+      // The group's existence and its admins do not, so they are ordinary
+      // public rows and a client listing this relay's groups reads them
+      // through the ordinary public path with no group code involved.
+      expect(byKind.get(GROUP_METADATA_KIND)).toBe(PUBLIC_SCOPE);
+      expect(byKind.get(GROUP_ADMINS_KIND)).toBe(PUBLIC_SCOPE);
       const publicRows = state.storage.sql
         .exec<{ n: number }>(`SELECT COUNT(*) AS n FROM events WHERE is_group = ?`, PUBLIC_SCOPE)
         .toArray()[0];
-      expect(publicRows?.n).toBe(0);
+      expect(publicRows?.n).toBe(2);
     });
   });
 
-  it("does not serve the member list to an unauthenticated client", async () => {
+  it("serves the metadata and admins publicly, and never the member list", async () => {
     const conn = await connectRelay();
     const member = randomKeypair();
     await publish(conn, putUser(member.pubkeyHex));
@@ -179,12 +231,25 @@ describe("the 39000-series and the group partition", () => {
     expect(String(closedReason)).toContain("auth-required");
     void reason;
 
-    // A filter that does NOT name it is answered normally, with the rows
-    // omitted -- refusing here would make the refusal itself the answer,
-    // which is the leak the gift wrap storage probe turned out to be.
-    // `#d` alone does not count as naming a group: `d` identifies every
-    // addressable event there is.
-    expect(await collectStored(conn, "byD", [{ "#d": [TOP_LEVEL_GROUP_ID] }])).toEqual([]);
+    // A filter that does NOT name it is answered normally, with the member
+    // list omitted -- refusing here would make the refusal itself the
+    // answer, which is the leak the gift wrap storage probe turned out to
+    // be. `#d` alone does not count as naming a group: `d` identifies
+    // every addressable event there is.
+    //
+    // What DOES come back is the metadata and the admin list, and that is
+    // the point of the rule rather than a hole in it: a group's existence
+    // is public and its membership is not. Asserted by kind rather than by
+    // emptiness, so that a change putting 39002 back on this path fails
+    // here instead of passing a length check.
+    const byD = await collectStored(conn, "byD", [{ "#d": [TOP_LEVEL_GROUP_ID] }]);
+    expect(byD.map((e) => e.kind).sort()).toEqual([GROUP_METADATA_KIND, GROUP_ADMINS_KIND].sort());
+    expect(byD.some((e) => e.kind === GROUP_MEMBERS_KIND)).toBe(false);
+
+    // The member list carries every member's pubkey in a `p` tag, so a
+    // filter reaching for one is the shape that would find it. It must
+    // come back with nothing at all: the admin list p-tags only the owner,
+    // and the metadata p-tags nobody.
     expect(await collectStored(conn, "byP", [{ "#p": [member.pubkeyHex] }])).toEqual([]);
     conn.close();
   });
@@ -201,18 +266,26 @@ describe("the 39000-series and the group partition", () => {
     conn.close();
   });
 
-  it("keeps the generated events off the public /api/stats counters", async () => {
+  it("counts only the public half of the generated state on /api/stats", async () => {
     const conn = await connectRelay();
     await publish(conn, putUser(randomKeypair().pubkeyHex));
     conn.close();
 
     await runInDurableObject(stub(), async (_instance: Relay, state) => {
       const counts = readMaintainedCounts(state.storage.sql);
-      // Four stored events -- the 9000 and the three generated -- and all
-      // four counted as group events, so `events - group_events` (what
-      // /api/stats publishes) is zero.
+      // Four stored events -- the 9000 and the three generated. Two of
+      // them are group events, so `events - group_events` (what /api/stats
+      // publishes) is 2: the group's metadata and its admin list, which
+      // are public and are supposed to be counted.
+      //
+      // What must NOT move with the group's traffic is the rest, and that
+      // is the property this test is really about: a membership change
+      // adds exactly one to the public count (the regenerated 39000 or
+      // 39001, only when its own content changed) and every chat message
+      // adds none, so polling the public counter still says nothing about
+      // what is being said in the group.
       expect(counts.events).toBe(4);
-      expect(counts.groupEvents).toBe(4);
+      expect(counts.groupEvents).toBe(2);
     });
   });
 });
@@ -271,17 +344,30 @@ describe("the relay writing its own events", () => {
     await runInDurableObject(stub(), async (_instance: Relay, state) => {
       const sql = state.storage.sql;
       const generated = sql
-        .exec<{ id: string; ingested_at: number | null; row_cost: number | null; is_group: number }>(
-          `SELECT id, ingested_at, row_cost, is_group FROM events WHERE kind >= 39000`,
+        .exec<{
+          id: string;
+          kind: number;
+          ingested_at: number | null;
+          row_cost: number | null;
+          is_group: number;
+        }>(
+          `SELECT id, kind, ingested_at, row_cost, is_group FROM events WHERE kind >= 39000`,
         )
         .toArray();
       expect(generated.length).toBe(3);
       for (const row of generated) {
         expect(row.ingested_at).not.toBeNull();
         expect(row.row_cost).not.toBeNull();
-        expect(row.is_group).toBe(GROUP_SCOPE);
-        // Tag rows exist and carry the partition, which is what lets the
-        // tag subquery exclude them before its own LIMIT applies.
+        // Whichever partition the kind belongs in -- the point of this
+        // test is the bookkeeping, not the placement, and the placement is
+        // asserted above.
+        const expectedScope = row.kind === GROUP_MEMBERS_KIND ? GROUP_SCOPE : PUBLIC_SCOPE;
+        expect(row.is_group).toBe(expectedScope);
+        // Tag rows exist and carry the SAME partition as their event, which
+        // is what lets the tag subquery scope them before its own LIMIT
+        // applies. A tag row disagreeing with its event is the defect that
+        // would put a member list's `p` tags on the public tag path while
+        // the event itself stayed hidden.
         const tagRows = sql
           .exec<{ n: number; g: number }>(
             `SELECT COUNT(*) AS n, COALESCE(SUM(is_group), 0) AS g FROM event_tags WHERE event_id = ?`,
@@ -289,7 +375,7 @@ describe("the relay writing its own events", () => {
           )
           .toArray()[0]!;
         expect(tagRows.n).toBeGreaterThan(0);
-        expect(tagRows.g).toBe(tagRows.n);
+        expect(tagRows.g).toBe(expectedScope === GROUP_SCOPE ? tagRows.n : 0);
       }
 
       // The counters moved for them, and the daily audit -- which recounts
@@ -431,7 +517,7 @@ describe("membership", () => {
         const sql = state.storage.sql;
         return {
           members: sql
-            .exec<{ pubkey: string }>(`SELECT pubkey FROM group_members`)
+            .exec<{ pubkey: string }>(`SELECT pubkey FROM group_membership`)
             .toArray()
             .map((r) => r.pubkey),
           allowed: sql
@@ -471,7 +557,7 @@ describe("membership", () => {
       // owner-owned, because put-user must not demote a deliberate grant
       // into one remove-user can reclaim.
       expect(rows).toEqual([{ pubkey: member.pubkeyHex, source: "owner", reason: "a friend" }]);
-      expect(state.storage.sql.exec(`SELECT 1 FROM group_members`).toArray()).toEqual([]);
+      expect(state.storage.sql.exec(`SELECT 1 FROM group_membership`).toArray()).toEqual([]);
     });
   });
 
@@ -543,7 +629,11 @@ describe("membership", () => {
       kind: PUT_USER_KIND,
       tags: [["h", "some-other-group"], ["p", randomKeypair().pubkeyHex]],
     });
-    expect((await publish(conn, wrongGroup))[3]).toContain(`["h", "${TOP_LEVEL_GROUP_ID}"]`);
+    // Refused because this relay hosts no such group -- not because the id
+    // is not `_`. The distinction is the change: a moderation event may
+    // name any group this relay actually hosts, and there is now more than
+    // one it could be.
+    expect((await publish(conn, wrongGroup))[3]).toContain("hosts no group with id some-other-group");
 
     // kind 9005 delete-event: in NIP-29's moderation range, not implemented
     // here. Refused by name rather than stored as an inert group note that
@@ -829,7 +919,7 @@ describe("the daily audit", () => {
       // function granting relay write access on the strength of a row it
       // has just decided it cannot trust.
       expect(sql.exec(`SELECT 1 FROM allowed_pubkeys`).toArray()).toEqual([]);
-      expect(sql.exec(`SELECT 1 FROM group_members`).toArray().length).toBe(1);
+      expect(sql.exec(`SELECT 1 FROM group_membership`).toArray().length).toBe(1);
 
       // And what gets STORED for /api/stats to read back counts rather than
       // names -- that endpoint is public and unauthenticated, so putting
@@ -841,5 +931,98 @@ describe("the daily audit", () => {
       expect(stored).toContain("no allowed_pubkeys row");
       expect(stored).not.toContain(member.pubkeyHex);
     });
+  });
+});
+
+// Two groups, which is the case every rule above was written for and none
+// of the tests above could reach while the relay hosted exactly one.
+//
+// The property is per-group scoping: a member of A is an authenticated
+// non-owner to B, and must be answered as one. Before the scoping existed
+// this suite would have passed with membership relay-wide, because with a
+// single group "is a member" and "is a member of THIS group" are the same
+// sentence.
+describe("more than one group", () => {
+  function createGroup(id: string): NostrEvent {
+    return signEvent(OWNER_SECRET_KEY_HEX, { kind: CREATE_GROUP_KIND, tags: [["h", id]] });
+  }
+  function chat(secretKeyHex: string, id: string, body: string): NostrEvent {
+    return signEvent(secretKeyHex, { kind: 9, tags: [["h", id]], content: body });
+  }
+
+  it("keeps a member of one group out of the other", async () => {
+    const conn = await connectRelay();
+    const alice = randomKeypair();
+
+    expect((await publish(conn, createGroup("alpha")))[2]).toBe(true);
+    expect((await publish(conn, createGroup("beta")))[2]).toBe(true);
+    // Alice is put into alpha and never into beta.
+    const intoAlpha = signEvent(OWNER_SECRET_KEY_HEX, {
+      kind: PUT_USER_KIND,
+      tags: [["h", "alpha"], ["p", alice.pubkeyHex]],
+    });
+    expect((await publish(conn, intoAlpha))[2]).toBe(true);
+
+    // The owner writes into both.
+    expect((await publish(conn, chat(OWNER_SECRET_KEY_HEX, "alpha", "in alpha")))[2]).toBe(true);
+    expect((await publish(conn, chat(OWNER_SECRET_KEY_HEX, "beta", "in beta")))[2]).toBe(true);
+    conn.close();
+
+    const asAlice = await connectRelay();
+    await authenticateAs(asAlice, alice.secretKeyHex);
+
+    // Her own group answers, and carries only her own group's talk.
+    const alpha = await collectStored(asAlice, "alpha", [{ kinds: [9], "#h": ["alpha"] }]);
+    expect(alpha.map((e) => e.content)).toEqual(["in alpha"]);
+
+    // The other group is refused outright -- she named it, so telling her
+    // to authenticate says nothing she did not already say.
+    asAlice.send(["REQ", "beta", { kinds: [9], "#h": ["beta"] }]);
+    const [frameType, , reason] = await asAlice.nextMessage();
+    expect(frameType).toBe("CLOSED");
+    expect(String(reason)).toContain("restricted:");
+
+    // And the omission half, which is the one that would leak silently: a
+    // filter naming NO group is answered normally, and must come back with
+    // alpha's message and not beta's. A gate that only refuses named
+    // groups, with membership still relay-wide underneath, passes the
+    // assertion above and fails this one.
+    const unnamed = await collectStored(asAlice, "any", [{ kinds: [9], limit: 50 }]);
+    expect(unnamed.map((e) => e.content)).toEqual(["in alpha"]);
+    asAlice.close();
+  });
+
+  it("refuses to create a group that already exists", async () => {
+    const conn = await connectRelay();
+    expect((await publish(conn, createGroup("gamma")))[2]).toBe(true);
+    const [, , accepted, message] = await publish(conn, createGroup("gamma"));
+    expect(accepted).toBe(false);
+    expect(String(message)).toContain("already hosts a group");
+    conn.close();
+  });
+
+  it("gives each group its own state, addressed by its own id", async () => {
+    const conn = await connectRelay();
+    expect((await publish(conn, createGroup("delta")))[2]).toBe(true);
+    conn.close();
+
+    // Both groups' metadata is public, which is what lets a client list
+    // what this relay hosts without an account at all.
+    const anon = await connectRelay();
+    const meta = await collectStored(anon, "meta", [{ kinds: [GROUP_METADATA_KIND] }]);
+    const ids = meta
+      .map((e) => e.tags.find((tag) => tag[0] === "d")?.[1])
+      .filter((v): v is string => v !== undefined)
+      .sort();
+    expect(ids).toContain("delta");
+    // `_` is NOT here, and that is the honest answer rather than a gap in
+    // this assertion. It is seeded as a row so that a relay which predates
+    // creatable groups keeps the one it had, but a seeded row is not a
+    // configured group: nothing has named it, so there is no metadata
+    // event to publish and nothing for a client to list. It appears the
+    // moment the owner does anything with it -- a put-user or an
+    // edit-metadata regenerates its state like any other group's.
+    expect(ids).not.toContain(TOP_LEVEL_GROUP_ID);
+    anon.close();
   });
 });
