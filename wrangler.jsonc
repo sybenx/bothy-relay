@@ -52,7 +52,8 @@
   // scheduled()'s fault-isolation logging) are discarded and only visible
   // via a live `wrangler tail`, which needs credentials we don't have.
   // Included on the Free plan: 200,000 logs/day, 3-day retention.
-  // head_sampling_rate: 1 means every invocation is logged, not sampled.
+  // head_sampling_rate: 0.1 logs 1 in 10 invocations (at 1, WebSocket
+  // traffic alone used ~85k of the 200k/day by Oct 2026).
   //
   // Added by hand rather than arriving from upstream: this relay was
   // cloned before upstream added the block, and the sync workflow
@@ -62,6 +63,6 @@
   // has to be copied in here the same way.
   "observability": {
     "enabled": true,
-    "head_sampling_rate": 1
+    "head_sampling_rate": 0.1
   }
 }
