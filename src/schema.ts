@@ -488,8 +488,17 @@ export const TABLES: readonly TableSpec[] = [
     ],
   },
   {
-    // Web push subscriptions (push.ts). One row per ENDPOINT: a phone, a
-    // laptop and a browser tab are three endpoints for one pubkey.
+    // Web push subscriptions (push.ts). One row per (ENDPOINT, PUBKEY): a
+    // phone, a laptop and a browser tab are three endpoints for one pubkey,
+    // and two accounts in one app on one phone are one endpoint under two
+    // pubkeys. Keyed by endpoint alone until 0.20.0, when the second
+    // account's subscribe took the first's row; rekeyPushSubscriptions
+    // rebuilds a table still keyed that way.
+    //
+    // `label`: an opaque tag the app chose for the account (nip86.ts
+    // subscribepush), echoed in the payload so the app knows which account
+    // a push is for without the push service ever seeing a pubkey. NULL
+    // when the app sent none.
     //
     // `pubkey` comes from the NIP-98 signature, never from the request body
     // (nip86.ts subscribepush). A body-supplied pubkey would let anyone
@@ -514,13 +523,15 @@ export const TABLES: readonly TableSpec[] = [
     // drainPushOutbox).
     name: "push_subscriptions",
     columns: [
-      col("endpoint", "TEXT PRIMARY KEY"),
+      col("endpoint", "TEXT NOT NULL"),
       col("pubkey", "TEXT NOT NULL"),
       col("p256dh", "TEXT NOT NULL"),
       col("auth", "TEXT NOT NULL"),
       col("created_at", "INTEGER NOT NULL"),
       col("last_ok_at", "INTEGER"),
+      col("label", "TEXT"),
     ],
+    tableConstraints: ["PRIMARY KEY (endpoint, pubkey)"],
   },
   {
     // The push fan-out queue: one row per REASON ("message", "voice"), so at
@@ -594,6 +605,17 @@ export const TABLES: readonly TableSpec[] = [
     ],
   },
   {
+    // Admins (nip86.ts addadmin/removeadmin/listadmins): pubkeys the owner
+    // lets run the member list, invites and join requests, and nothing
+    // relay-level (nip86.ts ADMIN_CALLABLE_METHODS). Made for the owner's
+    // own second key, a messenger identity kept apart from the main npub.
+    // Every admin is also a member: addadmin writes the `allowed_pubkeys`
+    // row if there is none, and removing the member removes the admin.
+    // removeadmin takes the role away and leaves the membership.
+    name: "admins",
+    columns: [col("pubkey", "TEXT PRIMARY KEY"), col("added_at", "INTEGER NOT NULL")],
+  },
+  {
     // Join requests (nip86.ts requestjoin): one row per pubkey that asked
     // to become a member without a code. Pending while `declined_at` is
     // NULL; either way the row goes at `expires_at` (limits.ts
@@ -613,6 +635,34 @@ export const TABLES: readonly TableSpec[] = [
       // says (unverified: anyone can name anyone). On approval it becomes
       // `invited_by` if it names a member then, and the owner otherwise.
       col("via", "TEXT"),
+    ],
+  },
+  {
+    // Profile photos (src/photos.ts): ONE per pubkey, the member's or the
+    // owner's current photo, so a new upload replaces the row. The bytes
+    // are in `data`, one row each: limits.ts PHOTO_MAX_BYTES_CEILING keeps
+    // a photo under SQLite's per-value limit. Served publicly by `sha256`
+    // (idx_photos_sha256); there is no listing. A removed member's photo
+    // goes when their grace period ends (storage.ts sweepFormerMembers).
+    name: "photos",
+    columns: [
+      col("pubkey", "TEXT PRIMARY KEY"),
+      col("sha256", "TEXT NOT NULL"),
+      col("type", "TEXT NOT NULL"),
+      col("size", "INTEGER NOT NULL"),
+      col("data", "BLOB NOT NULL"),
+      col("uploaded_at", "INTEGER NOT NULL"),
+    ],
+  },
+  {
+    // The per-pubkey daily upload count (limits.ts PHOTO_UPLOADS_PER_DAY).
+    // `day` is the UTC day number; a new day resets `count`. Durable, not
+    // in memory, because an evicted object would otherwise forget it.
+    name: "photo_uploads",
+    columns: [
+      col("pubkey", "TEXT PRIMARY KEY"),
+      col("day", "INTEGER NOT NULL"),
+      col("count", "INTEGER NOT NULL"),
     ],
   },
   {
@@ -954,6 +1004,12 @@ export const INDEXES: readonly IndexSpec[] = [
   // member's mail goes to (relay.ts drainInboxPushes, storage.ts
   // hasPushSubscription), and dropping a removed member's devices. One row
   // written per subscribe.
+  // Serves GET /<sha256> (src/photos.ts): a photo is found by its hash.
+  {
+    name: "idx_photos_sha256",
+    table: "photos",
+    keyColumns: ["sha256"],
+  },
   {
     name: "idx_push_subscriptions_pubkey",
     table: "push_subscriptions",
@@ -1346,11 +1402,34 @@ function dropUndeclaredIndexes(sql: SqlStorage): void {
   }
 }
 
+// push_subscriptions was keyed by endpoint alone before 0.20.0 (see that
+// table). SQLite cannot change a primary key in place, so a table still
+// keyed that way is renamed, recreated from TABLES and copied back, rows
+// and all, then the old one dropped. Bounded by the per-pubkey device cap
+// times the members, so one pass. Runs only on the reconcile path, ahead
+// of the CREATE TABLE loop, which then finds the new table already there.
+function rekeyPushSubscriptions(sql: SqlStorage): void {
+  const keyed = sql
+    .exec<{ name: string; pk: number }>(`SELECT name, pk FROM pragma_table_info('push_subscriptions')`)
+    .toArray()
+    .filter((c) => c.pk > 0);
+  if (keyed.length !== 1) return;
+  const spec = TABLES.find((t) => t.name === "push_subscriptions")!;
+  sql.exec(`ALTER TABLE push_subscriptions RENAME TO push_subscriptions_old`);
+  sql.exec(createTableSql(spec));
+  sql.exec(
+    `INSERT OR IGNORE INTO push_subscriptions (endpoint, pubkey, p256dh, auth, created_at, last_ok_at)
+       SELECT endpoint, pubkey, p256dh, auth, created_at, last_ok_at FROM push_subscriptions_old`,
+  );
+  sql.exec(`DROP TABLE push_subscriptions_old`);
+}
+
 export function initSchema(sql: SqlStorage): void {
   ensureSchemaMetaTable(sql);
   const hash = currentSchemaHash();
   if (readStoredSchemaHash(sql) === hash) return;
 
+  rekeyPushSubscriptions(sql);
   for (const spec of TABLES) {
     // Creates the table with every declared column on a fresh database,
     // and is a no-op on an existing one -- which is exactly why the

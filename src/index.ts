@@ -1,7 +1,20 @@
 import { runBackfillTick } from "./backfill-worker";
 import { logExhaustion } from "./exhaustion";
-import { HTTP_RATE_LIMIT_PERIOD_SECONDS, secondsUntilUtcMidnight } from "./limits";
-import { ANYONE_CALLABLE_METHODS, MANAGEMENT_CONTENT_TYPE, MEMBER_CALLABLE_METHODS, NOT_A_MEMBER_REASON } from "./nip86";
+import {
+  HTTP_RATE_LIMIT_PERIOD_SECONDS,
+  photoMaxBytes,
+  photoStorageBytes,
+  secondsUntilUtcMidnight,
+} from "./limits";
+import { extensionFor, sha256Hex, sniffPhotoType, verifyBlossomAuth } from "./photos";
+import {
+  ADMIN_CALLABLE_METHODS,
+  ANYONE_CALLABLE_METHODS,
+  MANAGEMENT_CONTENT_TYPE,
+  MEMBER_CALLABLE_METHODS,
+  NOT_A_MEMBER_REASON,
+  adminOnlyReason,
+} from "./nip86";
 import { nip11Response } from "./nip11";
 import { verifyClaimAuthEvent } from "./nip42";
 import { ownerReason, verifyNip98 } from "./nip98";
@@ -267,21 +280,27 @@ async function handleManagement(request: Request, env: Env): Promise<Response> {
   // The first DO round trip of the request.
   const denial = anyoneCallable ? null : ownerReason(auth.pubkey, await relayStub(env).getOwner());
   if (denial !== null) {
-    // A non-owner passes only if the method is member-callable AND the
-    // signer is a member, checked in that order: the first is free, the
-    // second is another round trip, so a stranger signing `banpubkey`
-    // costs no extra. relay.ts isMember: a member of the relay, or of the
-    // group `_`.
+    // A non-owner passes only if the method is admin- or member-callable
+    // AND the signer has that role, checked in that order: the first is
+    // free, the second is another round trip, so a stranger signing
+    // `banpubkey` costs no extra. relay.ts getRole: owner, admin, member
+    // (of the relay, or of the group `_`) or none.
     //
     // An unclaimed relay has no members, so this refuses there whatever
     // the method.
+    const adminCallable = method !== null && ADMIN_CALLABLE_METHODS.includes(method);
     const memberCallable = method !== null && MEMBER_CALLABLE_METHODS.includes(method);
-    if (!memberCallable) return managementResponse({ error: denial }, 401);
-    // Its own reason, not the owner refusal: this is how an app learns its
-    // user has lost their home here (a removed member's subscribepush or
-    // unsubscribepush), and "not signed by the owner" would not tell it.
-    if (!(await relayStub(env).isMember(auth.pubkey))) {
-      return managementResponse({ error: NOT_A_MEMBER_REASON }, 401);
+    if (!adminCallable && !memberCallable) return managementResponse({ error: denial }, 401);
+    const role = await relayStub(env).getRole(auth.pubkey);
+    const allowed = adminCallable ? role === "admin" : role === "admin" || role === "member";
+    if (!allowed) {
+      // A member's own methods refuse a non-member with their own reason:
+      // this is how an app learns its user has lost their home here (a
+      // removed member's subscribepush or unsubscribepush), and "not
+      // signed by the owner" would not tell it. An admin's methods say
+      // which role they need.
+      const reason = memberCallable ? NOT_A_MEMBER_REASON : adminOnlyReason(method!);
+      return managementResponse({ error: reason }, 401);
     }
   }
 
@@ -314,10 +333,16 @@ async function handleManagement(request: Request, env: Env): Promise<Response> {
 // subscription) would fail in the browser.
 const CORS_HEADERS: Record<string, string> = {
   "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "POST, OPTIONS",
+  // GET, HEAD, PUT and DELETE for the photo server (src/photos.ts), whose
+  // Blossom clients run in browsers on other origins like every NIP-86
+  // client does, and whose auth is a signed header in the same way.
+  "Access-Control-Allow-Methods": "GET, HEAD, PUT, DELETE, POST, OPTIONS",
   // The two headers a NIP-86 call sets; both are non-simple
   // (application/nostr+json+rpc is not a CORS-safelisted media type).
-  "Access-Control-Allow-Headers": "Authorization, Content-Type",
+  // The X- ones are Blossom's upload headers (BUD-06).
+  "Access-Control-Allow-Headers": "Authorization, Content-Type, X-SHA-256, X-Content-Type, X-Content-Length",
+  // Blossom puts the reason for a refusal here (BUD-01).
+  "Access-Control-Expose-Headers": "X-Reason",
   // A day, so repeated calls preflight once rather than doubling every
   // request against the per-IP allowance.
   "Access-Control-Max-Age": "86400",
@@ -332,6 +357,99 @@ const CORS_HEADERS: Record<string, string> = {
 // would halve a preflighting client's per-IP allowance.
 function preflightResponse(): Response {
   return new Response(null, { status: 204, headers: CORS_HEADERS });
+}
+
+// ---------------------------------------------------------------------
+// Profile photos (src/photos.ts): Blossom's GET/HEAD /<sha256>, PUT
+// /upload and DELETE /<sha256>. Null when the request is none of those,
+// so route() carries on. Everything that can be checked without the
+// Durable Object (rate, size, signature, type) is checked here first, so
+// a refused upload costs no DO time.
+// ---------------------------------------------------------------------
+
+const PHOTO_PATH = /^\/([0-9a-f]{64})(?:\.(?:jpg|jpeg|png|webp))?$/;
+
+function photoError(status: number, reason: string): Response {
+  return new Response(reason, {
+    status,
+    headers: { "Content-Type": "text/plain; charset=utf-8", "X-Reason": reason, ...CORS_HEADERS },
+  });
+}
+
+async function routePhotos(request: Request, env: Env, url: URL): Promise<Response | null> {
+  const blob = PHOTO_PATH.exec(url.pathname);
+  const isUpload = url.pathname === "/upload";
+  if (blob === null && !isUpload) return null;
+  if (photoStorageBytes(env) === null) return photoError(404, "this relay stores no photos");
+
+  if (blob !== null && (request.method === "GET" || request.method === "HEAD")) {
+    const limited = await rateLimited(env.RATE_LIMIT_PHOTOS, request);
+    if (limited !== null) return limited;
+    const photo = await relayStub(env).getPhoto(blob[1]!);
+    if (photo === null) return photoError(404, "no photo with that hash is stored here");
+    return new Response(request.method === "HEAD" ? null : photo.data, {
+      headers: {
+        "Content-Type": photo.type,
+        "Content-Length": String(photo.data.byteLength),
+        // Content-addressed: the bytes behind a hash never change.
+        "Cache-Control": "public, max-age=31536000, immutable",
+        ...CORS_HEADERS,
+      },
+    });
+  }
+
+  if (blob !== null && request.method === "DELETE") {
+    const limited = await rateLimited(env.RATE_LIMIT_API, request);
+    if (limited !== null) return limited;
+    const sha256 = blob[1]!;
+    const auth = verifyBlossomAuth(request.headers.get("Authorization"), "delete", sha256, nowSec());
+    if (!auth.ok) return photoError(401, auth.reason);
+    if (!(await relayStub(env).deletePhoto(auth.pubkey, sha256))) {
+      return photoError(404, "you have no photo with that hash here");
+    }
+    return new Response(null, { status: 204, headers: CORS_HEADERS });
+  }
+
+  if (isUpload && request.method === "PUT") {
+    const limited = await rateLimited(env.RATE_LIMIT_API, request);
+    if (limited !== null) return limited;
+    const max = photoMaxBytes(env);
+    const declared = Number(request.headers.get("Content-Length") ?? NaN);
+    if (Number.isFinite(declared) && declared > max) {
+      return photoError(413, `a photo here can be at most ${max} bytes`);
+    }
+    const bytes = new Uint8Array(await request.arrayBuffer());
+    if (bytes.byteLength > max) return photoError(413, `a photo here can be at most ${max} bytes`);
+    if (bytes.byteLength === 0) return photoError(400, "the upload is empty");
+    const sha256 = await sha256Hex(bytes);
+    const auth = verifyBlossomAuth(request.headers.get("Authorization"), "upload", sha256, nowSec());
+    if (!auth.ok) return photoError(401, auth.reason);
+    const type = sniffPhotoType(bytes);
+    if (type === null) return photoError(415, "only JPEG, PNG and WebP photos are stored here");
+    const claimed = request.headers.get("Content-Type")?.split(";")[0]?.trim().toLowerCase();
+    if (claimed && claimed !== "application/octet-stream" && claimed !== type) {
+      return photoError(415, `the bytes are ${type}, not ${claimed}`);
+    }
+    const stored = await relayStub(env).uploadPhoto(auth.pubkey, sha256, type, bytes);
+    if (stored.status !== 200) return photoError(stored.status, stored.reason);
+    // BUD-02 blob descriptor.
+    return new Response(
+      JSON.stringify({
+        url: `${url.origin}/${sha256}.${extensionFor(type)}`,
+        sha256,
+        size: bytes.byteLength,
+        type,
+        uploaded: stored.uploadedAt,
+      }),
+      { headers: { "Content-Type": "application/json", ...CORS_HEADERS } },
+    );
+  }
+
+  return photoError(405, "photos are fetched with GET, uploaded with PUT /upload and deleted with DELETE");
+}
+
+function nowSec(): number {
+  return Math.floor(Date.now() / 1000);
 }
 
 function managementResponse(body: unknown, status = 200): Response {
@@ -418,8 +536,13 @@ async function route(request: Request, env: Env): Promise<Response> {
     // Rate limited: serving this is a DO round trip (getIdentity).
     const limited = await rateLimited(env.RATE_LIMIT_API, request);
     if (limited !== null) return limited;
-    const { profile, settings, ownerPubkey, relayPubkey, memberCount } = await relayStub(env).getIdentity(url.host);
-    return nip11Response(env, settings, profile, ownerPubkey, relayPubkey, memberCount);
+    const { profile, settings, ownerPubkey, relayPubkey, memberCount, photoBytes } = await relayStub(env).getIdentity(
+      url.host,
+    );
+    return nip11Response(env, settings, profile, ownerPubkey, relayPubkey, memberCount, {
+      url: `${url.origin}/`,
+      usedBytes: photoBytes,
+    });
   }
 
   if (request.headers.get("Upgrade")?.toLowerCase() === "websocket") {
@@ -430,6 +553,9 @@ async function route(request: Request, env: Env): Promise<Response> {
     if (limited !== null) return limited;
     return relayStub(env).fetch(request);
   }
+
+  const photos = await routePhotos(request, env, url);
+  if (photos !== null) return photos;
 
   if (url.pathname === "/api/claim") return handleClaim(request, env);
   if (url.pathname === "/api/claim-nonce") return handleClaimNonce(request, env);

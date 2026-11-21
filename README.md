@@ -118,6 +118,8 @@ The deploy button only asks for a project name. Everything else is an optional v
 | `MAX_EVENTS_PER_PUBKEY_PER_MINUTE` | How fast any one non-owner pubkey may publish. Defaults to `20`/minute — far above human posting rates, slow enough that a runaway follow takes hours rather than minutes to spend the daily write budget. You are never throttled. Raise it to a number, or set it to `off`. |
 | `NON_OWNER_STORAGE_BYTES` | Point at which writes from anyone but you are refused, reserving what's left of the 5GB free-tier ceiling for your own archive. Defaults to `2684354560` (half). Raise it to a number, or set it to `off`. |
 | `WRITE_POLICY` | Who can publish here: `owner`, `inbox`, `follows`, `mentions` or `all` (see "Who can write here" below). Set here it outranks the value set through the management API. Unset, the management API's value applies, then the default, `follows`. |
+| `PHOTO_STORAGE_BYTES` | How much all profile photos together may take, in bytes. Defaults to `262144000` (250 MB). Set it to `off` to store no photos at all. |
+| `PHOTO_MAX_BYTES` | The largest one photo may be, in bytes. Defaults to `102400` (100 KB), and can be raised to at most `1048576` (1 MB). |
 | `UPDATE_CHECK` | On by default: the relay asks this repo what the current release is (one request, cached for six hours, made by the Worker rather than by your browser) so the admin page can say when a newer one exists. Set it to `off` and the relay never makes that request; the footer then simply shows no notice. |
 
 `ALLOW_FOLLOWS` is no longer read. If you had set it to `false`, set `WRITE_POLICY=owner` instead.
@@ -138,15 +140,27 @@ Reading them back is restricted to the person they are addressed to: you, or a m
 
 You can give other people a home here: an inbox for their encrypted mail, and a notification on their phone when some arrives. They need no account, only a key, which any Nostr app (or the friend app) makes for them.
 
-To add someone, make an invite and send them the code:
+To add someone, make an invite and send them the code. These are bothy's own methods, which `nak admin` does not know, so call them with the `bothy_rpc` function under "Who can write here" below:
 
 ```bash
-nak admin createinvite --sec <your nsec> your-relay.workers.dev
+bothy_rpc https://your-relay.workers.dev/ createinvite
 ```
 
 The answer is the code, how many times it can be used and when it stops working. A code works once and for 7 days unless you ask for more: `createinvite` takes the number of uses (up to 100) and then the lifetime in seconds (up to 30 days). Their app redeems it by calling `redeeminvite` with the code, signed with their own key; that is the one management call anyone can make. `listunusedinvites` shows the codes still waiting, and `revokeinvite` kills one.
 
 Your members are the pubkeys on your allow list, so `listallowedpubkeys` lists them and `unallowpubkey` removes one. `listmembers` shows more: who let each one in, when, and how, plus the people you removed whose mail is still waiting to be deleted, with the date it goes. Who let someone in is whoever made the code they used, or whose link their join request came through, or you; every member has one, so an app can draw the whole tree from it. A member can also publish here, as anyone you `allowpubkey` can.
+
+### Admins
+
+An admin is a key that helps you run your members: it can make and revoke invites, answer join requests, see the member list, and add or remove members. It cannot touch anything else: the write policy, bans, blocks, the relay's name, description and icon, or other admins. It is made for a second key of your own, such as the one your messaging app uses, so that key can run your home without being your relay's owner key.
+
+```bash
+bothy_rpc https://your-relay.workers.dev/ addadmin '["<their npub>"]'
+```
+
+`removeadmin` takes the role away and leaves them a member; `listadmins` lists them. An admin is always a member, with an inbox and notifications, and gets its own message about each join request. An admin cannot remove another admin; only you can. Who an admin lets in is listed as invited by that admin.
+
+Any key can call `myrole` to learn what it is here: `owner`, `admin`, `member` or `none`. The list of admins is not published in the relay information document, because it would tie your second key to your relay for anyone to read.
 
 ### Join requests
 
@@ -165,6 +179,12 @@ npx wrangler secret put VAPID_PRIVATE_KEY
 ```
 
 Without it everything above still works, with no notifications. A notification says only that there is a new message: not who sent it, not what it says, and not which conversation it belongs to. It passes through Apple's or Google's push service, and none of that is theirs to see. The relay could not add it anyway, because the mail is sealed.
+
+### Profile photos
+
+Members, and you, can keep a profile photo here, so the people in your home load each other's faces from it. It is a [Blossom](https://github.com/hzrd149/blossom) server for that one thing: JPEG, PNG or WebP, up to 100 KB, one photo each (a new one replaces the old), a few uploads a day. Anyone can fetch a stored photo by its hash; nothing lists them. A removed member's photo goes with their mail, after 14 days.
+
+Photos are kept in the relay's own storage, beside your events, so they need no setup and no extra Cloudflare product. All of them together are capped at 250 MB; at the cap new uploads are refused and nothing else is affected. The admin page shows how much is used. The apps also put each photo on a public Blossom server, so nothing breaks if this one is full.
 
 ## Who can write here
 
@@ -218,9 +238,9 @@ The tool to send them with is [`nak`](https://github.com/fiatjaf/nak), whose `ad
 nak admin supportedmethods --sec <your nsec> your-relay.workers.dev
 ```
 
-Start there. `supportedmethods` returns exactly what this relay implements, which is the honest answer to what you can do with it, and `nak admin --help` lists the flags each method takes. Every request is authenticated with a [NIP-98](https://github.com/nostr-protocol/nips/blob/master/98.md) event signed by the relay owner's key, the same key you claimed the relay with. Nothing else is accepted, and an unsigned or wrongly signed request gets a 401. The exceptions are a member's own notification settings (`subscribepush` and `unsubscribepush`, signed by the member) and `redeeminvite` and `requestjoin` (signed by whoever is joining).
+Start there. `supportedmethods` returns exactly what this relay implements, which is the honest answer to what you can do with it, and `nak admin --help` lists the flags each method takes. Every request is authenticated with a [NIP-98](https://github.com/nostr-protocol/nips/blob/master/98.md) event signed by the relay owner's key, the same key you claimed the relay with. Nothing else is accepted, and an unsigned or wrongly signed request gets a 401. The exceptions are a member's own notification settings (`subscribepush` and `unsubscribepush`, signed by the member) `redeeminvite` and `requestjoin` (signed by whoever is joining), `myrole` (any key), and the member methods an admin may call (see "Admins" above).
 
-What this relay implements: `banevent` and `allowevent` and `listbannedevents`; `banpubkey`, `unbanpubkey` and `listbannedpubkeys`; `allowpubkey`, `unallowpubkey` and `listallowedpubkeys`; `blockip` and `unblockip` and `listblockedips`; `changerelayname`, `changerelaydescription` and `changerelayicon`; and, bothy's own, `changewritepolicy` and `getwritepolicy` (see "Who can write here" above), `createinvite`, `redeeminvite`, `listunusedinvites`, `revokeinvite`, `requestjoin`, `listjoinrequests`, `approvejoin`, `declinejoin` and `listmembers` (see "Members" above), and `subscribepush` and `unsubscribepush`. What it does not: the kind allowlist, because bothy stores every kind on purpose; and the moderation queue, because bothy has nothing to report events into.
+What this relay implements: `banevent` and `allowevent` and `listbannedevents`; `banpubkey`, `unbanpubkey` and `listbannedpubkeys`; `allowpubkey`, `unallowpubkey` and `listallowedpubkeys`; `blockip` and `unblockip` and `listblockedips`; `changerelayname`, `changerelaydescription` and `changerelayicon`; and, bothy's own, `changewritepolicy` and `getwritepolicy` (see "Who can write here" above), `createinvite`, `redeeminvite`, `listunusedinvites`, `revokeinvite`, `requestjoin`, `listjoinrequests`, `approvejoin`, `declinejoin`, `listmembers`, `addadmin`, `removeadmin`, `listadmins` and `myrole` (see "Members" above), and `subscribepush` and `unsubscribepush`. What it does not: the kind allowlist, because bothy stores every kind on purpose; and the moderation queue, because bothy has nothing to report events into.
 
 The endpoint answers cross-origin requests, so a client hosted somewhere other than the relay can call it from a browser.
 
@@ -253,7 +273,7 @@ The effective name also appears on the admin page, since NIP-86 has no `getrelay
 
 ## HTTP endpoints
 
-- `GET /api/stats` — relay stats for the admin page. Returns `{ version, claimed, ownerPubkey, relayPubkey, totalEvents, events24h, ingested24h, rowsWrittenToday, storageBytes, storageBytesLimit, dailyRowsWrittenLimit, dailyRowsReadLimit, backfill, icon, relayName, writePolicy, writePolicySource, groupPolicy, chatPolicy, followCount, countAudit, followsListAt, vanishing, ownerListsThisRelay, reads, writes, reqCache, connections, latestVersion, updateAvailable }`. `relayPubkey` is the relay's own signing key (the NIP-11 `self` field), not yours. `ownerListsThisRelay` says whether your own relay list (kind 10002) already names this relay; the admin page hides the `wss://` copy box once it does. `latestVersion` and `updateAvailable` are the update check described in "Keeping it updated" (`null` and `false` when it is off or failed). `reads`, `writes`, `reqCache` and `connections` are diagnostics held in memory, which start again from zero whenever Cloudflare evicts the relay. `writePolicy` is the write policy in force by name and `writePolicySource` is where it was set (`env`, `stored` or `default`); `groupPolicy` is `on` or `paused`. `events24h` counts events by their own timestamp, which is what you posted; `ingested24h` counts what this relay actually took in, backfill included. During a backfill those differ by orders of magnitude. `vanishing` is a count, a progress total and an age — never the pubkeys that asked, since this endpoint is public and naming them would publish exactly the list a vanish request exists to remove someone from.
+- `GET /api/stats`: relay stats for the admin page. Returns `{ version, claimed, ownerPubkey, relayPubkey, totalEvents, events24h, ingested24h, rowsWrittenToday, storageBytes, storageBytesLimit, dailyRowsWrittenLimit, dailyRowsReadLimit, backfill, icon, relayName, writePolicy, writePolicySource, groupPolicy, chatPolicy, followCount, memberCount, pushPolicy, photoBytes, photoStorageLimit, countAudit, followsListAt, vanishing, ownerListsThisRelay, reads, writes, reqCache, connections, latestVersion, updateAvailable }`. `relayPubkey` is the relay's own signing key (the NIP-11 `self` field), not yours. `ownerListsThisRelay` says whether your own relay list (kind 10002) already names this relay; the admin page hides the `wss://` copy box once it does. `latestVersion` and `updateAvailable` are the update check described in "Keeping it updated" (`null` and `false` when it is off or failed). `reads`, `writes`, `reqCache` and `connections` are diagnostics held in memory, which start again from zero whenever Cloudflare evicts the relay. `writePolicy` is the write policy in force by name and `writePolicySource` is where it was set (`env`, `stored` or `default`); `groupPolicy` is `on` or `paused`. `memberCount` is how many members you have, `pushPolicy` is `on` or `off` (whether `VAPID_PRIVATE_KEY` is set), and `photoBytes` is what profile photos take against `photoStorageLimit` (`null` when photos are off). `events24h` counts events by their own timestamp, which is what you posted; `ingested24h` counts what this relay actually took in, backfill included. During a backfill those differ by orders of magnitude. `vanishing` is a count, a progress total and an age, never the pubkeys that asked, since this endpoint is public and naming them would publish exactly the list a vanish request exists to remove someone from.
   Every other figure here is a maintained counter, exact and current as of the request — nothing on this document is cached or dated except `latestVersion`, which is cached for six hours. `events24h` and `ingested24h` are windowed in whole hours, so each spans 24–25 hours rather than exactly 24; `rowsWrittenToday` is exact, since a UTC day starts on a whole hour.
   `rowsWrittenToday` counts every row the relay wrote today: event rows and their index entries, tag rows, tombstones, counter updates, the follow-list rebuild, management calls and backfill bookkeeping. It is measured, and it reads slightly high because a removal is charged a pessimistic figure.
 - `POST /api/claim` — TOFU claim; body `{ pubkey }` (npub or hex), plus `nonce` when the claim comes from the QR (a code from `/api/claim-nonce`; `410` if it has expired or was already used). See "Ownership and lifecycle" above.
@@ -263,9 +283,10 @@ The effective name also appears on the admin page, since NIP-86 has no `getrelay
 - `GET /api/profile?pubkey=<hex>` — the claim form's courtesy profile preview: it looks your kind-0 up on a couple of well-known relays so you can see the name and avatar attached to a pubkey before binding the relay to it permanently. **This is a setup endpoint and it is only reachable during setup** — once the relay is claimed it returns 404, because it exists to guard one irreversible step and there is no reason to leave a path that opens outbound connections to third-party relays permanently open to anybody. Results are cached for five minutes.
 - `GET /live` — unauthenticated, push-only WebSocket for the admin page's live feed (max 5 connections, 10-minute lifetime); sends `{ kind, created_at, id }` per stored event, with `id` cut to its first 8 characters, never gift wraps.
 - Any path, with header `Accept: application/nostr+json` — the [NIP-11](https://github.com/nostr-protocol/nips/blob/master/11.md) relay information document. It reports the relay's name, description and icon, along with `pubkey` (yours, once the relay is claimed), and `contact` (the `website` from your kind-0 profile, if you have one). Both are omitted rather than left empty when there is nothing to report.
+- `GET /<sha256>` (optionally with `.jpg`, `.png` or `.webp`), `PUT /upload` and `DELETE /<sha256>`: the profile photo server, a [Blossom](https://github.com/hzrd149/blossom) server for members' photos only (see "Profile photos" above). Fetching is public; uploading and deleting need a Blossom authorization event (kind 24242) naming the photo's hash.
 - `POST /`, with header `Content-Type: application/nostr+json+rpc` — the [NIP-86](https://github.com/nostr-protocol/nips/blob/master/86.md) management API, authenticated with a [NIP-98](https://github.com/nostr-protocol/nips/blob/master/98.md) event signed by the owner. See "Relay management API" above.
 
-Every endpoint above that reaches the relay's storage is rate limited per IP: 60 requests a minute shared across all of them and the WebSocket connection itself, and 10 a minute for `/api/profile`, which is tighter because it is the one that reaches out to other people's relays. Over the limit you get a `429` with a `Retry-After`. The admin page itself is a static file and is never rate limited — if the relay is refusing you, the page that says so still loads. Raising these means editing the `ratelimits` block in `wrangler.jsonc` and redeploying; there is no environment variable for them, because unlike the write-path caps they cost nothing to leave in place.
+Every endpoint above that reaches the relay's storage is rate limited per IP: 60 requests a minute shared across all of them and the WebSocket connection itself, and 10 a minute for `/api/profile`, which is tighter because it is the one that reaches out to other people's relays. Fetching profile photos has its own 300 a minute, because an app showing a list of friends loads many at once. Over the limit you get a `429` with a `Retry-After`. The admin page itself is a static file and is never rate limited: if the relay is refusing you, the page that says so still loads. Raising these means editing the `ratelimits` block in `wrangler.jsonc` and redeploying; there is no environment variable for them, because unlike the write-path caps they cost nothing to leave in place.
 
 ## Choices, not requirements
 
