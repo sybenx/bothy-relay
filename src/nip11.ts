@@ -12,6 +12,7 @@ import {
 } from "./limits";
 import { PHOTO_TYPES } from "./photos";
 import { pushPublicKey } from "./push";
+import { serviceAccount } from "./fcm";
 import type { RelaySettings } from "./storage";
 import { resolveWritePolicy } from "./write-policy";
 import { version } from "../package.json";
@@ -163,6 +164,14 @@ export function buildRelayInfo(
   if (pushKey) {
     info.push_key = pushKey;
   }
+  // Android push (src/fcm.ts), bothy's own field: present only when the
+  // relay can send it, carrying the Firebase project it sends from. An app
+  // registers (nip86.ts subscribefcm) only if that is its own project; a
+  // token from another project would be refused by Google.
+  const fcm = serviceAccount(env);
+  if (fcm) {
+    info.fcm = { project_id: fcm.projectId };
+  }
   // How many people this relay keeps an inbox for besides the owner
   // (storage.ts memberCount). bothy's own field. A client deciding whether
   // to offer this relay as a home reads it beside `push_key`. Omitted while
@@ -183,6 +192,12 @@ export function buildRelayInfo(
       used_bytes: photos.usedBytes,
       max_bytes: photoCap,
     };
+  }
+  // The home's file server (nip86.ts setstorage), bothy's own field and a
+  // separate one from `blossom`, which is this relay's own photo server:
+  // media and history backups go here. Omitted while unset or unclaimed.
+  if (ownerPubkey && stored.storageUrl) {
+    info.storage = { url: stored.storageUrl };
   }
   const contact = resolveContact(profile);
   if (contact) {

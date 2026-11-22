@@ -20,6 +20,12 @@ import {
   banPubkey,
   blockIp,
   approveJoinRequest,
+  getRelaySettings,
+  eraseMember,
+  mailTimes,
+  memberKeys,
+  deleteFcmToken,
+  upsertFcmToken,
   addAdmin,
   invitedSubtree,
   isAdmin,
@@ -32,7 +38,10 @@ import {
   inviteSlotsUsed,
   countOutstandingMemberInvites,
   declineJoinRequest,
-  giftWrapCount,
+  mailRoom,
+  mailLeftFor,
+  mailUsage,
+  wrapBytes,
   isMember,
   isPubkeyBanned,
   listJoinRequests,
@@ -63,6 +72,7 @@ import {
   INVITE_MAX_TTL_SECONDS,
   MAX_OUTSTANDING_INVITES,
   MAX_PUSH_SUBSCRIPTIONS_PER_PUBKEY,
+  MAX_FCM_TOKENS_PER_PUBKEY,
   MEMBER_INVITE_CODE_BYTES,
   MEMBER_INVITE_DEFAULT_USES,
   MEMBER_INVITE_MAX_USES,
@@ -70,7 +80,9 @@ import {
   JOIN_REQUEST_NOTE_MAX_LENGTH,
   JOIN_REQUEST_TTL_SECONDS,
   MAX_PENDING_JOIN_REQUESTS,
-  maxGiftWraps,
+  ERASE_MAIL_BATCH,
+  mailBytesPerMember,
+  mailStorageBytes,
   MEMBER_REMOVAL_GRACE_SECONDS,
   memberInviteLimits,
   HOME_STATS_DAYS,
@@ -80,6 +92,7 @@ import {
 import { sqlitePhotoStore } from "./photos";
 import { GROUPS_PAUSED_MESSAGE } from "./nip29";
 import { pushConfigured } from "./push";
+import { fcmConfigured } from "./fcm";
 import { joinRequestMessage, oneLine } from "./join-requests";
 import type { NostrEvent } from "./nostr";
 import { getOwnerPubkey } from "./ownership";
@@ -178,6 +191,19 @@ export const SUPPORTED_METHODS = [
   // (MEMBER_CALLABLE_METHODS below).
   "subscribepush",
   "unsubscribepush",
+  // bothy's own: the same for an Android app, with an FCM token (src/fcm.ts).
+  "subscribefcm",
+  "unsubscribefcm",
+  // bothy's own: the home's file server (owner sets it; its key reads the
+  // member list), and when this relay stored a member's mail.
+  "setstorage",
+  "getstorage",
+  "memberkeys",
+  "mailtimes",
+  // bothy's own: how full the signer's mailbox and the home's are.
+  "mymailbox",
+  // bothy's own: a member deleting their own account.
+  "eraseme",
 ] as const;
 
 // The methods a MEMBER may call, not just the owner.
@@ -196,8 +222,13 @@ export const SUPPORTED_METHODS = [
 // codes within their own allowance and sees and revokes only their own
 // (memberInviteStanding). Owner and admins pass the same gate unlimited.
 export const MEMBER_CALLABLE_METHODS: readonly string[] = [
+  "eraseme",
+  "mymailbox",
+  "mailtimes",
   "subscribepush",
   "unsubscribepush",
+  "subscribefcm",
+  "unsubscribefcm",
   "createinvite",
   "listunusedinvites",
   "revokeinvite",
@@ -214,6 +245,13 @@ export const MEMBER_CALLABLE_METHODS: readonly string[] = [
 //
 // myrole answers any signer with their own role, so an app can decide what
 // to show without trying a method and reading the 401.
+// The one method the storage service's key may call (setstorage), and the
+// only key that may call it: not the owner, not a member. index.ts checks
+// the signer against the stored pubkey before dispatch.
+export const STORAGE_CALLABLE_METHODS: readonly string[] = ["memberkeys"];
+
+export const STORAGE_ONLY_REASON = "memberkeys is only for this relay's storage service";
+
 export const ANYONE_CALLABLE_METHODS: readonly string[] = ["redeeminvite", "requestjoin", "myrole"];
 
 // The methods an ADMIN may call besides the member's own: running the
@@ -272,6 +310,9 @@ export const SELF_BLOCK_CONFIRMATION = "yes, block my own address";
 
 const HEX_ID_RE = /^[0-9a-f]{64}$/;
 
+// Ids one mailtimes call may ask about: a sync's worth.
+export const MAX_MAILTIMES_IDS = 500;
+
 // A member who is neither the owner nor an admin: the caller whose view
 // of invites is limited to their own.
 function isPlainMember(sql: SqlStorage, env: Env, signer: string): boolean {
@@ -281,6 +322,11 @@ function isPlainMember(sql: SqlStorage, env: Env, signer: string): boolean {
 // subscribepush's label: short, and from an alphabet with no room for an
 // npub (63 characters) or a sentence.
 const PUSH_LABEL_RE = /^[A-Za-z0-9_-]{1,16}$/;
+
+// An FCM registration token: Google's own format, base64url-ish with ":"
+// and usually about 160 characters. Bounded so the column cannot be used
+// as storage.
+const FCM_TOKEN_RE = /^[A-Za-z0-9_:.-]{20,4096}$/;
 
 // The label, null for none, undefined when the parameter is malformed.
 function parsePushLabel(value: unknown): string | null | undefined {
@@ -840,8 +886,15 @@ export function handleManagementCall(
           // admin. Each is its own wrap, sealed to that person.
           const outbox: NostrEvent[] = [];
           for (const recipient of [owner, ...listAdmins(sql).map((a) => a.pubkey)]) {
-            if (giftWrapCount(sql) >= maxGiftWraps(env)) break;
             const { wrap } = joinRequestMessage(sql, recipient, signer, details.name, details.note, nowSec);
+            const fits = mailRoom(
+              sql,
+              [recipient],
+              wrapBytes(wrap.content, JSON.stringify(wrap.tags)),
+              mailStorageBytes(env),
+              mailBytesPerMember(env),
+            );
+            if (fits !== "ok") continue;
             const stored = storeEvent(sql, wrap, nowSec);
             if (stored.stored) outbox.push(stored.stored);
           }
@@ -943,6 +996,134 @@ export function handleManagementCall(
         nowSec,
       );
       return { result: true };
+    }
+
+    // Android's subscribepush: an FCM registration token instead of a web
+    // push subscription, and the same optional label. Refused without a
+    // service account, as subscribepush is without a VAPID key.
+    case "subscribefcm": {
+      if (!fcmConfigured(env)) {
+        return err(
+          "subscribefcm: this relay has no FCM service account, so it cannot send Android notifications and " +
+            "will not keep a token it can never use",
+        );
+      }
+      const token = stringParam(params, 0);
+      if (token === null || !FCM_TOKEN_RE.test(token)) {
+        return err("subscribefcm takes the app's FCM registration token as a string");
+      }
+      const label = parsePushLabel(params[1]);
+      if (label === undefined) {
+        return err(
+          'subscribefcm: the second parameter is optional, {"label": "..."} with 1 to 16 letters, digits, "_" or "-"',
+        );
+      }
+      upsertFcmToken(sql, { token, pubkey: signer, label }, MAX_FCM_TOKENS_PER_PUBKEY, nowSec);
+      return { result: true };
+    }
+
+    // `true` whether or not a row went, and only the signer's, as
+    // unsubscribepush.
+    case "unsubscribefcm": {
+      const token = stringParam(params, 0);
+      if (token === null || token === "") return err("unsubscribefcm takes the FCM registration token as a string");
+      deleteFcmToken(sql, signer, token);
+      return { result: true };
+    }
+
+    // The home's file server: its URL (advertised as NIP-11 `storage`)
+    // and the pubkey its memberkeys calls are signed with. Owner only.
+    // An empty URL clears both.
+    case "setstorage": {
+      const url = stringParam(params, 0);
+      if (url === "") {
+        setRelaySetting(sql, "storage_url", "");
+        setRelaySetting(sql, "storage_pubkey", "");
+        return { result: true };
+      }
+      let valid = false;
+      try {
+        valid = url !== null && url.length <= 512 && new URL(url).protocol === "https:";
+      } catch {
+        valid = false;
+      }
+      if (!valid) {
+        return err('setstorage takes the storage server\'s https URL and its pubkey; "" as the URL clears both');
+      }
+      const pubkey = pubkeyParam(params, 1);
+      if (pubkey === null) return err("setstorage: the second parameter is the storage service's pubkey, as npub or hex");
+      setRelaySetting(sql, "storage_url", url!);
+      setRelaySetting(sql, "storage_pubkey", pubkey);
+      return { result: true };
+    }
+
+    // Owner only: what setstorage last stored, for the admin page's File
+    // server section. {url, pubkey}, or null when none is set.
+    case "getstorage": {
+      const settings = getRelaySettings(sql);
+      return {
+        result:
+          settings.storageUrl && settings.storagePubkey
+            ? { url: settings.storageUrl, pubkey: settings.storagePubkey }
+            : null,
+      };
+    }
+
+    // For the storage service alone (STORAGE_CALLABLE_METHODS): who may
+    // upload and who has left. Pubkeys only.
+    case "memberkeys":
+      return { result: memberKeys(sql, getOwnerPubkey(sql, env), MEMBER_REMOVAL_GRACE_SECONDS) };
+
+    // When this relay stored each of the signer's own gift wraps, for
+    // ordering ties. Up to 500 ids; ids that are not the signer's mail are
+    // left out of the answer.
+    case "mailtimes": {
+      const ids = params[0];
+      if (
+        !Array.isArray(ids) ||
+        ids.length === 0 ||
+        ids.length > MAX_MAILTIMES_IDS ||
+        !ids.every((id) => typeof id === "string" && HEX_ID_RE.test(id))
+      ) {
+        return err(`mailtimes takes an array of 1 to ${MAX_MAILTIMES_IDS} event ids, as 64-character hex`);
+      }
+      return { result: mailTimes(sql, signer, ids as string[]) };
+    }
+
+    // A member deleting their own account (storage.ts eraseMember): the
+    // membership ends, their devices are dropped, their mail and photo
+    // here are deleted at once, their place goes back to whoever invited
+    // them, and the people they invited stay, under that person. An admin
+    // stops being one. The owner cannot: the relay is theirs.
+    case "eraseme": {
+      const owner = getOwnerPubkey(sql, env);
+      if (signer === owner) {
+        return err("eraseme: the relay owner cannot erase themselves; the relay itself is your account here");
+      }
+      // A first batch now; any rest goes on the hourly sweep at once (no
+      // grace), since one call deleting a large mailbox could spend the
+      // day's rows written (limits.ts ERASE_MAIL_BATCH).
+      const deleted = eraseMember(sql, signer, owner, nowSec, ERASE_MAIL_BATCH);
+      const left = mailLeftFor(sql, signer, owner, ERASE_MAIL_BATCH);
+      return { result: { erased: true, messagesDeleted: deleted, messagesLeft: left } };
+    }
+
+    // The signer's own mailbox here, and the home's: how much is stored
+    // against each cap (limits.ts mailBytesPerMember, mailStorageBytes),
+    // so an app can say "your mailbox is 80% full" before a sender hears
+    // it is full. Limits are null when off.
+    case "mymailbox": {
+      const own = mailUsage(sql, signer);
+      const home = mailUsage(sql, null);
+      return {
+        result: {
+          messages: own.messages,
+          usedBytes: own.bytes,
+          limitBytes: mailBytesPerMember(env),
+          homeUsedBytes: home.bytes,
+          homeLimitBytes: mailStorageBytes(env),
+        },
+      };
     }
 
     case "unsubscribepush": {

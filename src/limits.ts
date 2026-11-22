@@ -555,10 +555,28 @@ export const UPSTREAM_VERSION_MAX_BYTES = 16 * 1024;
 // stall the whole cron invocation.
 export const BACKFILL_FETCH_TIMEOUT_MS = 8000;
 
-// Workers Free SQLite storage per Durable Object (5GB;
-// developers.cloudflare.com/durable-objects/platform/limits/, checked
-// 2026-08-25). Also served on /api/stats for the admin page's storage bar.
-export const STORAGE_BYTES_LIMIT = 5 * 1024 * 1024 * 1024;
+// How much this relay may store: its storage BUDGET, the base every share
+// below is a fraction of. Also served on /api/stats for the admin page's
+// storage bar.
+//
+// 1GB by default, the smallest reading of Cloudflare's limits page
+// (developers.cloudflare.com/durable-objects/platform/limits/, re-read
+// 2026-11-21). The page is inconsistent: its table gives 5GB of storage per
+// ACCOUNT on Workers Free and 10GB per Durable Object, and its FAQ says a
+// SQLite-backed Durable Object stops taking writes at 1GB on the Free plan.
+// The relay is one Durable Object, and the account's 5GB is shared with
+// every other Durable Object app on the account, which bothy cannot see.
+// So it assumes the least, and the owner raises it when they know better
+// (STORAGE_BUDGET_BYTES; a Workers Paid account can take 10GB). Until
+// 0.26.0 this was 5GB, five times the Free plan's per-object reading.
+//
+// Every check against it uses the database's real size
+// (`sql.databaseSize`), never an estimate.
+export const STORAGE_BYTES_LIMIT = 1024 * 1024 * 1024;
+
+export function storageBudget(env: Env): number {
+  return resolveLimit(env.STORAGE_BUDGET_BYTES, STORAGE_BYTES_LIMIT) ?? STORAGE_BYTES_LIMIT;
+}
 
 // Non-owner writes stop once the database passes this size, so at least
 // half the ceiling stays free for the owner's own archive (the same
@@ -574,41 +592,60 @@ export const STORAGE_BYTES_LIMIT = 5 * 1024 * 1024 * 1024;
 export const NON_OWNER_STORAGE_SHARE_LIMIT = STORAGE_BYTES_LIMIT / 2;
 
 export function nonOwnerStorageLimit(env: Env): number | null {
-  return resolveLimit(env.NON_OWNER_STORAGE_BYTES, NON_OWNER_STORAGE_SHARE_LIMIT);
+  return resolveLimit(env.NON_OWNER_STORAGE_BYTES, storageBudget(env) / 2);
 }
 
-// Storage the gift wrap inbox may occupy: 1/40 of the ceiling, ~128MB.
-// Kind 1059 is accepted from any author (under `inbox` and above), so it
-// gets its own bound on top of NON_OWNER_STORAGE_SHARE_LIMIT.
-const GIFT_WRAP_STORAGE_SHARE = STORAGE_BYTES_LIMIT / 40;
-
-// Gift wraps held at once. New ones are refused at the cap until the owner
-// deletes or vanishes old ones or storage.ts sweepExpiredGiftWraps removes
-// expired ones (which keeps this a count of mail rather than of hidden
-// rows). The smaller of two bounds:
+// ---------------------------------------------------------------------
+// The mailbox: stored gift wraps, bounded in BYTES as actually stored
+// (storage.ts `mail_usage`, maintained on every insert and delete), not by
+// a count priced at the worst-case event size. Until 0.26.0 this was 2,048
+// wraps for the whole home (128MB / 64KB), which group messages, one wrap
+// per member, would fill in days.
 //
-// - Storage: GIFT_WRAP_STORAGE_SHARE over the byte cap IN EFFECT
-//   (maxEventBytes(env)), so raising MAX_EVENT_BYTES lowers the count
-//   instead of multiplying the worst case. With the byte cap "off" it is
-//   priced at the compile-time default, and NON_OWNER_STORAGE_SHARE_LIMIT
-//   is the real backstop. 2,048 at the defaults.
-// - Reads: unauthenticated reads omit gift wraps (filters.ts
-//   excludeGiftWraps), and omitting a row still reads it, so an
-//   `authors`-pinned filter on a pubkey that authored only wraps skips
-//   every one (measured at 2,000 wraps: 41 rows without the exclusion,
-//   2,002 with it). The inbox size is therefore a per-filter read cost and
-//   must fit inside MAX_FILTER_ROWS_READ / ROWS_READ_PER_MATCH. Binds only
-//   if MAX_EVENT_BYTES is lowered below ~26KB.
-export function maxGiftWraps(env: Env): number {
-  const perEventBytes = maxEventBytes(env) ?? MAX_EVENT_BYTES;
-  return Math.max(
-    1,
-    Math.min(
-      Math.floor(MAX_FILTER_ROWS_READ / ROWS_READ_PER_MATCH),
-      Math.floor(GIFT_WRAP_STORAGE_SHARE / perEventBytes),
-    ),
-  );
+// Where the storage budget (storageBudget, 1GB by default) goes, as
+// fractions so it all scales when the owner raises it: half is the
+// owner's alone (nonOwnerStorageLimit); of the shared half, mail may take
+// 30% of the budget, profile photos 5% (photoStorageBytes), and follows'
+// and members' own events the rest. Payload bytes are counted here; SQLite
+// adds its tag rows and index entries on top (about a third more for a
+// small wrap), which the non-owner half absorbs.
+// ---------------------------------------------------------------------
+
+// All mail together, payload bytes: 30% of the budget (about 307MB at
+// 1GB). MAIL_STORAGE_BYTES overrides; "off" removes this cap and leaves
+// the non-owner share as the backstop.
+const MAIL_SHARE_OF_BUDGET = 0.3;
+export const MAIL_STORAGE_BYTES_DEFAULT = Math.floor(STORAGE_BYTES_LIMIT * MAIL_SHARE_OF_BUDGET);
+
+export function mailStorageBytes(env: Env): number | null {
+  return resolveLimit(env.MAIL_STORAGE_BYTES, Math.floor(storageBudget(env) * MAIL_SHARE_OF_BUDGET));
 }
+
+// One recipient's mail, the owner's included, so no one person (or a
+// stranger mailing them) can fill the home: a tenth of the mail total
+// (about 31MB at the default budget, some 10,000 wraps of a typical 3KB).
+// MAIL_BYTES_PER_MEMBER overrides; "off" removes it.
+const MAIL_SHARES = 10;
+export const MAIL_BYTES_PER_MEMBER_DEFAULT = Math.floor(MAIL_STORAGE_BYTES_DEFAULT / MAIL_SHARES);
+
+export function mailBytesPerMember(env: Env): number | null {
+  const total = Math.floor(storageBudget(env) * MAIL_SHARE_OF_BUDGET);
+  return resolveLimit(env.MAIL_BYTES_PER_MEMBER, Math.floor(total / MAIL_SHARES));
+}
+
+// Gift wraps one signing key may have stored here. NIP-59 signs every wrap
+// with a fresh key, so a real sender never comes near it; what it bounds
+// is reads. Unauthenticated reads omit gift wraps (filters.ts
+// excludeGiftWraps), and an `authors`-pinned filter on a key that signed
+// only wraps reads every one of them to skip it (2 rows each). That was
+// why the whole inbox used to be capped by MAX_FILTER_ROWS_READ; a cap per
+// key bounds the same read at 2 x 100 rows, whatever the inbox holds.
+export const MAX_WRAPS_PER_AUTHOR = 100;
+
+// Wraps eraseme deletes in its own call (storage.ts eraseMember); the rest
+// go on the hourly sweep. Deleting costs about 5 rows written a wrap, so a
+// large mailbox erased in one call could spend the day's 100,000.
+export const ERASE_MAIL_BATCH = 1000;
 
 // Workers Free daily rows-written ceiling (the same limits page as
 // DAILY_ROWS_READ_LIMIT). Every write-side share below is a fraction of
@@ -621,17 +658,14 @@ export const DAILY_ROWS_WRITTEN_LIMIT = 100_000;
 const TAGS_PER_GIFT_WRAP = 1;
 
 // Expired gift wraps one cron tick may remove (storage.ts
-// sweepExpiredGiftWraps). maxGiftWraps already bounds the largest possible
-// backlog (2,048 at the defaults, ~32,000 charged rows), so this is
-// insurance for many wraps expiring in the same hour: they drain across
-// ticks, and the remainder needs no checkpoint because the sweep takes the
-// oldest first. Five percent of the day per tick, as CHAT_SWEEP_BATCH_SIZE:
-// ~312 wraps.
+// sweepExpiredGiftWraps). Insurance for many wraps expiring in the same
+// hour: they drain across ticks, and the remainder needs no checkpoint
+// because the sweep takes the soonest expiry first. Five percent of the
+// day per tick, as CHAT_SWEEP_BATCH_SIZE: ~312 wraps.
 //
 // No daily share: every wrap removed was first written here at a higher
 // cost (12 rows to store, 5 to remove), so a day's sweeping cannot exceed
-// a day's gift wrap ingest, which MAX_GIFT_WRAPS_PER_IP_PER_WINDOW and
-// maxGiftWraps already bound.
+// a day's gift wrap ingest, which the daily rows-written ceiling bounds.
 const GIFT_WRAP_SWEEP_TICK_SHARE = DAILY_ROWS_WRITTEN_LIMIT / 20;
 export const GIFT_WRAP_SWEEP_BATCH_SIZE = Math.max(
   1,
@@ -720,13 +754,18 @@ export function photoMaxBytes(env: Env): number {
   return Math.min(Math.floor(raw), PHOTO_MAX_BYTES_CEILING);
 }
 
-// All photos together: 250MB, 5% of the storage ceiling. At the cap new
-// uploads are refused and nothing else changes. "off" turns photos off:
-// no uploads, nothing served, and no `blossom` on NIP-11.
-export const PHOTO_STORAGE_BYTES_DEFAULT = 250 * 1024 * 1024;
+// All photos together. At the cap new uploads are refused and nothing
+// else changes. "off" turns photos off: no uploads, nothing served, and
+// no `blossom` on NIP-11.
+//
+// 5% of the storage budget (about 51MB at the default 1GB: some 500
+// photos at the 100KB cap, ten times what a home of fifty needs). It was a
+// fixed 250MB, 5% of the 5GB the relay used to assume.
+const PHOTO_SHARE_OF_BUDGET = 0.05;
+export const PHOTO_STORAGE_BYTES_DEFAULT = Math.floor(STORAGE_BYTES_LIMIT * PHOTO_SHARE_OF_BUDGET);
 
 export function photoStorageBytes(env: Env): number | null {
-  return resolveLimit(env.PHOTO_STORAGE_BYTES, PHOTO_STORAGE_BYTES_DEFAULT);
+  return resolveLimit(env.PHOTO_STORAGE_BYTES, Math.floor(storageBudget(env) * PHOTO_SHARE_OF_BUDGET));
 }
 
 // Uploads one pubkey may make in a UTC day. Each replaces their one photo,
@@ -864,6 +903,10 @@ export const MAX_PUSH_ENDPOINTS_PER_NOTIFICATION = MAX_PUSHES_PER_TICK * PUSH_MA
 // new one refused, because browsers rotate endpoints on their own schedule
 // and dead rows would otherwise lock a member out of notifications.
 export const MAX_PUSH_SUBSCRIPTIONS_PER_PUBKEY = 4;
+
+// Android push tokens one pubkey may register (src/fcm.ts), separate from
+// the web push devices above: oldest evicted, as there.
+export const MAX_FCM_TOKENS_PER_PUBKEY = 4;
 
 // How long a push service may hold an undeliverable notification (RFC
 // 8030 TTL). A message stays true for the hour; "somebody is in the call"

@@ -116,11 +116,14 @@ The deploy button only asks for a project name. Everything else is an optional v
 | `RELAY_NAME` / `RELAY_DESCRIPTION` / `RELAY_ICON` | Set the NIP-11 name/description/icon. These outrank anything set through the management API, which in turn outranks your kind-0 profile — see "Relay management API" below for the full order. |
 | `MAX_EVENT_BYTES` | Largest event this relay will accept, JSON-serialized, for everyone including you. Defaults to `65536` (64KB) — generous for any real note, including long-form. Raise it to a number, or set it to `off` to remove the cap. |
 | `MAX_EVENTS_PER_PUBKEY_PER_MINUTE` | How fast any one non-owner pubkey may publish. Defaults to `20`/minute — far above human posting rates, slow enough that a runaway follow takes hours rather than minutes to spend the daily write budget. You are never throttled. Raise it to a number, or set it to `off`. |
-| `NON_OWNER_STORAGE_BYTES` | Point at which writes from anyone but you are refused, reserving what's left of the 5GB free-tier ceiling for your own archive. Defaults to `2684354560` (half). Raise it to a number, or set it to `off`. |
+| `STORAGE_BUDGET_BYTES` | How much the relay may store, in bytes: the base every share below is a part of. Defaults to `1073741824` (1 GB), the smallest reading of Cloudflare's free-plan limit for one Durable Object; the account's 5 GB is shared with anything else on it. Raise it on a paid plan, up to `10737418240` (10 GB). The admin page shows use against it. |
+| `NON_OWNER_STORAGE_BYTES` | Point at which writes from anyone but you are refused, reserving the rest of the storage budget for your own archive. Defaults to half of `STORAGE_BUDGET_BYTES`. Raise it to a number, or set it to `off`. |
 | `WRITE_POLICY` | Who can publish here: `owner`, `inbox`, `follows`, `mentions` or `all` (see "Who can write here" below). Set here it outranks the value set through the management API. Unset, the management API's value applies, then the default, `follows`. |
+| `MAIL_STORAGE_BYTES` | How much all stored mail may take, in bytes. Defaults to 30% of `STORAGE_BUDGET_BYTES` (about 300 MB). Set it to `off` to remove this cap; the share reserved for you (`NON_OWNER_STORAGE_BYTES`) still applies. |
+| `MAIL_BYTES_PER_MEMBER` | How much mail any one person may have stored here, you included, in bytes. Defaults to a tenth of the mail total (about 30 MB). Set it to `off` to remove it. |
 | `INVITES_PER_MEMBER` | How many people each member may invite. Defaults to `5`. Set it to `off` so only you and your admins make invites. You and your admins are never limited. |
 | `INVITE_DEPTH` | How many steps from you invites reach: your own invitees are one step away, and a member this many steps away cannot invite. Defaults to `3`. `off` also keeps invites to you and your admins. |
-| `PHOTO_STORAGE_BYTES` | How much all profile photos together may take, in bytes. Defaults to `262144000` (250 MB). Set it to `off` to store no photos at all. |
+| `PHOTO_STORAGE_BYTES` | How much all profile photos together may take, in bytes. Defaults to 5% of `STORAGE_BUDGET_BYTES` (about 50 MB). Set it to `off` to store no photos at all. |
 | `PHOTO_MAX_BYTES` | The largest one photo may be, in bytes. Defaults to `102400` (100 KB), and can be raised to at most `1048576` (1 MB). |
 | `UPDATE_CHECK` | On by default: the relay asks this repo what the current release is (one request, cached for six hours, made by the Worker rather than by your browser) so the admin page can say when a newer one exists. Set it to `off` and the relay never makes that request; the footer then simply shows no notice. |
 
@@ -135,6 +138,8 @@ This relay's read path is intentionally public, so it is worth adding a free Clo
 This relay also accepts encrypted mail addressed to you or one of your members (see "Members" below), from anyone ([NIP-59](https://github.com/nostr-protocol/nips/blob/master/59.md) gift wraps, kind 1059), under every write policy except `owner` (see "Who can write here" below for that policy). It's the write path a client needs if you publish a `kind:10050` DM relay list naming this relay; bothy itself never publishes that list for you, so nothing changes unless you deliberately turn your relay into a DM inbox by signing one.
 
 Reading them back is restricted to the person they are addressed to: you, or a member asking for their own with `"#p"` set to their pubkey. A query that names kind 1059 gets a [NIP-42](https://github.com/nostr-protocol/nips/blob/master/42.md) AUTH challenge instead of results; a query that doesn't name a kind is answered normally, with the gift wraps simply absent from what comes back. The second half matters as much as the first: refusing a query only when it would have matched a gift wrap makes the refusal itself the answer, and a stranger sliding a time window across your relay could count and time-correlate your incoming DMs from the refusals alone, without ever mentioning kind 1059. Leaving them out answers the same way whether your inbox is full or empty. You can delete a gift wrap the same way you'd delete any note ([NIP-09](https://github.com/nostr-protocol/nips/blob/master/09.md)), and [NIP-62](https://github.com/nostr-protocol/nips/blob/master/62.md) "Request to Vanish" support means either you or a message's sender can ask for it to be permanently purged.
+
+How much mail the relay keeps is measured in bytes. All mail together may take 30% of the relay's storage budget, about 300 MB, and mail for any one person, you included, a tenth of that, about 30 MB: some 10,000 messages of a typical 3 KB each, counting the copy of each message a sender keeps for themselves. When a person's share is full, mail for them is refused with `blocked: the recipient's mailbox on this home is full`; when the whole home is, with `blocked: this home's mailbox is full`. Their apps can show that as it is, and the sender's message still reaches any other relay in the recipient's inbox list. Members can see how full their own mailbox is with `mymailbox`. The other limit is Cloudflare's: each stored message costs about 14 of the 100,000 rows the free tier lets the relay write a day, so a home takes in about 7,000 messages a day before writes stop until midnight UTC.
 
 **Worth knowing:** Cloudflare terminates the TLS connection in front of this relay, so it necessarily sees the `p` tag (who a gift wrap is addressed to), the arrival time, and the sender's IP address, the same as any other Worker traffic. On a personal relay the `p` tag is you or a member, so that part says only who has mail; the sender IPs, though, belong to other people sending you mail through infrastructure that you chose.
 
@@ -168,6 +173,18 @@ bothy_rpc https://your-relay.workers.dev/ addadmin '["<their npub>"]'
 
 Any key can call `myrole` to learn what it is here: `owner`, `admin`, `member` or `none`. The list of admins is not published in the relay information document, because it would tie your second key to your relay for anyone to read.
 
+### A file server for your home
+
+If your home has a separate file server for media and history backups (a Blossom server such as Keykin Storage), tell the relay about it, with its address and the key it signs with:
+
+```bash
+bothy_rpc https://your-relay.workers.dev/ setstorage '["https://storage.example/", "<the server'"'"'s npub>"]'
+```
+
+Apps then find it in the relay information document as `storage`, beside `blossom`, which stays this relay's own profile photo server. The file server keeps itself in step with your members by calling `memberkeys`, which only its key can call: it answers who may upload (you and your members) and who has left and when, and nothing else, so someone who joins can upload at once and someone removed cannot. `setstorage` with an empty address forgets it, and `getstorage` shows what is set. With a browser signer you can do the same on the admin page, under **File server**: it shows the key you are about to register, so you can check it against the one your file server shows before you sign.
+
+Members' apps can also ask `mailtimes` when this relay stored each of their messages, which they use to order messages that carry the same time.
+
 ### How your home is used
 
 `homestats` answers, for you and your admins, how much your home is being used, in counts only: members seen today, this week and this month, encrypted messages that arrived each day for two weeks, how many people joined each week for eight weeks and how many of them by invite, how many members get notifications, and what profile photos take. It never says who: not who was seen, not who messaged whom. The admin page shows the same, after you sign a request with your browser signer; without one, use the `bothy_rpc` function below or an app.
@@ -182,6 +199,8 @@ An app can tell a message came from its own home relay: the message is signed by
 
 When you remove someone who invited others, you choose what happens to those people. By default they stay members and are listed as invited by you. To remove them too, and everyone they in turn invited, pass `{"invitees": "remove"}` after the pubkey. The answer says what happened to them.
 
+A member can also delete their own account, from their app (`eraseme`). Nothing waits 14 days then: their mail here and their profile photo are deleted at once (a very large mailbox finishes on the next hourly sweep, to stay inside the day's write allowance), their phones stop being notified, and they are no longer a member. The place they took goes back to whoever invited them, the people they invited stay and are listed as invited by that person, and any invites of theirs still waiting stop working. Messages they already sent stay with the people who received them. You cannot erase yourself this way: the relay is your account here.
+
 A removed member's new mail is refused from that moment, and their phones stop being notified. What is already stored for them stays readable to them for 14 days, so their app can collect it and move to another home; then it is deleted. Letting them back in stops the clock.
 
 Notifications need a key of their own. Generate a P-256 private key (32 bytes, base64url) and store it as a secret, never a variable:
@@ -192,11 +211,25 @@ npx wrangler secret put VAPID_PRIVATE_KEY
 
 Without it everything above still works, with no notifications. A notification says only that there is a new message: not who sent it, not what it says, and not which conversation it belongs to. It passes through Apple's or Google's push service, and none of that is theirs to see. The relay could not add it anyway, because the mail is sealed.
 
+#### Android notifications
+
+That key covers browsers and home-screen web apps. An Android app that is not a browser gets its notifications through Google's Firebase Cloud Messaging instead, which needs a second, separate setup, and only if you use such an app:
+
+1. In the [Firebase console](https://console.firebase.google.com), open the Firebase project the Android app was built with. It has to be that app's own project: Google delivers only to apps in the project that sends.
+2. Go to **Project settings**, then **Service accounts**, and press **Generate new private key**. A JSON file downloads.
+3. Store the whole file as a secret, then delete the download:
+
+```bash
+npx wrangler secret put FCM_SERVICE_ACCOUNT < path/to/the-key.json
+```
+
+The relay information document then shows `"fcm": {"project_id": "..."}`, and the app registers each phone with `subscribefcm`. Each member can register up to 4 Android devices, on top of up to 4 for web push. The message carries the same as a web notification: that there is a new message, and the app's own label for the account, never who or what. Keep the key secret: anyone holding it can send notifications to everyone who uses that app. Without it, nothing changes.
+
 ### Profile photos
 
 Members, and you, can keep a profile photo here, so the people in your home load each other's faces from it. It is a [Blossom](https://github.com/hzrd149/blossom) server for that one thing: JPEG, PNG or WebP, up to 100 KB, one photo each (a new one replaces the old), a few uploads a day. Anyone can fetch a stored photo by its hash; nothing lists them. A removed member's photo goes with their mail, after 14 days.
 
-Photos are kept in the relay's own storage, beside your events, so they need no setup and no extra Cloudflare product. All of them together are capped at 250 MB; at the cap new uploads are refused and nothing else is affected. The admin page shows how much is used. The apps also put each photo on a public Blossom server, so nothing breaks if this one is full.
+Photos are kept in the relay's own storage, beside your events, so they need no setup and no extra Cloudflare product. All of them together are capped at 5% of the relay's storage budget, about 50 MB; at the cap new uploads are refused and nothing else is affected. The admin page shows how much is used. The apps also put each photo on a public Blossom server, so nothing breaks if this one is full.
 
 ## Who can write here
 
@@ -250,9 +283,9 @@ The tool to send them with is [`nak`](https://github.com/fiatjaf/nak), whose `ad
 nak admin supportedmethods --sec <your nsec> your-relay.workers.dev
 ```
 
-Start there. `supportedmethods` returns exactly what this relay implements, which is the honest answer to what you can do with it, and `nak admin --help` lists the flags each method takes. Every request is authenticated with a [NIP-98](https://github.com/nostr-protocol/nips/blob/master/98.md) event signed by the relay owner's key, the same key you claimed the relay with. Nothing else is accepted, and an unsigned or wrongly signed request gets a 401. The exceptions are a member's own notification settings (`subscribepush` and `unsubscribepush`, signed by the member) `redeeminvite` and `requestjoin` (signed by whoever is joining), `myrole` (any key), the invite methods and `myinvites` for members (within their limits), and the member methods an admin may call (see "Admins" above).
+Start there. `supportedmethods` returns exactly what this relay implements, which is the honest answer to what you can do with it, and `nak admin --help` lists the flags each method takes. Every request is authenticated with a [NIP-98](https://github.com/nostr-protocol/nips/blob/master/98.md) event signed by the relay owner's key, the same key you claimed the relay with. Nothing else is accepted, and an unsigned or wrongly signed request gets a 401. The exceptions are a member's own notification settings (`subscribepush`, `unsubscribepush`, `subscribefcm` and `unsubscribefcm`, signed by the member) `redeeminvite` and `requestjoin` (signed by whoever is joining), `myrole` (any key), the invite methods and `myinvites` for members (within their limits), and the member methods an admin may call (see "Admins" above).
 
-What this relay implements: `banevent` and `allowevent` and `listbannedevents`; `banpubkey`, `unbanpubkey` and `listbannedpubkeys`; `allowpubkey`, `unallowpubkey` and `listallowedpubkeys`; `blockip` and `unblockip` and `listblockedips`; `changerelayname`, `changerelaydescription` and `changerelayicon`; and, bothy's own, `changewritepolicy` and `getwritepolicy` (see "Who can write here" above), `createinvite`, `redeeminvite`, `listunusedinvites`, `revokeinvite`, `requestjoin`, `listjoinrequests`, `approvejoin`, `declinejoin`, `listmembers`, `addadmin`, `removeadmin`, `listadmins`, `myrole`, `myinvites` and `homestats` (see "Members" above), and `subscribepush` and `unsubscribepush`. What it does not: the kind allowlist, because bothy stores every kind on purpose; and the moderation queue, because bothy has nothing to report events into.
+What this relay implements: `banevent` and `allowevent` and `listbannedevents`; `banpubkey`, `unbanpubkey` and `listbannedpubkeys`; `allowpubkey`, `unallowpubkey` and `listallowedpubkeys`; `blockip` and `unblockip` and `listblockedips`; `changerelayname`, `changerelaydescription` and `changerelayicon`; and, bothy's own, `changewritepolicy` and `getwritepolicy` (see "Who can write here" above), `createinvite`, `redeeminvite`, `listunusedinvites`, `revokeinvite`, `requestjoin`, `listjoinrequests`, `approvejoin`, `declinejoin`, `listmembers`, `addadmin`, `removeadmin`, `listadmins`, `myrole`, `myinvites`, `homestats`, `setstorage`, `getstorage`, `memberkeys`, `mailtimes`, `mymailbox` and `eraseme` (see "Members" above), and `subscribepush`, `unsubscribepush`, `subscribefcm` and `unsubscribefcm`. What it does not: the kind allowlist, because bothy stores every kind on purpose; and the moderation queue, because bothy has nothing to report events into.
 
 The endpoint answers cross-origin requests, so a client hosted somewhere other than the relay can call it from a browser.
 

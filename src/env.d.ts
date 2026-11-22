@@ -34,6 +34,9 @@ interface Env {
   // public half is derived, so the two cannot disagree. Unset (or
   // invalid) means no push_key on NIP-11 and no push, a supported state.
   VAPID_PRIVATE_KEY?: string;
+  // Android push (src/fcm.ts): a Google service-account JSON, the whole
+  // file, as a secret. Unset means no Android push.
+  FCM_SERVICE_ACCOUNT?: string;
   // The upstream update check (upstream-version.ts). On unless this is
   // exactly "off", the same shape as the write caps below.
   UPDATE_CHECK?: string;
@@ -60,6 +63,10 @@ interface Env {
   MAX_EVENT_BYTES?: string;
   MAX_EVENTS_PER_PUBKEY_PER_MINUTE?: string;
   NON_OWNER_STORAGE_BYTES?: string;
+  // The relay's storage budget (limits.ts storageBudget): 1GB by default,
+  // the smallest reading of the Free plan's per-object limit. Every share
+  // is a fraction of it.
+  STORAGE_BUDGET_BYTES?: string;
   // Profile photos (src/photos.ts). PHOTO_STORAGE_BYTES is the total they
   // may occupy, or exactly "off" to turn photo storage off. PHOTO_MAX_BYTES
   // is the largest one photo may be, never above limits.ts
@@ -67,6 +74,11 @@ interface Env {
   // Members' own invites (limits.ts memberInviteLimits): how many people
   // a member may let in, and how many steps from the owner invites go.
   // A positive number, or "off" to leave invites to the owner and admins.
+  // The mailbox (limits.ts mailStorageBytes, mailBytesPerMember): bytes
+  // of stored gift wraps for the whole home and per recipient. A positive
+  // number, or "off" to remove that cap.
+  MAIL_STORAGE_BYTES?: string;
+  MAIL_BYTES_PER_MEMBER?: string;
   INVITES_PER_MEMBER?: string;
   INVITE_DEPTH?: string;
   PHOTO_STORAGE_BYTES?: string;

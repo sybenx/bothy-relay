@@ -52,7 +52,9 @@ import {
   MAX_FILTERS_PER_REQ,
   maxEventBytes,
   maxEventsPerPubkeyPerWindow,
-  maxGiftWraps,
+  MAX_WRAPS_PER_AUTHOR,
+  mailBytesPerMember,
+  mailStorageBytes,
   MAX_GIFT_WRAPS_PER_IP_PER_WINDOW,
   MAX_LIVE_FEED_CONNECTIONS,
   MAX_MENTION_EVENT_INDEXED_TAGS,
@@ -67,7 +69,7 @@ import {
   nonOwnerStorageLimit,
   PUBKEY_RATE_LIMIT_MAX_TRACKED,
   PUBKEY_RATE_LIMIT_WINDOW_MS,
-  STORAGE_BYTES_LIMIT,
+  storageBudget,
   utcDayStartSeconds,
 } from "./limits";
 import {
@@ -131,6 +133,16 @@ import {
 } from "./read-metrics";
 import { getRelayPubkey } from "./relay-identity";
 import { type PhotoType, sqlitePhotoStore, takeUploadAllowance } from "./photos";
+import {
+  accessToken,
+  fcmData,
+  type FcmOutcome,
+  fcmConfigured,
+  forgetAccessToken,
+  needsAccessToken,
+  sendFcm,
+  serviceAccount,
+} from "./fcm";
 import { normalizeIp } from "./ip";
 import { connMetricsSnapshot, noteClose, noteRefusal, type ConnMetricsSnapshot } from "./conn-metrics";
 import { reqCacheSnapshot, type ReqCacheSnapshot } from "./req-cache";
@@ -174,7 +186,9 @@ import {
   migrateToMultiGroup,
   getRelaySettings,
   getStoredWritePolicy,
-  giftWrapCount,
+  mailRoom,
+  wrapBytes,
+  wrapsSignedBy,
   sweepExpiredGiftWraps,
   hasNonOwnerStorageHeadroom,
   isDeleted,
@@ -186,9 +200,13 @@ import {
   memberCount,
   pendingInboxPushes,
   pushSubscriptionsFor,
+  fcmTokensFor,
+  forgetFcmToken,
+  type FcmTokenRow,
   queueInboxPush,
   sweepFormerMembers,
   sweepExpiredJoinRequests,
+  storagePubkey,
   countMailDay,
   noteMemberSeen,
   pruneHomeStats,
@@ -333,6 +351,13 @@ function writeRejectionMessage(reason: WriteRejection): string {
 // than the owner may read kind 1059 (handleReqInner, broadcast). NIP-17
 // clients already ask for their inbox exactly this way
 // (`{"kinds":[1059],"#p":[me]}`).
+// The refusals the mailbox gives a sender, as OK false. Stable: apps match
+// them to say "their mailbox is full" or "this home is full" plainly.
+export const HOME_MAILBOX_FULL_MESSAGE = "blocked: this home's mailbox is full";
+export const RECIPIENT_MAILBOX_FULL_MESSAGE = "blocked: the recipient's mailbox on this home is full";
+export const WRAPS_PER_KEY_MESSAGE =
+  "rate-limited: this key has signed too many gift wraps here; NIP-59 uses a new key for every wrap";
+
 function readsOnlyOwnMail(filter: Filter, pubkey: string): boolean {
   const recipients = filter["#p"];
   return Array.isArray(recipients) && recipients.length > 0 && recipients.every((value) => value === pubkey);
@@ -679,6 +704,12 @@ export class Relay extends DurableObject<Env> {
   // MEMBER_CALLABLE_METHODS (storage.ts roleOf). "member" includes the
   // top-level group (TOP_LEVEL_GROUP_ID), whose members a group fan-out
   // pushes to. A few PK seeks, reached only after a valid signature.
+  // For the memberkeys gate (src/index.ts): is this the storage service's
+  // key (nip86.ts setstorage)? One row.
+  async isStorageService(pubkey: string): Promise<boolean> {
+    return this.metered(() => withReadPath("management", () => storagePubkey(this.sql) === pubkey));
+  }
+
   async getRole(pubkey: string): Promise<Role> {
     return this.metered(() =>
       withReadPath("management", () => roleOf(this.sql, pubkey, getOwnerPubkey(this.sql, this.env))),
@@ -920,7 +951,7 @@ export class Relay extends DurableObject<Env> {
       ingested24h: ingest.ingested24h - ingest.ingestedGroup24h,
       storageBytes: sql.databaseSize,
       rowsWrittenToday: ingest.rowsWrittenToday,
-      storageBytesLimit: STORAGE_BYTES_LIMIT,
+      storageBytesLimit: storageBudget(this.env),
       dailyRowsWrittenLimit: DAILY_ROWS_WRITTEN_LIMIT,
       dailyRowsReadLimit: DAILY_ROWS_READ_LIMIT,
       // Read live: one row per relay in the owner's kind-10002 list
@@ -1029,7 +1060,7 @@ export class Relay extends DurableObject<Env> {
         }
         // Expired gift wraps (storage.ts sweepExpiredGiftWraps): deleted,
         // not just hidden, because kind 1059 is capped by count (limits.ts
-        // maxGiftWraps) and a hidden row would still hold a slot.
+        // mailStorageBytes) and a hidden row would still hold its bytes.
         withReadPath("giftWrapSweep", () => this.sweepExpiredWraps(sql, now));
         // Removed members' mail, once their grace period is over
         // (storage.ts sweepFormerMembers). Free while nobody is waiting.
@@ -1309,8 +1340,26 @@ export class Relay extends DurableObject<Env> {
       return;
     }
 
-    if (giftWrapCount(sql) >= maxGiftWraps(this.env)) {
-      ok(ws, event.id, false, "blocked: gift wrap inbox storage is full");
+    // One key, many wraps: NIP-59 senders use a fresh key per wrap, so
+    // this only stops a key that is being used to make reads expensive
+    // (limits.ts MAX_WRAPS_PER_AUTHOR). An index count that stops early.
+    if (wrapsSignedBy(sql, event.pubkey, MAX_WRAPS_PER_AUTHOR) >= MAX_WRAPS_PER_AUTHOR) {
+      ok(ws, event.id, false, WRAPS_PER_KEY_MESSAGE);
+      return;
+    }
+
+    // The mailbox, in bytes (storage.ts mailRoom): the home's total, then
+    // each recipient's share. Stable strings, so a sender's app can say
+    // which one plainly.
+    const room = mailRoom(
+      sql,
+      recipients,
+      wrapBytes(event.content, JSON.stringify(event.tags)),
+      mailStorageBytes(this.env),
+      mailBytesPerMember(this.env),
+    );
+    if (room !== "ok") {
+      ok(ws, event.id, false, room === "home-full" ? HOME_MAILBOX_FULL_MESSAGE : RECIPIENT_MAILBOX_FULL_MESSAGE);
       return;
     }
 
@@ -1774,20 +1823,26 @@ export class Relay extends DurableObject<Env> {
   // What an accepted event owes the notification queue. Only three kinds
   // qualify, decided by integer comparisons, so other writes pay nothing.
   private notePush(sql: SqlStorage, event: NostrEvent, wrapRecipients: readonly string[]): void {
-    if (!pushConfigured(this.env)) return;
+    const web = pushConfigured(this.env);
+    const android = fcmConfigured(this.env);
     // Mail: queued per recipient who has a device registered (one indexed
-    // read each), so mail for someone without push writes nothing.
+    // read each), so mail for someone without push writes nothing. Web
+    // push or Android (src/fcm.ts), whichever this relay can send.
     if (event.kind === GIFT_WRAP_KIND) {
+      if (!web && !android) return;
       withReadPath("push", () => {
         const now = nowSeconds();
         for (const pubkey of wrapRecipients) {
-          if (!hasPushSubscription(sql, pubkey)) continue;
+          if (!hasPushSubscription(sql, pubkey, web, android)) continue;
           queueInboxPush(sql, pubkey, now);
           this.pushAlarmWanted = true;
         }
       });
       return;
     }
+    // Group messages and call presence go to web push only: they belong to
+    // the paused group feature, whose client was a browser.
+    if (!web) return;
     if (event.kind === CALL_PRESENCE_KIND) {
       withReadPath("presence", () => this.notePresence(sql, event));
       return;
@@ -1899,12 +1954,18 @@ export class Relay extends DurableObject<Env> {
   //
   // Returns how many subrequests it spent and whether anyone is still
   // queued.
+  //
+  // Each recipient's web push endpoints AND Android tokens (src/fcm.ts),
+  // counted together against the budget: each is one subrequest. Minting
+  // an FCM access token is one more, set aside first when it is due.
   private async drainInboxPushes(budget: number): Promise<{ spent: number; more: boolean }> {
     const keys = vapidKeys(this.env);
-    if (keys === null) return { spent: 0, more: false };
+    const account = serviceAccount(this.env);
+    if (keys === null && account === null) return { spent: 0, more: false };
     const sql = this.sql;
     const nowSec = nowSeconds();
     const online = this.onlinePubkeys();
+    const mint = account !== null && needsAccessToken(account, nowSec) ? 1 : 0;
 
     const plan = withReadPath("push", () => {
       // One more than could possibly be served, so "more" is known without
@@ -1916,8 +1977,8 @@ export class Relay extends DurableObject<Env> {
         kind: "message",
       };
       const subject = pushSubject(getOwnHost(sql));
-      let left = budget;
-      const serve: { pubkey: string; targets: PushFanoutRow[] }[] = [];
+      let left = budget - mint;
+      const serve: { pubkey: string; targets: PushFanoutRow[]; tokens: FcmTokenRow[] }[] = [];
       const skip: string[] = [];
       let more = false;
       for (const pubkey of pending) {
@@ -1925,17 +1986,18 @@ export class Relay extends DurableObject<Env> {
           skip.push(pubkey);
           continue;
         }
-        const targets = pushSubscriptionsFor(sql, pubkey);
-        if (targets.length === 0) {
+        const targets = keys === null ? [] : pushSubscriptionsFor(sql, pubkey);
+        const tokens = account === null ? [] : fcmTokensFor(sql, pubkey);
+        if (targets.length + tokens.length === 0) {
           skip.push(pubkey);
           continue;
         }
-        if (targets.length > left) {
+        if (targets.length + tokens.length > left) {
           more = true;
           break;
         }
-        serve.push({ pubkey, targets });
-        left -= targets.length;
+        serve.push({ pubkey, targets, tokens });
+        left -= targets.length + tokens.length;
       }
       // The extra row read above was there: somebody beyond this batch is
       // waiting, whatever happened to the ones before them.
@@ -1944,23 +2006,40 @@ export class Relay extends DurableObject<Env> {
     });
     if (plan === null) return { spent: 0, more: false };
 
+    // The access token only if someone in this batch has an Android token.
+    const wantsFcm = account !== null && plan.serve.some((entry) => entry.tokens.length > 0);
+    const bearer = wantsFcm ? await accessToken(account, nowSec) : null;
+
     const results = await Promise.all(
       plan.serve.map(async (entry) => ({
         entry,
         outcomes: await Promise.all(
           entry.targets.map((target) =>
-            sendPush(keys, plan.subject, target, payloadFor(plan.payload, target), nowSec),
+            sendPush(keys!, plan.subject, target, payloadFor(plan.payload, target), nowSec),
+          ),
+        ),
+        fcm: await Promise.all(
+          entry.tokens.map((row) =>
+            account !== null && bearer !== null
+              ? sendFcm(account, bearer, row.token, fcmData(payloadFor(plan.payload, row)))
+              : Promise.resolve<FcmOutcome>("failed"),
           ),
         ),
       })),
     );
 
-    let spent = 0;
+    let spent = wantsFcm && mint ? 1 : 0;
     withReadPath("push", () => {
       for (const pubkey of plan.skip) clearInboxPush(sql, pubkey);
-      for (const { entry, outcomes } of results) {
-        spent += outcomes.length;
+      for (const { entry, outcomes, fcm } of results) {
+        spent += outcomes.length + (bearer === null ? 0 : fcm.length);
         outcomes.forEach((outcome, index) => this.settlePushOutcome(sql, entry.targets[index]!, outcome, nowSec));
+        fcm.forEach((outcome, index) => {
+          // Google says this token is dead: every account on it goes.
+          if (outcome === "gone") forgetFcmToken(sql, entry.tokens[index]!.token);
+          // The access token was refused: mint a fresh one next time.
+          if (outcome === "auth" && account !== null) forgetAccessToken(account);
+        });
         clearInboxPush(sql, entry.pubkey);
       }
     });

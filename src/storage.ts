@@ -13,7 +13,7 @@ import {
   scopeOf,
   TOP_LEVEL_GROUP_ID,
 } from "./groups";
-import { CHAT_BACKLOG_SECONDS, CONVERSATION_IDLE_SECONDS } from "./limits";
+import { CHAT_BACKLOG_SECONDS, CONVERSATION_IDLE_SECONDS, MAX_WRAP_RECIPIENTS_CHECKED } from "./limits";
 import {
   EVENT_BASE_ROW_COST,
   EVENT_BASE_ROW_COST_MEASURED,
@@ -22,6 +22,7 @@ import {
   TAG_ROW_COST,
   TAG_ROW_COST_MEASURED,
   TOMBSTONE_ROW_COST,
+  WRAP_FIXED_BYTES,
 } from "./schema";
 import { addRowsWritten, takeRowsWritten, unlandedRowsWritten, withReadPath } from "./read-metrics";
 import { normalizeIp } from "./ip";
@@ -122,6 +123,14 @@ function insertEventRow(
   // top of the event row's own cost (schema.ts eventRowCostMeasured; the
   // guards use the deliberately higher eventRowCost).
   bumpEventCounters(sql, event.created_at, 1, scope);
+  // The mailbox's bytes (schema.ts `mail_usage`) and the expiry index
+  // (`wrap_expiry`), for gift wraps only. 2 to 3 rows written.
+  if (event.kind === GIFT_WRAP_KIND) {
+    bumpMailUsage(sql, wrapRecipients(event.tags), wrapBytes(event.content, JSON.stringify(event.tags)), 1);
+    if (expiration !== null) {
+      sql.exec(`INSERT OR REPLACE INTO wrap_expiry (id, expiration) VALUES (?, ?)`, event.id, expiration);
+    }
+  }
   for (const tag of indexedTags) {
     sql.exec(
       `INSERT INTO event_tags (tag_name, tag_value, event_id, created_at, is_group, group_id)
@@ -196,19 +205,42 @@ function deleteEventRow(sql: SqlStorage, id: string): void {
   // ids that may never have been stored: the counters must move only for a
   // row that existed, by its own `created_at`. `undefined` means nothing
   // to remove. Rows read: 1 (the same PK seek the DELETE does).
+  // `content` and `tags` only for a gift wrap, whose mailbox charge is
+  // refunded below; no other kind pays to read them.
   const row = sql
     .exec<{
       created_at: number;
       ingested_at: number | null;
       row_cost: number | null;
       is_group: number;
-    }>(`SELECT created_at, ingested_at, row_cost, is_group FROM events WHERE id = ?`, id)
+      kind: number;
+      wrap_content: string | null;
+      wrap_tags: string | null;
+    }>(
+      `SELECT created_at, ingested_at, row_cost, is_group, kind,
+              CASE WHEN kind = ? THEN content END AS wrap_content,
+              CASE WHEN kind = ? THEN tags END AS wrap_tags
+         FROM events WHERE id = ?`,
+      GIFT_WRAP_KIND,
+      GIFT_WRAP_KIND,
+      id,
+    )
     .toArray()[0];
   sql.exec(`DELETE FROM event_tags WHERE event_id = ?`, id);
   sql.exec(`DELETE FROM events WHERE id = ?`, id);
   // After the DELETEs, so a statement that throws cannot leave the
   // counters describing fewer events than are stored.
   if (row === undefined) return;
+  if (row.kind === GIFT_WRAP_KIND && row.wrap_content !== null && row.wrap_tags !== null) {
+    let tags: string[][] = [];
+    try {
+      tags = JSON.parse(row.wrap_tags) as string[][];
+    } catch {
+      tags = [];
+    }
+    bumpMailUsage(sql, wrapRecipients(tags), wrapBytes(row.wrap_content, row.wrap_tags), -1);
+    sql.exec(`DELETE FROM wrap_expiry WHERE id = ?`, id);
+  }
   // The partition the row was actually in, read from the row.
   const scope: GroupScope = row.is_group === 1 ? GROUP_SCOPE : PUBLIC_SCOPE;
   bumpEventCounters(sql, row.created_at, -1, scope);
@@ -954,6 +986,88 @@ export function giftWrapCount(sql: SqlStorage): number {
   ).reduce((total, row) => total + row.n, 0);
 }
 
+// ---------------------------------------------------------------------
+// The mailbox's bytes (schema.ts `mail_usage`, limits.ts
+// mailStorageBytes and mailBytesPerMember).
+// ---------------------------------------------------------------------
+
+const MAIL_TOTAL = "*";
+
+// What a stored wrap is charged: its content and serialized tags as
+// stored, plus schema.ts WRAP_FIXED_BYTES. The same function on insert
+// and delete, from the same stored strings, so the two always cancel.
+export function wrapBytes(content: string, tagsJson: string): number {
+  return content.length + tagsJson.length + WRAP_FIXED_BYTES;
+}
+
+// Who a wrap is charged to: its distinct `p` values, as many as
+// relay.ts handleGiftWrap looks at (limits.ts MAX_WRAP_RECIPIENTS_CHECKED).
+function wrapRecipients(tags: string[][]): string[] {
+  return [...new Set(pTagValues(tags))].slice(0, MAX_WRAP_RECIPIENTS_CHECKED);
+}
+
+function bumpMailUsage(sql: SqlStorage, recipients: string[], bytes: number, sign: 1 | -1): void {
+  for (const key of [MAIL_TOTAL, ...recipients]) {
+    sql.exec(
+      `INSERT INTO mail_usage (pubkey, bytes, n) VALUES (?, MAX(?, 0), MAX(?, 0))
+         ON CONFLICT(pubkey) DO UPDATE SET bytes = MAX(bytes + ?, 0), n = MAX(n + ?, 0)`,
+      key,
+      sign * bytes,
+      sign,
+      sign * bytes,
+      sign,
+    );
+  }
+}
+
+export interface MailUsage {
+  bytes: number;
+  messages: number;
+}
+
+export function mailUsage(sql: SqlStorage, pubkey: string | null): MailUsage {
+  const row = sql
+    .exec<{ bytes: number; n: number }>(`SELECT bytes, n FROM mail_usage WHERE pubkey = ?`, pubkey ?? MAIL_TOTAL)
+    .toArray()[0];
+  return { bytes: row?.bytes ?? 0, messages: row?.n ?? 0 };
+}
+
+// Whether a wrap of `bytes` fits: the home's total first, then each
+// recipient's share. Two or three PK reads.
+export type MailRoom = "ok" | "home-full" | "share-full";
+
+export function mailRoom(
+  sql: SqlStorage,
+  recipients: readonly string[],
+  bytes: number,
+  homeCap: number | null,
+  perMemberCap: number | null,
+): MailRoom {
+  if (homeCap !== null && mailUsage(sql, null).bytes + bytes > homeCap) return "home-full";
+  if (perMemberCap !== null) {
+    for (const pubkey of recipients) {
+      if (mailUsage(sql, pubkey).bytes + bytes > perMemberCap) return "share-full";
+    }
+  }
+  return "ok";
+}
+
+// Wraps this key has signed that are stored here, counted up to `limit`
+// and no further (idx_events_pubkey_kind_created_pub), for
+// limits.ts MAX_WRAPS_PER_AUTHOR.
+export function wrapsSignedBy(sql: SqlStorage, pubkey: string, limit: number): number {
+  return (
+    sql
+      .exec<{ n: number }>(
+        `SELECT COUNT(*) AS n FROM (SELECT 1 FROM events WHERE pubkey = ? AND kind = ? AND is_group = 0 LIMIT ?)`,
+        pubkey,
+        GIFT_WRAP_KIND,
+        limit,
+      )
+      .toArray()[0]?.n ?? 0
+  );
+}
+
 export interface GiftWrapSweep {
   // How many wraps this tick actually removed.
   removed: number;
@@ -987,26 +1101,18 @@ export function sweepExpiredGiftWraps(
   nowSec: number,
   limit: number,
 ): GiftWrapSweep {
-  const targets = acrossScopes((scope) =>
-    sql
-      .exec<{ id: string }>(
-        `SELECT id FROM events
-           WHERE kind = ? AND is_group = ? AND expiration IS NOT NULL AND expiration <= ?
-           ORDER BY created_at ASC LIMIT ?`,
-        GIFT_WRAP_KIND,
-        scope,
-        nowSec,
-        limit,
-      )
-      .toArray(),
-  );
-
-  // Fewer than `limit` in total means neither partition filled its own
-  // limit, so nothing is left. Exactly `limit` counts as not done, since
-  // either partition might hold more.
+  // From `wrap_expiry`, soonest first (idx_wrap_expiry_expiration), so a
+  // tick reads only what is due, however many wraps are stored.
+  const targets = sql
+    .exec<{ id: string }>(
+      `SELECT id FROM wrap_expiry WHERE expiration <= ? ORDER BY expiration ASC LIMIT ?`,
+      nowSec,
+      limit,
+    )
+    .toArray();
   const done = targets.length < limit;
-  for (const target of targets.slice(0, limit)) deleteEventRow(sql, target.id);
-  return { removed: Math.min(targets.length, limit), done };
+  for (const target of targets) deleteEventRow(sql, target.id);
+  return { removed: targets.length, done };
 }
 
 interface StoreResult {
@@ -1612,6 +1718,11 @@ export interface RelaySettings {
   // unparseable value falls through to the default instead of refusing
   // every write.
   writePolicy: string | null;
+  // The home's file server (nip86.ts setstorage): its URL, advertised on
+  // NIP-11 as `storage`, and the pubkey it signs memberkeys calls with.
+  // Both or neither.
+  storageUrl?: string | null;
+  storagePubkey?: string | null;
 }
 
 export function getRelaySettings(sql: SqlStorage): RelaySettings {
@@ -1622,6 +1733,8 @@ export function getRelaySettings(sql: SqlStorage): RelaySettings {
     description: byKey.get("description") ?? null,
     icon: byKey.get("icon") ?? null,
     writePolicy: byKey.get("write_policy") ?? null,
+    storageUrl: byKey.get("storage_url") ?? null,
+    storagePubkey: byKey.get("storage_pubkey") ?? null,
   };
 }
 
@@ -1638,7 +1751,16 @@ export function getStoredWritePolicy(sql: SqlStorage): string | null {
 // An empty string clears the stored value: NIP-86 has no unset operation,
 // so this is bothy's convention (README.md "Relay management API"). A
 // stored "" would shadow the kind-0 and default rungs forever.
-export type RelaySettingKey = "name" | "description" | "icon" | "write_policy";
+export type RelaySettingKey = "name" | "description" | "icon" | "write_policy" | "storage_url" | "storage_pubkey";
+
+// The storage service's pubkey alone, for the memberkeys gate.
+export function storagePubkey(sql: SqlStorage): string | null {
+  return (
+    sql
+      .exec<{ value: string }>(`SELECT value FROM relay_settings WHERE key = 'storage_pubkey'`)
+      .toArray()[0]?.value ?? null
+  );
+}
 
 export function setRelaySetting(sql: SqlStorage, key: RelaySettingKey, value: string): void {
   if (value === "") {
@@ -2044,7 +2166,12 @@ export function invitedSubtree(sql: SqlStorage, pubkey: string, owner: string): 
   return order;
 }
 
-export function unallowPubkey(sql: SqlStorage, pubkey: string, nowSec: number): void {
+export function unallowPubkey(
+  sql: SqlStorage,
+  pubkey: string,
+  nowSec: number,
+  reason: "removed" | "erased" = "removed",
+): void {
   const existed = sql.exec(`SELECT 1 FROM allowed_pubkeys WHERE pubkey = ?`, pubkey).toArray().length > 0;
   if (!existed) return;
   sql.exec(`DELETE FROM allowed_pubkeys WHERE pubkey = ?`, pubkey);
@@ -2052,12 +2179,107 @@ export function unallowPubkey(sql: SqlStorage, pubkey: string, nowSec: number): 
   sql.exec(`DELETE FROM admins WHERE pubkey = ?`, pubkey);
   sql.exec(`DELETE FROM member_seen WHERE pubkey = ?`, pubkey);
   sql.exec(`DELETE FROM push_subscriptions WHERE pubkey = ?`, pubkey);
+  sql.exec(`DELETE FROM fcm_tokens WHERE pubkey = ?`, pubkey);
   sql.exec(`DELETE FROM inbox_push WHERE pubkey = ?`, pubkey);
   sql.exec(
-    `INSERT INTO former_members (pubkey, removed_at) VALUES (?, ?)
-       ON CONFLICT(pubkey) DO UPDATE SET removed_at = excluded.removed_at`,
+    `INSERT INTO former_members (pubkey, removed_at, reason) VALUES (?, ?, ?)
+       ON CONFLICT(pubkey) DO UPDATE SET removed_at = excluded.removed_at, reason = excluded.reason`,
     pubkey,
     nowSec,
+    reason,
+  );
+}
+
+// A member erasing their own account (nip86.ts eraseme). Unlike removal
+// there is no grace: what bothy holds for them goes now.
+//
+//   - Their invitees stay members, re-hung under the person who invited
+//     them (or the owner, if that person is not a member).
+//   - The invite place they used goes back to whoever invited them
+//     (giveBackInvite).
+//   - Codes of their own still waiting are revoked: nobody joins under
+//     someone who has left.
+//   - Their mail here (wraps addressed to them and no one else still
+//     entitled to it), their profile photo, their devices, any join
+//     request and group rows are deleted.
+//   - The membership ends as a removal does, recorded as 'erased' so the
+//     storage service can tell (memberkeys), with nothing left for the
+//     grace sweep to delete.
+//
+// Returns how many wraps were deleted. `mailLimit` bounds the work; the
+// inbox is capped (limits.ts maxGiftWraps), so passing that cap deletes
+// everything.
+export function eraseMember(
+  sql: SqlStorage,
+  pubkey: string,
+  owner: string | null,
+  nowSec: number,
+  mailLimit: number,
+): number {
+  const row = sql
+    .exec<{ invited_by: string | null; via_code: string | null }>(
+      `SELECT invited_by, via_code FROM allowed_pubkeys WHERE pubkey = ?`,
+      pubkey,
+    )
+    .toArray()[0];
+  if (row === undefined) return 0;
+  const inviter =
+    row.invited_by !== null && row.invited_by !== pubkey && isPubkeyAllowed(sql, row.invited_by)
+      ? row.invited_by
+      : owner;
+  if (inviter !== null) {
+    sql.exec(`UPDATE allowed_pubkeys SET invited_by = ? WHERE invited_by = ?`, inviter, pubkey);
+  }
+  if (row.invited_by !== null) giveBackInvite(sql, row.invited_by, row.via_code);
+  sql.exec(
+    `UPDATE member_invites SET revoked_at = ?
+      WHERE created_by = ? AND revoked_at IS NULL AND uses < uses_allowed AND expires_at > ?`,
+    nowSec,
+    pubkey,
+    nowSec,
+  );
+  let deleted = 0;
+  for (const { id } of mailOnlyFor(sql, pubkey, owner, mailLimit)) {
+    deleteEventRow(sql, id);
+    deleted++;
+  }
+  sql.exec(`DELETE FROM photos WHERE pubkey = ?`, pubkey);
+  sql.exec(`DELETE FROM photo_uploads WHERE pubkey = ?`, pubkey);
+  sql.exec(`DELETE FROM join_requests WHERE pubkey = ?`, pubkey);
+  sql.exec(`DELETE FROM group_membership WHERE pubkey = ?`, pubkey);
+  unallowPubkey(sql, pubkey, nowSec, "erased");
+  return deleted;
+}
+
+// Gives one invite place back to `creator` (limits.ts memberInviteLimits
+// counts places: all uses of a live code, the used ones of a dead one).
+// The code the person redeemed if it was recorded (`via_code`), otherwise
+// any used code of the creator's. Taking one from both `uses` and
+// `uses_allowed` frees the place without making a used-up code
+// redeemable again.
+function giveBackInvite(sql: SqlStorage, creator: string, code: string | null): void {
+  const exact =
+    code === null
+      ? undefined
+      : sql
+          .exec<{ code: string }>(
+            `SELECT code FROM member_invites WHERE code = ? AND created_by = ? AND uses > 0`,
+            code,
+            creator,
+          )
+          .toArray()[0];
+  const target =
+    exact ??
+    sql
+      .exec<{ code: string }>(
+        `SELECT code FROM member_invites WHERE created_by = ? AND uses > 0 ORDER BY created_at DESC LIMIT 1`,
+        creator,
+      )
+      .toArray()[0];
+  if (target === undefined) return;
+  sql.exec(
+    `UPDATE member_invites SET uses = uses - 1, uses_allowed = MAX(uses_allowed - 1, 0) WHERE code = ?`,
+    target.code,
   );
 }
 
@@ -2277,12 +2499,13 @@ export function redeemMemberInvite(
     nowSec,
   );
   sql.exec(
-    `INSERT INTO allowed_pubkeys (pubkey, reason, allowed_at, source, invited_by)
-       VALUES (?, 'joined with an invite', ?, 'member', ?)
+    `INSERT INTO allowed_pubkeys (pubkey, reason, allowed_at, source, invited_by, via_code)
+       VALUES (?, 'joined with an invite', ?, 'member', ?, ?)
        ON CONFLICT(pubkey) DO NOTHING`,
     pubkey,
     nowSec,
     invite.created_by ?? owner,
+    code,
   );
   readmitFormerMember(sql, pubkey);
   return "joined";
@@ -2403,8 +2626,9 @@ export function homeStats(sql: SqlStorage, nowSec: number, days: number, weeks: 
     pushSubscribers:
       sql
         .exec<{ n: number }>(
-          `SELECT COUNT(DISTINCT p.pubkey) AS n FROM push_subscriptions p
-             JOIN allowed_pubkeys a ON a.pubkey = p.pubkey`,
+          `SELECT COUNT(*) AS n FROM allowed_pubkeys a
+            WHERE EXISTS (SELECT 1 FROM push_subscriptions p WHERE p.pubkey = a.pubkey)
+               OR EXISTS (SELECT 1 FROM fcm_tokens f WHERE f.pubkey = a.pubkey)`,
         )
         .toArray()[0]?.n ?? 0,
   };
@@ -2636,6 +2860,57 @@ export interface RemovedMember {
 // with no recorded inviter, or whose inviter is no longer a member, is
 // reported as the owner's, so every member hangs from the owner. (Removal
 // re-parents invitees itself; this covers rows from before it did.)
+// What the storage service is told (nip86.ts memberkeys): who may upload
+// (the owner and every member, admins included) and who has left, with
+// when their files should go. Pubkeys only, no names or roles.
+export function memberKeys(
+  sql: SqlStorage,
+  owner: string | null,
+  graceSec: number,
+): {
+  owner: string | null;
+  members: string[];
+  removed: { pubkey: string; removedAt: number; deletesAt: number; reason: string }[];
+} {
+  const members = sql
+    .exec<{ pubkey: string }>(`SELECT pubkey FROM allowed_pubkeys ORDER BY pubkey ASC`)
+    .toArray()
+    .map((r) => r.pubkey);
+  const removed = sql
+    .exec<{ pubkey: string; removed_at: number; reason: string }>(
+      `SELECT pubkey, removed_at, reason FROM former_members ORDER BY removed_at DESC`,
+    )
+    .toArray()
+    // An erased account's mail is already gone, so its deadline is now.
+    .map((r) => ({
+      pubkey: r.pubkey,
+      removedAt: r.removed_at,
+      deletesAt: r.reason === "erased" ? r.removed_at : r.removed_at + graceSec,
+      reason: r.reason,
+    }));
+  return { owner, members, removed };
+}
+
+// When bothy stored each of these gift wraps (events.ingested_at), for
+// the ones addressed to `recipient` only; any other id is left out, so
+// the answer says nothing about anyone else's mail. The ids go in as one
+// JSON parameter (json_each), so 500 of them bind one parameter, not 500
+// (limits.ts MAX_QUERY_BOUND_PARAMS). One PK seek per id plus a tag check.
+export function mailTimes(sql: SqlStorage, recipient: string, ids: string[]): Record<string, number> {
+  const rows = sql
+    .exec<{ id: string; ingested_at: number }>(
+      `SELECT e.id AS id, e.ingested_at AS ingested_at FROM events e
+        WHERE e.id IN (SELECT value FROM json_each(?)) AND e.kind = ? AND e.ingested_at IS NOT NULL
+          AND EXISTS (SELECT 1 FROM event_tags t
+                       WHERE t.event_id = e.id AND t.tag_name = 'p' AND t.tag_value = ?)`,
+      JSON.stringify(ids),
+      GIFT_WRAP_KIND,
+      recipient,
+    )
+    .toArray();
+  return Object.fromEntries(rows.map((r) => [r.id, r.ingested_at]));
+}
+
 export function listMembers(
   sql: SqlStorage,
   graceSec: number,
@@ -2658,11 +2933,16 @@ export function listMembers(
     role: admins.has(r.pubkey) ? ("admin" as const) : ("member" as const),
   }));
   const removed = sql
-    .exec<{ pubkey: string; removed_at: number }>(
-      `SELECT pubkey, removed_at FROM former_members ORDER BY removed_at DESC`,
+    .exec<{ pubkey: string; removed_at: number; reason: string }>(
+      `SELECT pubkey, removed_at, reason FROM former_members ORDER BY removed_at DESC`,
     )
     .toArray()
-    .map((r) => ({ pubkey: r.pubkey, removedAt: r.removed_at, deletesAt: r.removed_at + graceSec }));
+    // An erased account's mail is already gone, so its deadline is now.
+    .map((r) => ({
+      pubkey: r.pubkey,
+      removedAt: r.removed_at,
+      deletesAt: r.reason === "erased" ? r.removed_at : r.removed_at + graceSec,
+    }));
   return { members, removed };
 }
 
@@ -2684,6 +2964,38 @@ export interface FormerMemberSweep {
 // Per former member: one indexed range over `event_tags` for their `p`,
 // per partition, at most `limit` rows. A former member with no wraps left
 // is deleted, which ends the work for them. Called from the cron tick.
+// How many wraps are still waiting to be deleted for someone who left,
+// counted up to `limit` (eraseme's answer, messagesLeft).
+export function mailLeftFor(sql: SqlStorage, pubkey: string, owner: string | null, limit: number): number {
+  return mailOnlyFor(sql, pubkey, owner, limit).length;
+}
+
+// Gift wraps addressed to `pubkey` and to nobody else still entitled to
+// them (the owner, a current member), up to `limit` per partition. What
+// leaves with a person who leaves: the grace sweep below and eraseMember.
+function mailOnlyFor(sql: SqlStorage, pubkey: string, owner: string | null, limit: number): { id: string }[] {
+  return acrossScopes((scope) =>
+    sql
+      .exec<{ id: string }>(
+        `SELECT e.id AS id FROM event_tags t JOIN events e ON e.id = t.event_id
+          WHERE t.is_group = ? AND t.tag_name = 'p' AND t.tag_value = ? AND e.kind = ?
+            AND NOT EXISTS (
+              SELECT 1 FROM event_tags o
+               WHERE o.event_id = e.id AND o.tag_name = 'p' AND o.tag_value != ?
+                 AND (o.tag_value = ? OR o.tag_value IN (SELECT pubkey FROM allowed_pubkeys))
+            )
+          LIMIT ?`,
+        scope,
+        pubkey,
+        GIFT_WRAP_KIND,
+        pubkey,
+        owner ?? "",
+        limit,
+      )
+      .toArray(),
+  );
+}
+
 export function sweepFormerMembers(
   sql: SqlStorage,
   nowSec: number,
@@ -2694,7 +3006,8 @@ export function sweepFormerMembers(
 ): FormerMemberSweep {
   const due = sql
     .exec<{ pubkey: string }>(
-      `SELECT pubkey FROM former_members WHERE removed_at <= ? ORDER BY removed_at ASC LIMIT ?`,
+      `SELECT pubkey FROM former_members WHERE removed_at <= ? OR reason = 'erased'
+        ORDER BY removed_at ASC LIMIT ?`,
       nowSec - graceSec,
       pubkeyLimit,
     )
@@ -2704,26 +3017,7 @@ export function sweepFormerMembers(
   for (const { pubkey } of due) {
     const budget = limit - removed;
     if (budget <= 0) break;
-    const targets = acrossScopes((scope) =>
-      sql
-        .exec<{ id: string }>(
-          `SELECT e.id AS id FROM event_tags t JOIN events e ON e.id = t.event_id
-            WHERE t.is_group = ? AND t.tag_name = 'p' AND t.tag_value = ? AND e.kind = ?
-              AND NOT EXISTS (
-                SELECT 1 FROM event_tags o
-                 WHERE o.event_id = e.id AND o.tag_name = 'p' AND o.tag_value != ?
-                   AND (o.tag_value = ? OR o.tag_value IN (SELECT pubkey FROM allowed_pubkeys))
-              )
-            LIMIT ?`,
-          scope,
-          pubkey,
-          GIFT_WRAP_KIND,
-          pubkey,
-          owner ?? "",
-          budget,
-        )
-        .toArray(),
-    );
+    const targets = mailOnlyFor(sql, pubkey, owner, budget);
     const batch = targets.slice(0, budget);
     for (const target of batch) deleteEventRow(sql, target.id);
     removed += batch.length;
@@ -2891,9 +3185,66 @@ export function pushSubscriptionsFor(sql: SqlStorage, pubkey: string): PushFanou
 }
 
 // Asked on the gift wrap write path before queuing, so mail for a member
-// with no devices writes no queue row and wakes no alarm.
-export function hasPushSubscription(sql: SqlStorage, pubkey: string): boolean {
-  return sql.exec(`SELECT 1 FROM push_subscriptions WHERE pubkey = ? LIMIT 1`, pubkey).toArray().length > 0;
+// with no devices writes no queue row and wakes no alarm. Web push or
+// Android, whichever this relay can send.
+export function hasPushSubscription(sql: SqlStorage, pubkey: string, web = true, fcm = false): boolean {
+  if (web && sql.exec(`SELECT 1 FROM push_subscriptions WHERE pubkey = ? LIMIT 1`, pubkey).toArray().length > 0) {
+    return true;
+  }
+  return fcm && sql.exec(`SELECT 1 FROM fcm_tokens WHERE pubkey = ? LIMIT 1`, pubkey).toArray().length > 0;
+}
+
+// ---------------------------------------------------------------------
+// Android push tokens (schema.ts `fcm_tokens`, src/fcm.ts). The pubkey is
+// always the NIP-98 signer.
+// ---------------------------------------------------------------------
+
+export interface FcmTokenRow {
+  token: string;
+  pubkey: string;
+  label: string | null;
+}
+
+// Upsert on (token, pubkey), the label replaced every time, then this
+// pubkey's oldest beyond the cap evicted (rowid DESC as the tie-break,
+// as for web push).
+export function upsertFcmToken(sql: SqlStorage, row: FcmTokenRow, cap: number, nowSec: number): void {
+  sql.exec(
+    `INSERT INTO fcm_tokens (token, pubkey, label, created_at) VALUES (?, ?, ?, ?)
+       ON CONFLICT(token, pubkey) DO UPDATE SET label = excluded.label, created_at = excluded.created_at`,
+    row.token,
+    row.pubkey,
+    row.label,
+    nowSec,
+  );
+  sql.exec(
+    `DELETE FROM fcm_tokens
+       WHERE pubkey = ?
+         AND token NOT IN (
+           SELECT token FROM fcm_tokens WHERE pubkey = ? ORDER BY created_at DESC, rowid DESC LIMIT ?
+         )`,
+    row.pubkey,
+    row.pubkey,
+    cap,
+  );
+}
+
+export function deleteFcmToken(sql: SqlStorage, pubkey: string, token: string): void {
+  sql.exec(`DELETE FROM fcm_tokens WHERE token = ? AND pubkey = ?`, token, pubkey);
+}
+
+// Every account on a token Google says is dead.
+export function forgetFcmToken(sql: SqlStorage, token: string): void {
+  sql.exec(`DELETE FROM fcm_tokens WHERE token = ?`, token);
+}
+
+export function fcmTokensFor(sql: SqlStorage, pubkey: string): FcmTokenRow[] {
+  return sql
+    .exec<{ token: string; pubkey: string; label: string | null }>(
+      `SELECT token, pubkey, label FROM fcm_tokens WHERE pubkey = ? ORDER BY token ASC`,
+      pubkey,
+    )
+    .toArray();
 }
 
 // ---------------------------------------------------------------------
