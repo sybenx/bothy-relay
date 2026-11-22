@@ -98,9 +98,17 @@ function insertEventRow(
   // NULL exactly when the row is public, including kinds 39000/39001,
   // which are public group state (groups.ts isPubliclyReadableGroupKind).
   const groupId = scope === GROUP_SCOPE ? groupIdOf(event) : null;
+  // A gift wrap takes the home's next sequence number (schema.ts
+  // events.seq): one row read here, and the counter moves in the mailbox
+  // UPDATE below, which every stored wrap already pays.
+  const seq =
+    event.kind === GIFT_WRAP_KIND
+      ? (sql.exec<{ seq: number }>(`SELECT seq FROM mail_usage WHERE pubkey = ?`, MAIL_TOTAL).toArray()[0]?.seq ??
+          0) + 1
+      : null;
   sql.exec(
-    `INSERT INTO events (id, pubkey, created_at, kind, tags, content, sig, expiration, ingested_at, row_cost, is_group, group_id)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO events (id, pubkey, created_at, kind, tags, content, sig, expiration, ingested_at, row_cost, is_group, group_id, seq)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     event.id,
     event.pubkey,
     event.created_at,
@@ -113,6 +121,7 @@ function insertEventRow(
     eventRowCost(indexedTags.length),
     scope,
     groupId,
+    seq,
   );
   // After the INSERT, so a duplicate id (which throws, and which
   // backfill.ts applyBackfillPage catches and continues past) leaves the
@@ -126,7 +135,7 @@ function insertEventRow(
   // The mailbox's bytes (schema.ts `mail_usage`) and the expiry index
   // (`wrap_expiry`), for gift wraps only. 2 to 3 rows written.
   if (event.kind === GIFT_WRAP_KIND) {
-    bumpMailUsage(sql, wrapRecipients(event.tags), wrapBytes(event.content, JSON.stringify(event.tags)), 1);
+    bumpMailUsage(sql, wrapRecipients(event.tags), wrapBytes(event.content, JSON.stringify(event.tags)), 1, seq);
     if (expiration !== null) {
       sql.exec(`INSERT OR REPLACE INTO wrap_expiry (id, expiration) VALUES (?, ?)`, event.id, expiration);
     }
@@ -1006,14 +1015,25 @@ function wrapRecipients(tags: string[][]): string[] {
   return [...new Set(pTagValues(tags))].slice(0, MAX_WRAP_RECIPIENTS_CHECKED);
 }
 
-function bumpMailUsage(sql: SqlStorage, recipients: string[], bytes: number, sign: 1 | -1): void {
+// `seq`, on a stored wrap, moves the `*` row's sequence counter to it in
+// the same statement (schema.ts mail_usage.seq); deletes never move it.
+function bumpMailUsage(
+  sql: SqlStorage,
+  recipients: string[],
+  bytes: number,
+  sign: 1 | -1,
+  seq: number | null = null,
+): void {
   for (const key of [MAIL_TOTAL, ...recipients]) {
+    const counter = key === MAIL_TOTAL && seq !== null ? seq : 0;
     sql.exec(
-      `INSERT INTO mail_usage (pubkey, bytes, n) VALUES (?, MAX(?, 0), MAX(?, 0))
-         ON CONFLICT(pubkey) DO UPDATE SET bytes = MAX(bytes + ?, 0), n = MAX(n + ?, 0)`,
+      `INSERT INTO mail_usage (pubkey, bytes, n, seq) VALUES (?, MAX(?, 0), MAX(?, 0), ?)
+         ON CONFLICT(pubkey) DO UPDATE SET bytes = MAX(bytes + ?, 0), n = MAX(n + ?, 0),
+                                           seq = MAX(seq, excluded.seq)`,
       key,
       sign * bytes,
       sign,
+      counter,
       sign * bytes,
       sign,
     );
@@ -1865,8 +1885,8 @@ export function allowPubkeyForGroup(
   nowSec: number,
 ): void {
   sql.exec(
-    `INSERT INTO allowed_pubkeys (pubkey, reason, allowed_at, source)
-       VALUES (?, ?, ?, 'invite')
+    `INSERT INTO allowed_pubkeys (pubkey, reason, allowed_at, source, close)
+       VALUES (?, ?, ?, 'invite', 0)
        ON CONFLICT(pubkey) DO NOTHING`,
     pubkey,
     reason,
@@ -2126,25 +2146,49 @@ export type InviteesChoice = "keep" | "remove";
 
 // Returns everyone removed, the named pubkey first. Empty if it was not a
 // member.
+//
+// `newParent` is who "keep" re-hangs the invitees under: the owner when
+// the owner or an admin removes someone, the remover when a member removes
+// someone in their own subtree (the nearest ancestor who remains).
 export function removeMember(
   sql: SqlStorage,
   pubkey: string,
   owner: string,
   invitees: InviteesChoice,
   nowSec: number,
+  newParent: string = owner,
 ): string[] {
   if (!isPubkeyAllowed(sql, pubkey)) {
     unallowPubkey(sql, pubkey, nowSec);
     return [];
   }
   if (invitees === "keep") {
-    sql.exec(`UPDATE allowed_pubkeys SET invited_by = ? WHERE invited_by = ?`, owner, pubkey);
+    sql.exec(`UPDATE allowed_pubkeys SET invited_by = ? WHERE invited_by = ?`, newParent, pubkey);
     unallowPubkey(sql, pubkey, nowSec);
     return [pubkey];
   }
   const order = invitedSubtree(sql, pubkey, owner);
   for (const member of order) unallowPubkey(sql, member, nowSec);
   return order;
+}
+
+// Whether `pubkey` is somewhere below `ancestor` in the invite tree:
+// invited by them, or by someone they invited, and so on. Walks up from
+// `pubkey`, stopping at the owner, a missing inviter, a cycle or 64 steps.
+export function isBelow(sql: SqlStorage, ancestor: string, pubkey: string, owner: string | null): boolean {
+  const seen = new Set<string>([pubkey]);
+  let current = pubkey;
+  for (let step = 0; step < 64; step++) {
+    const parent = sql
+      .exec<{ invited_by: string | null }>(`SELECT invited_by FROM allowed_pubkeys WHERE pubkey = ?`, current)
+      .toArray()[0]?.invited_by;
+    if (!parent || seen.has(parent)) return false;
+    if (parent === ancestor) return true;
+    if (parent === owner) return false;
+    seen.add(parent);
+    current = parent;
+  }
+  return false;
 }
 
 // `pubkey` and everyone below it in the invite tree, breadth first,
@@ -2498,14 +2542,19 @@ export function redeemMemberInvite(
     code,
     nowSec,
   );
+  // Location trust: on when the owner or an admin made the code, off when
+  // a member did (schema.ts `allowed_pubkeys.close`).
+  const creator = invite.created_by ?? owner;
+  const close = creator === null || creator === owner || isAdmin(sql, creator) ? 1 : 0;
   sql.exec(
-    `INSERT INTO allowed_pubkeys (pubkey, reason, allowed_at, source, invited_by, via_code)
-       VALUES (?, 'joined with an invite', ?, 'member', ?, ?)
+    `INSERT INTO allowed_pubkeys (pubkey, reason, allowed_at, source, invited_by, via_code, close)
+       VALUES (?, 'joined with an invite', ?, 'member', ?, ?, ?)
        ON CONFLICT(pubkey) DO NOTHING`,
     pubkey,
     nowSec,
-    invite.created_by ?? owner,
+    creator,
     code,
+    close,
   );
   readmitFormerMember(sql, pubkey);
   return "joined";
@@ -2655,6 +2704,8 @@ export function addAdmin(sql: SqlStorage, pubkey: string, owner: string, nowSec:
   );
   readmitFormerMember(sql, pubkey);
   sql.exec(`INSERT INTO admins (pubkey, added_at) VALUES (?, ?) ON CONFLICT(pubkey) DO NOTHING`, pubkey, nowSec);
+  // An admin is close by default, as anyone the owner lets in is.
+  sql.exec(`UPDATE allowed_pubkeys SET close = 1 WHERE pubkey = ?`, pubkey);
 }
 
 // False if they were not an admin. Their membership stays.
@@ -2675,6 +2726,57 @@ export function listAdmins(sql: SqlStorage): { pubkey: string; addedAt: number }
 // myrole. "member" includes a member of the NIP-29 group `_`, as the
 // member gate always has.
 export type Role = "owner" | "admin" | "member" | "none";
+
+// ---------------------------------------------------------------------
+// Location trust (schema.ts `allowed_pubkeys.close`): who may see where
+// a member's photos were taken. On for people the owner or an admin let
+// in, and admins; off for people who came in on a member's code. The
+// owner and admins change it (setclose). It governs that one thing; every
+// member uses the box (storage, media) whatever it says.
+// ---------------------------------------------------------------------
+
+export function isClose(sql: SqlStorage, pubkey: string, owner: string | null): boolean {
+  if (owner !== null && pubkey === owner) return true;
+  return (
+    sql.exec<{ close: number }>(`SELECT close FROM allowed_pubkeys WHERE pubkey = ?`, pubkey).toArray()[0]
+      ?.close === 1
+  );
+}
+
+export type SetCloseOutcome = "ok" | "not-member" | "owner";
+
+export function setClose(sql: SqlStorage, pubkey: string, value: boolean, owner: string | null): SetCloseOutcome {
+  if (owner !== null && pubkey === owner) return "owner";
+  if (!isPubkeyAllowed(sql, pubkey)) return "not-member";
+  sql.exec(`UPDATE allowed_pubkeys SET close = ? WHERE pubkey = ?`, value ? 1 : 0, pubkey);
+  return "ok";
+}
+
+// For each asked pubkey: may the caller and it see each other's photo
+// locations? True only when both are close (the owner always is), so a
+// caller without the flag learns nothing. The asked pubkeys bind as one
+// json_each parameter.
+export function areClose(
+  sql: SqlStorage,
+  caller: string,
+  pubkeys: string[],
+  owner: string | null,
+): Record<string, boolean> {
+  const answer: Record<string, boolean> = Object.fromEntries(pubkeys.map((p) => [p, false]));
+  if (!isClose(sql, caller, owner)) return answer;
+  const close = new Set(
+    sql
+      .exec<{ pubkey: string }>(
+        `SELECT pubkey FROM allowed_pubkeys WHERE close = 1 AND pubkey IN (SELECT value FROM json_each(?))`,
+        JSON.stringify(pubkeys),
+      )
+      .toArray()
+      .map((r) => r.pubkey),
+  );
+  if (owner !== null) close.add(owner);
+  for (const p of pubkeys) answer[p] = close.has(p);
+  return answer;
+}
 
 export function roleOf(sql: SqlStorage, pubkey: string, owner: string | null): Role {
   if (owner !== null && pubkey === owner) return "owner";
@@ -2846,6 +2948,8 @@ export interface MemberDetails {
   source: string;
   // "admin" for a pubkey in `admins`, else "member".
   role: "admin" | "member";
+  // Location trust (schema.ts `allowed_pubkeys.close`).
+  close: boolean;
 }
 
 export interface RemovedMember {
@@ -2870,6 +2974,7 @@ export function memberKeys(
 ): {
   owner: string | null;
   members: string[];
+  admins: string[];
   removed: { pubkey: string; removedAt: number; deletesAt: number; reason: string }[];
 } {
   const members = sql
@@ -2888,7 +2993,14 @@ export function memberKeys(
       deletesAt: r.reason === "erased" ? r.removed_at : r.removed_at + graceSec,
       reason: r.reason,
     }));
-  return { owner, members, removed };
+  // Admins, sorted, for the account page's owner and admin views of disk
+  // use. Only ever seen by the storage service's key (memberkeys), so the
+  // admin list is still never public.
+  const admins = sql
+    .exec<{ pubkey: string }>(`SELECT pubkey FROM admins ORDER BY pubkey ASC`)
+    .toArray()
+    .map((r) => r.pubkey);
+  return { owner, members, admins, removed };
 }
 
 // When bothy stored each of these gift wraps (events.ingested_at), for
@@ -2896,10 +3008,18 @@ export function memberKeys(
 // the answer says nothing about anyone else's mail. The ids go in as one
 // JSON parameter (json_each), so 500 of them bind one parameter, not 500
 // (limits.ts MAX_QUERY_BOUND_PARAMS). One PK seek per id plus a tag check.
-export function mailTimes(sql: SqlStorage, recipient: string, ids: string[]): Record<string, number> {
+//
+// With `withSeq`, each value is {storedAt, seq} instead of a number: the
+// home's sequence number too (schema.ts events.seq).
+export function mailTimes(
+  sql: SqlStorage,
+  recipient: string,
+  ids: string[],
+  withSeq = false,
+): Record<string, number | { storedAt: number; seq: number | null }> {
   const rows = sql
-    .exec<{ id: string; ingested_at: number }>(
-      `SELECT e.id AS id, e.ingested_at AS ingested_at FROM events e
+    .exec<{ id: string; ingested_at: number; seq: number | null }>(
+      `SELECT e.id AS id, e.ingested_at AS ingested_at, e.seq AS seq FROM events e
         WHERE e.id IN (SELECT value FROM json_each(?)) AND e.kind = ? AND e.ingested_at IS NOT NULL
           AND EXISTS (SELECT 1 FROM event_tags t
                        WHERE t.event_id = e.id AND t.tag_name = 'p' AND t.tag_value = ?)`,
@@ -2908,7 +3028,22 @@ export function mailTimes(sql: SqlStorage, recipient: string, ids: string[]): Re
       recipient,
     )
     .toArray();
-  return Object.fromEntries(rows.map((r) => [r.id, r.ingested_at]));
+  return Object.fromEntries(
+    rows.map((r) => [r.id, withSeq ? { storedAt: r.ingested_at, seq: r.seq } : r.ingested_at]),
+  );
+}
+
+// Who is in the home, for any member to see (nip86.ts homemembers): every
+// member and the owner, as hex pubkeys, sorted. Nothing else about them.
+export function homeMemberPubkeys(sql: SqlStorage, owner: string | null): string[] {
+  const pubkeys = new Set(
+    sql
+      .exec<{ pubkey: string }>(`SELECT pubkey FROM allowed_pubkeys`)
+      .toArray()
+      .map((r) => r.pubkey),
+  );
+  if (owner !== null) pubkeys.add(owner);
+  return [...pubkeys].sort();
 }
 
 export function listMembers(
@@ -2917,8 +3052,8 @@ export function listMembers(
   owner: string,
 ): { members: MemberDetails[]; removed: RemovedMember[] } {
   const rows = sql
-    .exec<{ pubkey: string; invited_by: string | null; allowed_at: number; source: string }>(
-      `SELECT pubkey, invited_by, allowed_at, source FROM allowed_pubkeys ORDER BY allowed_at DESC`,
+    .exec<{ pubkey: string; invited_by: string | null; allowed_at: number; source: string; close: number }>(
+      `SELECT pubkey, invited_by, allowed_at, source, close FROM allowed_pubkeys ORDER BY allowed_at DESC`,
     )
     .toArray();
   const present = new Set(rows.map((r) => r.pubkey));
@@ -2931,6 +3066,7 @@ export function listMembers(
     joinedAt: r.allowed_at,
     source: r.source,
     role: admins.has(r.pubkey) ? ("admin" as const) : ("member" as const),
+    close: r.close === 1,
   }));
   const removed = sql
     .exec<{ pubkey: string; removed_at: number; reason: string }>(
