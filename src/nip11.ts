@@ -1,7 +1,9 @@
 // NIP-11 relay information document. List only what is actually
 // implemented and enforced, never ahead of it.
 
+import { GROUP_DECISIONS } from "./home-groups";
 import {
+  CALL_ICE_SERVERS,
   groupsEnabled,
   MAX_CREATED_AT_FUTURE_SECONDS,
   MAX_FILTER_LIMIT,
@@ -207,6 +209,24 @@ export function buildRelayInfo(
     // Sealed signals (relay.ts handleSignal, kind 21059), bothy's own
     // field: typing, seen and call setup, delivered live, never stored.
     info.signals = { v: 1 };
+    // 1:1 calls, bothy's own field: rings are accepted (relay.ts
+    // handleGiftWrap) and the ICE servers the apps build their call from
+    // (limits.ts CALL_ICE_SERVERS). Copied, so no caller can change the
+    // constant through the document.
+    info.calls = { v: 1, ice: CALL_ICE_SERVERS.map((server) => ({ urls: [...server.urls] })) };
+    // Private profiles (src/profiles.ts), bothy's own field: members'
+    // kind 0 is served only to this home's authenticated owner, admins and
+    // members, and members may store a sealed photo (octet-stream). An app
+    // publishes its profile here, and only here, when it sees this; an
+    // older bothy would serve it to anyone.
+    info.profiles = "members";
+    // History backup (nip86.ts backedup), bothy's own field: this home
+    // takes a member's "my backup holds my mail up to here", which mailbox
+    // retention waits for before deleting anything of theirs.
+    info.backup = { v: 1 };
+    // Home groups (src/home-groups.ts), bothy's own field. `keeper` is the
+    // box's key once a box keeps every group's keys; null until then.
+    info.groups = { v: 1, keeper: GROUP_DECISIONS.keeperIsStorage && stored.storageUrl && stored.storagePubkey ? stored.storagePubkey : null };
   }
   const contact = resolveContact(profile);
   if (contact) {

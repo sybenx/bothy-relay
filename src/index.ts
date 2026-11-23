@@ -8,10 +8,18 @@ import {
   secondsUntilUtcMidnight,
   VAULT_OPEN_FLOOR_MS,
 } from "./limits";
-import { extensionFor, sha256Hex, sniffPhotoType, verifyBlossomAuth } from "./photos";
+import {
+  extensionFor,
+  type PhotoType,
+  SEALED_PHOTO_TYPE,
+  sha256Hex,
+  sniffPhotoType,
+  verifyBlossomAuth,
+} from "./photos";
 import {
   ADMIN_CALLABLE_METHODS,
   ANYONE_CALLABLE_METHODS,
+  GUEST_PUSH_METHODS,
   MANAGEMENT_CONTENT_TYPE,
   MEMBER_CALLABLE_METHODS,
   NOT_A_MEMBER_REASON,
@@ -296,7 +304,7 @@ async function handleManagement(request: Request, env: Env): Promise<Response> {
   // included: it is a machine's read of the member list, not a person's.
   if (method !== null && STORAGE_CALLABLE_METHODS.includes(method)) {
     if (!(await relayStub(env).isStorageService(auth.pubkey))) {
-      return managementResponse({ error: STORAGE_ONLY_REASON }, 401);
+      return managementResponse({ error: method === "memberkeys" ? STORAGE_ONLY_REASON : `${method} is only for this home's box` }, 401);
     }
     return managementResponse(
       await relayStub(env).manage(call?.method, params, request.headers.get("CF-Connecting-IP") ?? "unknown", auth.pubkey),
@@ -318,7 +326,12 @@ async function handleManagement(request: Request, env: Env): Promise<Response> {
     const memberCallable = method !== null && MEMBER_CALLABLE_METHODS.includes(method);
     if (!adminCallable && !memberCallable) return managementResponse({ error: denial }, 401);
     const role = await relayStub(env).getRole(auth.pubkey);
-    const allowed = adminCallable ? role === "admin" : role === "admin" || role === "member";
+    let allowed = adminCallable ? role === "admin" : role === "admin" || role === "member";
+    // A home group's guest (on a group's roster here, not in the home) may
+    // register and drop their own devices, so the group can wake them.
+    if (!allowed && role === "none" && GUEST_PUSH_METHODS.includes(method!)) {
+      allowed = await relayStub(env).isGroupGuest(auth.pubkey);
+    }
     if (!allowed) {
       // A member's own methods refuse a non-member with their own reason:
       // this is how an app learns its user has lost their home here (a
@@ -496,18 +509,24 @@ async function routePhotos(request: Request, env: Env, url: URL): Promise<Respon
     const sha256 = await sha256Hex(bytes);
     const auth = verifyBlossomAuth(request.headers.get("Authorization"), "upload", sha256, nowSec());
     if (!auth.ok) return photoError(401, auth.reason);
-    const type = sniffPhotoType(bytes);
-    if (type === null) return photoError(415, "only JPEG, PNG and WebP photos are stored here");
+    const sniffed = sniffPhotoType(bytes);
     const claimed = request.headers.get("Content-Type")?.split(";")[0]?.trim().toLowerCase();
-    if (claimed && claimed !== "application/octet-stream" && claimed !== type) {
-      return photoError(415, `the bytes are ${type}, not ${claimed}`);
+    // Bytes that are no image are a sealed photo (photos.ts
+    // SEALED_PHOTO_TYPE) when sent as one; the Durable Object then takes
+    // them from members only.
+    const type: PhotoType | null = sniffed ?? (claimed === SEALED_PHOTO_TYPE ? SEALED_PHOTO_TYPE : null);
+    if (type === null) {
+      return photoError(415, "only JPEG, PNG and WebP photos are stored here");
+    }
+    if (sniffed !== null && claimed && claimed !== SEALED_PHOTO_TYPE && claimed !== sniffed) {
+      return photoError(415, `the bytes are ${sniffed}, not ${claimed}`);
     }
     const stored = await relayStub(env).uploadPhoto(auth.pubkey, sha256, type, bytes);
     if (stored.status !== 200) return photoError(stored.status, stored.reason);
     // BUD-02 blob descriptor.
     return new Response(
       JSON.stringify({
-        url: `${url.origin}/${sha256}.${extensionFor(type)}`,
+        url: `${url.origin}/${sha256}${extensionFor(type)}`,
         sha256,
         size: bytes.byteLength,
         type,

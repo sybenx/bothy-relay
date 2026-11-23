@@ -612,6 +612,16 @@ export const TABLES: readonly TableSpec[] = [
     columns: [col("pubkey", "TEXT PRIMARY KEY"), col("queued_at", "INTEGER NOT NULL")],
   },
   {
+    // Rings waiting to be announced (relay.ts drainCallPushes), one row
+    // per RECIPIENT, the same shape as `inbox_push` but a queue of its
+    // own: a ring is pushed at once rather than after the message
+    // coalescing delay, even to someone with a socket open, and must not
+    // be folded into (or delay) a message notification. Nothing about the
+    // ring is recorded, only who it is for and when it was queued.
+    name: "call_push",
+    columns: [col("pubkey", "TEXT PRIMARY KEY"), col("queued_at", "INTEGER NOT NULL")],
+  },
+  {
     // Member invite codes (nip86.ts createinvite/redeeminvite). Separate
     // from `group_invites`: those admit to a NIP-29 group, are created by a
     // signed kind-9009 and are single-use by construction; these make
@@ -729,6 +739,17 @@ export const TABLES: readonly TableSpec[] = [
       col("updated_at", "INTEGER NOT NULL"),
       col("last_used_at", "INTEGER"),
     ],
+  },
+  {
+    // History backup (nip86.ts backedup): per person, the latest stored
+    // time (`events.ingested_at`) of mail their app has verified its backup
+    // holds. Only ever moves forward, and never past the call's own time.
+    // Mailbox retention (storage.ts sweepRetention) deletes a member's mail
+    // only at or below it. Deleted by eraseme, and when the grace sweep
+    // finishes a removed member (storage.ts eraseMember, sweepFormerMembers);
+    // letting someone back in keeps it.
+    name: "backup_watermarks",
+    columns: [col("pubkey", "TEXT PRIMARY KEY"), col("mail_through", "INTEGER NOT NULL")],
   },
   {
     // "Removed on purpose" (storage.ts markRemovedOnPurpose): people the
@@ -849,6 +870,106 @@ export const TABLES: readonly TableSpec[] = [
       col("member_via_code", "TEXT"),
       col("member_close", "INTEGER"),
     ],
+  },
+  // ---------------------------------------------------------------------
+  // Home groups (src/home-groups.ts): the DMs app's groups with a group
+  // key. Separate from the NIP-29 tables above on purpose: their messages
+  // never enter `events`, so no public read path can ever see one, and
+  // what a reader gets is decided in one place (home-groups.ts).
+  // ---------------------------------------------------------------------
+  {
+    // One row per group: the roster's version (one per applied change),
+    // the current key epoch, and whether the key must change before the
+    // next message (a leave or a removal bothy made). `settings` is JSON
+    // {onlyAdminsAdd, history}.
+    name: "home_groups",
+    columns: [
+      col("gid", "TEXT PRIMARY KEY"),
+      col("version", "INTEGER NOT NULL"),
+      col("epoch", "INTEGER NOT NULL"),
+      col("needs_key", "INTEGER NOT NULL DEFAULT 0"),
+      col("settings", "TEXT NOT NULL"),
+      col("created_at", "INTEGER NOT NULL"),
+      col("created_by", "TEXT NOT NULL"),
+      // The keeper has every message through this home number (groupkept).
+      col("kept_seq", "INTEGER"),
+    ],
+  },
+  {
+    // Live join links per group: the sha256 of each code (the app keeps
+    // the code), made by an admin's signed link change.
+    name: "home_group_links",
+    columns: [
+      col("gid", "TEXT NOT NULL"),
+      col("hash", "TEXT NOT NULL"),
+      col("made_by", "TEXT NOT NULL"),
+      col("version", "INTEGER NOT NULL"),
+    ],
+    tableConstraints: ["PRIMARY KEY (gid, hash)"],
+  },
+  {
+    // Who is in each group now. `from_seq`: the first home number this
+    // member may read (the change that added them). `role` is 'admin' or
+    // 'member'.
+    name: "home_group_members",
+    columns: [
+      col("gid", "TEXT NOT NULL"),
+      col("pubkey", "TEXT NOT NULL"),
+      col("role", "TEXT NOT NULL"),
+      col("from_seq", "INTEGER NOT NULL"),
+      col("joined_at", "INTEGER NOT NULL"),
+      // The key epoch when they came in, and whether they still wait for
+      // its envelope (a link join, until the keeper or a member seals it).
+      col("join_epoch", "INTEGER NOT NULL DEFAULT 1"),
+      col("pending_key", "INTEGER NOT NULL DEFAULT 0"),
+    ],
+    tableConstraints: ["PRIMARY KEY (gid, pubkey)"],
+  },
+  {
+    // Each member's envelope of each key epoch: the key sealed by `from`
+    // to `member`. Kept while the member is in the group.
+    name: "home_group_keys",
+    columns: [
+      col("gid", "TEXT NOT NULL"),
+      col("epoch", "INTEGER NOT NULL"),
+      col("member", "TEXT NOT NULL"),
+      col("from_key", "TEXT NOT NULL"),
+      col("blob", "TEXT NOT NULL"),
+    ],
+    tableConstraints: ["PRIMARY KEY (gid, member, epoch)"],
+  },
+  {
+    // Group traffic in the home's running order: sealed messages (kind
+    // 1490, throwaway signer, `sender` = the authenticated member) and the
+    // roster's signed changes (kind 1491, `version` set). `seq` comes from
+    // the same counter as gift wraps (mail_usage `*`), so it is the home's
+    // one running number. `bytes` is what the sender was charged.
+    name: "home_group_events",
+    columns: [
+      col("seq", "INTEGER PRIMARY KEY"),
+      col("gid", "TEXT NOT NULL"),
+      col("id", "TEXT NOT NULL"),
+      col("kind", "INTEGER NOT NULL"),
+      col("sender", "TEXT NOT NULL"),
+      col("version", "INTEGER"),
+      col("stored_at", "INTEGER NOT NULL"),
+      col("bytes", "INTEGER NOT NULL"),
+      col("event", "TEXT NOT NULL"),
+    ],
+  },
+  {
+    // People who left or were removed, so their app can say "Ben removed
+    // you" (mygroups). Pruned after 30 days.
+    name: "home_group_former",
+    columns: [
+      col("gid", "TEXT NOT NULL"),
+      col("pubkey", "TEXT NOT NULL"),
+      col("by_key", "TEXT NOT NULL"),
+      col("op", "TEXT NOT NULL"),
+      col("version", "INTEGER NOT NULL"),
+      col("at", "INTEGER NOT NULL"),
+    ],
+    tableConstraints: ["PRIMARY KEY (gid, pubkey)"],
   },
   {
     // Call presence (push.ts CALL_PRESENCE_KIND): one row per pubkey, holding
@@ -1221,6 +1342,23 @@ export const INDEXES: readonly IndexSpec[] = [
   {
     name: "idx_push_subscriptions_pubkey",
     table: "push_subscriptions",
+    keyColumns: ["pubkey"],
+  },
+  // Home groups (src/home-groups.ts): a group's traffic in order
+  // (groupsince, lastSeq), a member's groups (mygroups), a duplicate id.
+  {
+    name: "idx_home_group_events_gid",
+    table: "home_group_events",
+    keyColumns: ["gid", "seq"],
+  },
+  {
+    name: "idx_home_group_events_id",
+    table: "home_group_events",
+    keyColumns: ["id"],
+  },
+  {
+    name: "idx_home_group_members_pubkey",
+    table: "home_group_members",
     keyColumns: ["pubkey"],
   },
   {

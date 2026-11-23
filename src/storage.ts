@@ -19,6 +19,8 @@ import {
 import {
   CHAT_BACKLOG_SECONDS,
   CONVERSATION_IDLE_SECONDS,
+  MAIL_RETENTION_SECONDS,
+  MAX_CREATED_AT_FUTURE_SECONDS,
   MAX_WRAP_RECIPIENTS_CHECKED,
   MEMBER_REMOVAL_GRACE_SECONDS,
 } from "./limits";
@@ -1527,6 +1529,9 @@ export interface ReadOptions {
   // See FilterQueryOptions.groupIds. `undefined` is the owner, who reads
   // every group; an empty array is a reader who may read none.
   groupIds?: readonly string[];
+  // See FilterQueryOptions.hideMemberProfiles. Omitted for the owner and
+  // admins.
+  hideMemberProfiles?: FilterQueryOptions["hideMemberProfiles"];
 }
 
 export function queryFilter(
@@ -1546,6 +1551,9 @@ export function queryFilter(
     // Dropping `groupIds` lets a member of one group read every group
     // (test/nip29-groups.test.ts).
     ...(options.groupIds === undefined ? {} : { groupIds: options.groupIds }),
+    // Dropping this one hands members' profiles to strangers
+    // (test/private-profiles.test.ts).
+    ...(options.hideMemberProfiles === undefined ? {} : { hideMemberProfiles: options.hideMemberProfiles }),
     scope,
     // Split the tag scan budget across partitions, so an authorised read
     // costs what limits.ts priced, not twice it.
@@ -1779,7 +1787,16 @@ export function getStoredWritePolicy(sql: SqlStorage): string | null {
 // An empty string clears the stored value: NIP-86 has no unset operation,
 // so this is bothy's convention (README.md "Relay management API"). A
 // stored "" would shadow the kind-0 and default rungs forever.
-export type RelaySettingKey = "name" | "description" | "icon" | "write_policy" | "storage_url" | "storage_pubkey";
+// 'mail_retention' is "on" while the owner has mailbox retention on
+// (nip86.ts setretention); absent means off.
+export type RelaySettingKey =
+  | "name"
+  | "description"
+  | "icon"
+  | "write_policy"
+  | "storage_url"
+  | "storage_pubkey"
+  | "mail_retention";
 
 // The storage service's pubkey alone, for the memberkeys gate.
 export function storagePubkey(sql: SqlStorage): string | null {
@@ -2404,6 +2421,7 @@ export function unallowPubkey(
   sql.exec(`DELETE FROM push_subscriptions WHERE pubkey = ?`, pubkey);
   sql.exec(`DELETE FROM fcm_tokens WHERE pubkey = ?`, pubkey);
   sql.exec(`DELETE FROM inbox_push WHERE pubkey = ?`, pubkey);
+  sql.exec(`DELETE FROM call_push WHERE pubkey = ?`, pubkey);
   sql.exec(
     `INSERT INTO former_members (pubkey, removed_at, reason, member_reason, member_allowed_at, member_source,
                                  member_invited_by, member_via_code, member_close)
@@ -2487,10 +2505,14 @@ export function eraseMember(
   }
   sql.exec(`DELETE FROM photos WHERE pubkey = ?`, pubkey);
   sql.exec(`DELETE FROM photo_uploads WHERE pubkey = ?`, pubkey);
+  // Their profile, which only the home could read (deleteProfilesOf).
+  deleteProfilesOf(sql, pubkey);
   sql.exec(`DELETE FROM join_requests WHERE pubkey = ?`, pubkey);
   sql.exec(`DELETE FROM group_membership WHERE pubkey = ?`, pubkey);
   // Their restore vault rows (src/vault.ts).
   deleteVaultRowsOf(sql, pubkey);
+  // Their history backup watermark: nothing of theirs is left to retain.
+  deleteBackupWatermark(sql, pubkey);
   unallowPubkey(sql, pubkey, nowSec, "erased");
   return deleted;
 }
@@ -2557,6 +2579,30 @@ export function isPubkeyAllowed(sql: SqlStorage, pubkey: string): boolean {
 // per recipient, bounded by limits.ts MAX_WRAP_RECIPIENTS_CHECKED.
 export function isMember(sql: SqlStorage, pubkey: string): boolean {
   return isPubkeyAllowed(sql, pubkey);
+}
+
+// Removed and still in the 14-day grace (or erased and not yet swept).
+// One PK seek.
+export function isFormerMember(sql: SqlStorage, pubkey: string): boolean {
+  return sql.exec(`SELECT 1 FROM former_members WHERE pubkey = ?`, pubkey).toArray().length > 0;
+}
+
+// Deletes every profile (kind 0) this pubkey has stored here, in either
+// partition. Private profiles (README "Private profiles"): a member's
+// kind 0 is readable only inside the home, so when they leave for good
+// (eraseme, or the end of the removal grace) it goes, rather than turning
+// public the moment the gate stops covering them. A replaceable kind, so
+// normally one row.
+export function deleteProfilesOf(sql: SqlStorage, pubkey: string): number {
+  // Per partition, so each half is an index seek on its own partial
+  // index (schema.ts idx_events_pubkey_kind_created_*).
+  const ids = acrossScopes((scope) =>
+    sql
+      .exec<{ id: string }>(`SELECT id FROM events WHERE pubkey = ? AND kind = 0 AND is_group = ?`, pubkey, scope)
+      .toArray(),
+  );
+  for (const { id } of ids) deleteEventRow(sql, id);
+  return ids.length;
 }
 
 // For NIP-11 and /api/stats. Reads M rows; M is the size of a friend group.
@@ -3480,12 +3526,187 @@ export function sweepFormerMembers(
       // Their profile photo goes with their mail (src/photos.ts).
       sql.exec(`DELETE FROM photos WHERE pubkey = ?`, pubkey);
       sql.exec(`DELETE FROM photo_uploads WHERE pubkey = ?`, pubkey);
+      // And their profile, before the gate stops covering it
+      // (deleteProfilesOf).
+      deleteProfilesOf(sql, pubkey);
       // So do their restore vault rows, read-only until now (src/vault.ts).
       deleteVaultRowsOf(sql, pubkey);
+      // And their backup watermark, kept through the grace so letting
+      // them back in resumes retention where it was.
+      deleteBackupWatermark(sql, pubkey);
       finished++;
     }
   }
   return { removed, finished };
+}
+
+// ---------------------------------------------------------------------
+// History backup and mailbox retention (nip86.ts backedup, setretention,
+// getretention; limits.ts MAIL_RETENTION_SECONDS and the sweep's caps).
+//
+// A member's app backs their history up to the home's file server, checks
+// the backup, then calls `backedup` with the latest stored time it holds.
+// With retention on, the hourly tick deletes mail that is both older than
+// 30 days and at or below every recipient's watermark. A member who never
+// backs up keeps all their mail, as before retention existed.
+// ---------------------------------------------------------------------
+
+// nip86.ts backedup: moves `pubkey`'s watermark forward to `mailThrough`,
+// clamped to `nowSec` (a backup cannot hold mail stored after the call),
+// and never back. Returns the stored value. Writes only when it moves.
+export function recordBackedUp(sql: SqlStorage, pubkey: string, mailThrough: number, nowSec: number): number {
+  const wanted = Math.min(mailThrough, nowSec);
+  const current = sql
+    .exec<{ mail_through: number }>(`SELECT mail_through FROM backup_watermarks WHERE pubkey = ?`, pubkey)
+    .toArray()[0]?.mail_through;
+  if (current !== undefined && current >= wanted) return current;
+  sql.exec(
+    `INSERT INTO backup_watermarks (pubkey, mail_through) VALUES (?, ?)
+       ON CONFLICT(pubkey) DO UPDATE SET mail_through = MAX(mail_through, excluded.mail_through)`,
+    pubkey,
+    wanted,
+  );
+  return wanted;
+}
+
+export function deleteBackupWatermark(sql: SqlStorage, pubkey: string): void {
+  sql.exec(`DELETE FROM backup_watermarks WHERE pubkey = ?`, pubkey);
+}
+
+// Current members with a watermark, for the owner's getretention: how many
+// of them retention can act for. The owner's own watermark, if any, is not
+// counted (their mail is never deleted).
+export function backedUpMemberCount(sql: SqlStorage): number {
+  return (
+    sql
+      .exec<{ n: number }>(
+        `SELECT COUNT(*) AS n FROM backup_watermarks w JOIN allowed_pubkeys a ON a.pubkey = w.pubkey`,
+      )
+      .toArray()[0]?.n ?? 0
+  );
+}
+
+// The owner's switch (nip86.ts setretention). Off unless set.
+export function mailRetentionOn(sql: SqlStorage): boolean {
+  return (
+    sql
+      .exec<{ value: string }>(`SELECT value FROM relay_settings WHERE key = 'mail_retention'`)
+      .toArray()[0]?.value === "on"
+  );
+}
+
+// Whether this home has a back room that members' history backups can go
+// to, which retention needs before it may delete anything
+// (docs/r2-backroom.md "Retention depends on it"). Today that is the file
+// server alone (setstorage sets its URL and key together). The R2 back
+// room, when it exists, joins here as a second way to answer true; every
+// caller (setretention, getretention, the sweep) asks this one function.
+export function hasBackRoom(sql: SqlStorage): boolean {
+  return (
+    (sql
+      .exec<{ n: number }>(
+        `SELECT COUNT(*) AS n FROM relay_settings WHERE key IN ('storage_url', 'storage_pubkey')`,
+      )
+      .toArray()[0]?.n ?? 0) === 2
+  );
+}
+
+export interface RetentionSweep {
+  // Wraps deleted this tick.
+  removed: number;
+  // False when the tick stopped at its cap with more maybe due.
+  done: boolean;
+}
+
+// One tick of mailbox retention. Deletes a stored gift wrap only when all
+// of these hold, every one checked here, now:
+//
+//   1. the owner turned retention on (mailRetentionOn), and
+//   2. a back room is set (hasBackRoom), so clearing the file server stops
+//      deletion at the next tick without touching the switch, and
+//   3. no recipient is the owner, and
+//   4. it was stored (`ingested_at`) more than MAIL_RETENTION_SECONDS ago,
+//      and
+//   5. every recipient (every `p` on the wrap) is a current member whose
+//      watermark is at or past when it was stored.
+//
+// Rule 5 means a member with no watermark keeps all their mail, and so
+// does anyone they share a wrap with. Someone removed is not a current
+// member, so retention leaves their mail alone through the 14-day grace;
+// the grace sweep (sweepFormerMembers) then deletes it. A wrap stored
+// before `ingested_at` existed (NULL) has no stored time and is kept.
+//
+// Reads: per member with a watermark, one range of their `p` rows on
+// idx_event_tags_lookup_*, bounded by `created_at` <= cutoff +
+// MAX_CREATED_AT_FUTURE_SECONDS. Every stored event's `created_at` is at
+// most that far past when it was stored (relay.ts refuses later ones), so
+// the bound loses no wrap that rule 4 and 5 allow, and the range holds
+// little more than what is due: mail newer than the cutoff, which is most
+// of a mailbox, is never read. A member with nothing due costs one seek.
+//
+// Writes: at most `limit` wraps, each through deleteEventRow, so the
+// mailbox byte counts (`mail_usage`) fall with every delete as they do for
+// every other removal. relay.ts runs it only while the day's rows written
+// leave real mail its half (limits.ts RETENTION_PAUSE_AT_ROWS_WRITTEN).
+export function sweepRetention(
+  sql: SqlStorage,
+  nowSec: number,
+  owner: string | null,
+  limit: number,
+): RetentionSweep {
+  if (owner === null || limit <= 0 || !mailRetentionOn(sql) || !hasBackRoom(sql)) {
+    return { removed: 0, done: true };
+  }
+  // Stored at or before this second is more than MAIL_RETENTION_SECONDS old.
+  const oldEnough = nowSec - MAIL_RETENTION_SECONDS - 1;
+  const holders = sql
+    .exec<{ pubkey: string; mail_through: number }>(
+      `SELECT w.pubkey AS pubkey, w.mail_through AS mail_through
+         FROM backup_watermarks w JOIN allowed_pubkeys a ON a.pubkey = w.pubkey
+        WHERE w.pubkey != ? ORDER BY w.pubkey`,
+      owner,
+    )
+    .toArray();
+  let removed = 0;
+  let done = true;
+  for (const holder of holders) {
+    const left = limit - removed;
+    if (left <= 0) {
+      done = false;
+      break;
+    }
+    const cutoff = Math.min(holder.mail_through, oldEnough);
+    const targets = acrossScopes((scope) =>
+      sql
+        .exec<{ id: string }>(
+          `SELECT e.id AS id FROM event_tags t JOIN events e ON e.id = t.event_id
+            WHERE t.is_group = ? AND t.tag_name = 'p' AND t.tag_value = ? AND t.created_at <= ?
+              AND e.kind = ? AND e.ingested_at IS NOT NULL AND e.ingested_at <= ?
+              AND NOT EXISTS (
+                SELECT 1 FROM event_tags o
+                 WHERE o.event_id = e.id AND o.tag_name = 'p'
+                   AND (o.tag_value = ?
+                        OR NOT EXISTS (
+                          SELECT 1 FROM backup_watermarks w JOIN allowed_pubkeys a ON a.pubkey = w.pubkey
+                           WHERE w.pubkey = o.tag_value AND w.mail_through >= e.ingested_at))
+              )
+            LIMIT ?`,
+          scope,
+          holder.pubkey,
+          cutoff + MAX_CREATED_AT_FUTURE_SECONDS,
+          GIFT_WRAP_KIND,
+          cutoff,
+          owner,
+          left,
+        )
+        .toArray(),
+    );
+    const batch = targets.slice(0, left);
+    for (const target of batch) deleteEventRow(sql, target.id);
+    removed += batch.length;
+    if (targets.length >= left) done = false;
+  }
+  return { removed, done };
 }
 
 // ---------------------------------------------------------------------
@@ -3725,6 +3946,28 @@ export function pendingInboxPushes(sql: SqlStorage, limit: number): string[] {
 
 export function clearInboxPush(sql: SqlStorage, pubkey: string): void {
   sql.exec(`DELETE FROM inbox_push WHERE pubkey = ?`, pubkey);
+}
+
+// The ring push queue (schema.ts `call_push`), the same three calls. Two
+// rings to one person before the alarm runs are one push: the phone
+// fetches every ring waiting for it when it wakes.
+export function queueCallPush(sql: SqlStorage, pubkey: string, nowSec: number): void {
+  sql.exec(
+    `INSERT INTO call_push (pubkey, queued_at) VALUES (?, ?) ON CONFLICT(pubkey) DO NOTHING`,
+    pubkey,
+    nowSec,
+  );
+}
+
+export function pendingCallPushes(sql: SqlStorage, limit: number): string[] {
+  return sql
+    .exec<{ pubkey: string }>(`SELECT pubkey FROM call_push ORDER BY queued_at ASC, pubkey ASC LIMIT ?`, limit)
+    .toArray()
+    .map((row) => row.pubkey);
+}
+
+export function clearCallPush(sql: SqlStorage, pubkey: string): void {
+  sql.exec(`DELETE FROM call_push WHERE pubkey = ?`, pubkey);
 }
 
 export function markPushEndpointOk(sql: SqlStorage, endpoint: string, nowSec: number): void {

@@ -105,16 +105,22 @@ describe("sealed signals", () => {
     const bob = await newMember();
     const stranger = await connectAs(randomKeypair());
     const anonymous = await connectAs(null);
-    for (const conn of [stranger, anonymous]) {
-      const event = signal(bob.pubkeyHex);
-      expect(await publish(conn, event)).toEqual([
-        "OK",
-        event.id,
-        false,
-        "restricted: signals are for this home's members; authenticate first",
-      ]);
-      conn.close();
-    }
+    const event = signal(bob.pubkeyHex);
+    expect(await publish(stranger, event)).toEqual(["OK", event.id, false, "restricted: signals are for this home's members"]);
+    // Not authenticated yet: a challenge and auth-required, so the client authenticates and sends it again.
+    const early = signal(bob.pubkeyHex);
+    anonymous.send(["EVENT", early]);
+    expect((await anonymous.nextMessage())[0]).toBe("AUTH");
+    expect(await anonymous.nextMessage()).toEqual(["OK", early.id, false, "auth-required: signals are for this home's members"]);
+    for (const conn of [stranger, anonymous]) conn.close();
+  });
+
+  it("ask an unauthenticated subscription to authenticate", async () => {
+    const anonymous = await connectAs(null);
+    anonymous.send(["REQ", "s", { kinds: [SIGNAL_KIND], "#p": [randomKeypair().pubkeyHex] }]);
+    expect((await anonymous.nextMessage())[0]).toBe("AUTH");
+    expect(await anonymous.nextMessage()).toEqual(["CLOSED", "s", "auth-required: authentication required to read signals"]);
+    anonymous.close();
   });
 
   it("are refused when addressed to nobody in the home, or too big", async () => {
@@ -122,7 +128,12 @@ describe("sealed signals", () => {
     const conn = await connectAs(alice);
     const nobody = signal(randomKeypair().pubkeyHex);
     expect((await publish(conn, nobody))[2]).toBe(false);
-    const big = signal(alice.pubkeyHex, "x".repeat(SIGNAL_MAX_BYTES));
+    // Exactly at the cap goes through: call setup carries SDP.
+    const overhead = JSON.stringify(signal(alice.pubkeyHex, "")).length;
+    const full = signal(alice.pubkeyHex, "x".repeat(SIGNAL_MAX_BYTES - overhead));
+    expect(JSON.stringify(full).length).toBe(SIGNAL_MAX_BYTES);
+    expect(await publish(conn, full)).toEqual(["OK", full.id, true, ""]);
+    const big = signal(alice.pubkeyHex, "x".repeat(SIGNAL_MAX_BYTES - overhead + 1));
     expect(await publish(conn, big)).toEqual([
       "OK",
       big.id,

@@ -83,10 +83,36 @@ export const MAX_GIFT_WRAPS_PER_IP_PER_WINDOW = 5;
 // receipts and call setup. Never stored, so they cost no rows; this
 // bounds the fan-out work. Counted per authenticated sender, apart from
 // the gift wrap limit above: 120 a minute is typing every few seconds plus
-// seen receipts in a 20-person group. Each is at most 2KB on the wire.
+// seen receipts in a 20-person group. Each is at most 16KB on the wire,
+// because call setup carries an SDP answer or an ICE restart offer.
 export const SIGNAL_RATE_LIMIT_WINDOW_MS = 60_000;
 export const MAX_SIGNALS_PER_SENDER_PER_WINDOW = 120;
-export const SIGNAL_MAX_BYTES = 2048;
+export const SIGNAL_MAX_BYTES = 16 * 1024;
+
+// Rings (relay.ts handleGiftWrap): a kind 1059 wrap with an outer
+// `["ring"]` tag, the call invite. Stored like any wrap, so the callee's
+// phone can fetch it after the push wakes it, but short-lived: it must
+// carry a NIP-40 expiration no more than RING_MAX_TTL_SECONDS ahead, and
+// the wrap_expiry sweep removes it. Rings skip the 5-a-minute gift wrap
+// limit above (a call that rings, is cancelled and rings again is normal)
+// and have their own two limits instead: per address, and per recipient,
+// which is what stops a stranger from waking one phone in a loop. Size is
+// MAX_EVENT_BYTES like any wrap: an SDP offer sealed twice is well under it.
+export const RING_MAX_TTL_SECONDS = 120;
+export const RING_RATE_LIMIT_WINDOW_MS = 60_000;
+export const MAX_RINGS_PER_IP_PER_WINDOW = 10;
+export const MAX_RINGS_PER_RECIPIENT_PER_WINDOW = 6;
+
+// The ICE servers a home offers its members' calls, on NIP-11 `calls`.
+// The owner's open decision (calls.md question 6): Google's and
+// Cloudflare's public STUN for now, which learn a caller's address but
+// carry no media. A TURN entry, with a member-only `turnpass` management
+// call returning short-lived TURN REST credentials, is a later step and
+// is not built.
+export const CALL_ICE_SERVERS: readonly { readonly urls: readonly string[] }[] = [
+  { urls: ["stun:stun.l.google.com:19302"] },
+  { urls: ["stun:stun.cloudflare.com:3478"] },
+];
 
 // ---------------------------------------------------------------------
 // NIP-29 invites (src/nip29.ts). An invite code is a bearer token: the
@@ -1035,8 +1061,9 @@ export const MAX_FCM_TOKENS_PER_PUBKEY = 4;
 // How long a push service may hold an undeliverable notification (RFC
 // 8030 TTL). A message stays true for the hour; "somebody is in the call"
 // stops being true when they leave, so a voice notification older than
-// five minutes would announce an empty room.
-export const PUSH_TTL_SECONDS = { message: 3600, voice: 300 } as const;
+// five minutes would announce an empty room. A ring stops being true when
+// it stops ringing, so a call push lives 30 seconds.
+export const PUSH_TTL_SECONDS = { message: 3600, voice: 300, call: 30 } as const;
 
 // RFC 8188 record size, written into the body header. One record; the
 // payload is a room name and one word, so this sits well clear of the
@@ -1134,6 +1161,39 @@ export const VANISH_BATCH_SIZE = Math.max(
   1,
   Math.floor(VANISH_ROWS_SHARE_LIMIT / (eventRemovalBudget(TAGS_PER_REAL_EVENT) * CRON_TICKS_PER_DAY)),
 );
+
+// ---------------------------------------------------------------------
+// Mailbox retention (storage.ts sweepRetention, nip86.ts setretention and
+// backedup). Off by default. When the owner turns it on, the hourly tick
+// deletes a stored gift wrap once it is older than MAIL_RETENTION_SECONDS
+// AND every recipient's app has verified a history backup that holds it
+// (their `backedup` watermark). Every number the sweep uses is here.
+// ---------------------------------------------------------------------
+
+// How old mail must be before retention may delete it, by when this relay
+// stored it (`events.ingested_at`): more than 30 days.
+export const MAIL_RETENTION_SECONDS = 30 * 24 * 60 * 60;
+
+// Retention's share of the daily rows-written ceiling, a quarter, as the
+// vanish drain's. A first run on a full home has months of mail to clear,
+// so unlike the expiry sweep (GIFT_WRAP_SWEEP_BATCH_SIZE) it cannot lean on
+// "never more than a day's ingest": it gets a share and drains across days.
+export const RETENTION_ROWS_SHARE_LIMIT = DAILY_ROWS_WRITTEN_LIMIT / 4;
+
+// Wraps one tick may delete: the share spread over the day's ticks, paced
+// against the pessimistic removal figure (schema.ts eventRemovalBudget),
+// about 57 a tick or 1,380 a day at the defaults. Never zero, so a tick
+// always makes progress.
+export const RETENTION_SWEEP_BATCH_SIZE = Math.max(
+  1,
+  Math.floor(RETENTION_ROWS_SHARE_LIMIT / (eventRemovalBudget(TAGS_PER_GIFT_WRAP) * CRON_TICKS_PER_DAY)),
+);
+
+// Retention never spends the second half of a day's rows written: a tick
+// that finds this many already written since 00:00 UTC deletes nothing
+// and waits for the next, so new mail always has room. The same half
+// backfill leaves for live traffic (BACKFILL_ROWS_SHARE_LIMIT).
+export const RETENTION_PAUSE_AT_ROWS_WRITTEN = DAILY_ROWS_WRITTEN_LIMIT / 2;
 
 // ---------------------------------------------------------------------
 // Ephemeral group chat (storage.ts sweepChat, relay.ts runCron). Kind-9

@@ -28,6 +28,10 @@ import {
   getRelaySettings,
   eraseMember,
   listInvitees,
+  backedUpMemberCount,
+  hasBackRoom,
+  mailRetentionOn,
+  recordBackedUp,
   addOwnKey,
   clearRemovalMark,
   markRemovedOnPurpose,
@@ -91,6 +95,7 @@ import {
   JOIN_REQUEST_TTL_SECONDS,
   MAX_PENDING_JOIN_REQUESTS,
   ERASE_MAIL_BATCH,
+  MAIL_RETENTION_SECONDS,
   mailBytesPerMember,
   mailStorageBytes,
   MEMBER_REMOVAL_GRACE_SECONDS,
@@ -104,6 +109,7 @@ import {
 import { sqlitePhotoStore } from "./photos";
 import { deleteVaultRow, isVaultHash, listVaultRows, parseVaultPut, storeVaultRow } from "./vault";
 import { GROUPS_PAUSED_MESSAGE } from "./nip29";
+import { HOME_GROUP_METHODS, KEEPER_METHODS, handleGroupCall, removeFromAllGroups, type GroupOutboxEntry } from "./home-groups";
 import { pushConfigured } from "./push";
 import { fcmConfigured } from "./fcm";
 import { joinRequestMessage, oneLine } from "./join-requests";
@@ -138,6 +144,14 @@ export interface ManagementResponse {
   // manage() must also deliver (live subscriptions, push) and then strip
   // before answering. Today only requestjoin's message to the owner.
   outbox?: NostrEvent[];
+  // Home groups (src/home-groups.ts): groupchange's current version on a
+  // conflict, sent to the caller beside `error`.
+  version?: number;
+  // Not part of the response either: group changes relay.ts manage() must
+  // deliver to the group's live subscriptions and wake its members for.
+  groupOutbox?: GroupOutboxEntry[];
+  // Not part of the response: people to wake with nothing to deliver.
+  wake?: string[];
 }
 
 // Exactly the methods implemented below, and the value supportedmethods
@@ -237,6 +251,25 @@ export const SUPPORTED_METHODS = [
   "forgetremoval",
   // bothy's own: listmembers' rows for the caller's own branch.
   "myinvitees",
+  // bothy's own: history backup and mailbox retention. backedup is a
+  // member's app saying its verified backup holds their mail up to a
+  // stored time; setretention and getretention are the owner's switch.
+  "backedup",
+  "setretention",
+  "getretention",
+  // bothy's own: home groups (src/home-groups.ts), the DMs app's groups
+  // with a group key.
+  "groupcreate",
+  "groupchange",
+  "groupinfo",
+  "mygroups",
+  "groupkeys",
+  "groupleave",
+  "groupsince",
+  "groupjoin",
+  "groupseal",
+  "keepergroups",
+  "groupkept",
 ] as const;
 
 // The methods a MEMBER may call, not just the owner.
@@ -274,6 +307,10 @@ export const MEMBER_CALLABLE_METHODS: readonly string[] = [
   "vaultdelete",
   "addmykey",
   "myinvitees",
+  "backedup",
+  // Starting a home group is for people in the home; the other group calls
+  // are for anyone on a group's roster, guests included (ANYONE_CALLABLE).
+  "groupcreate",
 ];
 
 // The methods that take NO signature, an exception to NIP-86's NIP-98
@@ -296,11 +333,22 @@ export const UNSIGNED_METHODS: readonly string[] = ["vaultchallenge", "vaultopen
 // The one method the storage service's key may call (setstorage), and the
 // only key that may call it: not the owner, not a member. index.ts checks
 // the signer against the stored pubkey before dispatch.
-export const STORAGE_CALLABLE_METHODS: readonly string[] = ["memberkeys"];
+export const STORAGE_CALLABLE_METHODS: readonly string[] = ["memberkeys", ...KEEPER_METHODS];
 
 export const STORAGE_ONLY_REASON = "memberkeys is only for this relay's storage service";
 
-export const ANYONE_CALLABLE_METHODS: readonly string[] = ["redeeminvite", "requestjoin", "myrole"];
+export const ANYONE_CALLABLE_METHODS: readonly string[] = [
+  "redeeminvite",
+  "requestjoin",
+  "myrole",
+  // Home groups: each checks the signer is on that group's roster
+  // (home-groups.ts), so a guest from another home can use their groups.
+  ...HOME_GROUP_METHODS.filter((m) => m !== "groupcreate" && !KEEPER_METHODS.includes(m)),
+];
+
+// The push methods a group guest (on a home group's roster here, not a
+// member of the home) may call too, so their phone is woken for the group.
+export const GUEST_PUSH_METHODS: readonly string[] = ["subscribepush", "unsubscribepush", "subscribefcm", "unsubscribefcm"];
 
 // The methods an ADMIN may call besides the member's own: running the
 // member list, invites and join requests. Everything else stays with the
@@ -376,6 +424,16 @@ export const MAX_MAILTIMES_IDS = 500;
 
 // Pubkeys one areclose call may ask about.
 export const MAX_ARECLOSE_PUBKEYS = 500;
+
+// What backedup and setretention answer to a call they cannot take.
+// Stable: apps may show them or match them, and every refusal the two
+// give starts with the method's name.
+export const BACKEDUP_PARAM_MESSAGE =
+  "backedup: it takes [mailThrough], the latest stored time your backup holds, as whole unix seconds";
+export const SETRETENTION_PARAM_MESSAGE = "setretention: it takes true or false";
+export const RETENTION_NEEDS_STORAGE_MESSAGE =
+  "setretention: this home has no file server for your members' history backups, and old messages " +
+  "are deleted only once a backup holds them. Connect one with setstorage first.";
 
 // A member who is neither the owner nor an admin: the caller whose view
 // of invites is limited to their own.
@@ -655,6 +713,10 @@ export function handleManagementCall(
     return err(GROUPS_PAUSED_MESSAGE.replace(/^restricted: /, ""));
   }
 
+  if (HOME_GROUP_METHODS.includes(method)) {
+    return handleGroupCall(sql, getOwnerPubkey(sql, env), method, params, signer, nowSec);
+  }
+
   switch (method) {
     case "supportedmethods":
       return { result: supportedMethods(env) };
@@ -689,7 +751,8 @@ export function handleManagementCall(
         return err("banpubkey: the relay owner's own pubkey can never be banned");
       }
       banPubkey(sql, pubkey, optionalReason(params, 1), nowSec);
-      return { result: true };
+      // Cut off: out of every home group too (home-groups.ts GROUP_DECISIONS).
+      return { result: true, groupOutbox: removeFromAllGroups(sql, getOwnerPubkey(sql, env), [pubkey], "cutoff", nowSec) };
     }
 
     case "unbanpubkey": {
@@ -772,17 +835,22 @@ export function handleManagementCall(
       // not bring any of these keys back until they are let back in
       // (storage.ts markRemovedOnPurpose).
       if (!byMember) markRemovedOnPurpose(sql, removed, nowSec);
-      if (removed.length === 0 || invited === 0) return { result: true };
+      // Cut off from the home: out of its home groups too (home-groups.ts
+      // GROUP_DECISIONS.cutOffLeavesGroups).
+      const groupOutbox = removeFromAllGroups(sql, owner, removed, "cutoff", nowSec);
+      if (removed.length === 0 || invited === 0) return { result: true, groupOutbox };
       if (choice === "remove") {
         const others = removed.length - 1;
         return {
           result: true,
+          groupOutbox,
           error: `Also removed ${others === 1 ? "1 person" : `${others} people`} they invited, directly or through someone they invited.`,
         };
       }
       const by = newParent === signer ? "you" : "the owner";
       return {
         result: true,
+        groupOutbox,
         error:
           invited === 1
             ? `The 1 person they invited is still a member, now listed as invited by ${by}.`
@@ -1249,9 +1317,13 @@ export function handleManagementCall(
       // A first batch now; any rest goes on the hourly sweep at once (no
       // grace), since one call deleting a large mailbox could spend the
       // day's rows written (limits.ts ERASE_MAIL_BATCH).
+      const erased = [signer, ...ownKeysOf(sql, signer)];
       const deleted = eraseMember(sql, signer, owner, nowSec, ERASE_MAIL_BATCH);
       const left = mailLeftFor(sql, signer, owner, ERASE_MAIL_BATCH);
-      return { result: { erased: true, messagesDeleted: deleted, messagesLeft: left } };
+      // Out of every home group, by a bothy-signed removal; their past
+      // messages stay for the others.
+      const groupOutbox = removeFromAllGroups(sql, owner, erased, "erased", nowSec);
+      return { result: { erased: true, messagesDeleted: deleted, messagesLeft: left }, groupOutbox };
     }
 
     // The signer's own mailbox here, and the home's: how much is stored
@@ -1315,6 +1387,45 @@ export function handleManagementCall(
       if (pubkey === null) return err("forgetremoval takes a pubkey, as npub or 64-character hex");
       return { result: { forgotten: clearRemovalMark(sql, pubkey) } };
     }
+
+    // History backup (storage.ts recordBackedUp): the caller's app has
+    // verified a backup that holds their mail up to `mailThrough`, a stored
+    // time (mailtimes' storedAt). The watermark moves forward only, never
+    // past now, and the answer is what is stored after the call. The owner
+    // may call it too: it is stored like anyone's, and changes nothing,
+    // since the owner's mail is never deleted.
+    case "backedup": {
+      const [mailThrough] = params;
+      if (typeof mailThrough !== "number" || !Number.isSafeInteger(mailThrough) || mailThrough < 0) {
+        return err(BACKEDUP_PARAM_MESSAGE);
+      }
+      return { result: { watermark: recordBackedUp(sql, signer, mailThrough, nowSec) } };
+    }
+
+    // Owner only: mailbox retention on or off (storage.ts sweepRetention).
+    // Off by default. On is refused while the home has nowhere for
+    // backups to go (storage.ts hasBackRoom). Clearing the file server
+    // later leaves the switch on but stops the deleting, at the next tick.
+    case "setretention": {
+      const [on] = params;
+      if (typeof on !== "boolean") return err(SETRETENTION_PARAM_MESSAGE);
+      if (on && !hasBackRoom(sql)) return err(RETENTION_NEEDS_STORAGE_MESSAGE);
+      setRelaySetting(sql, "mail_retention", on ? "on" : "");
+      return { result: true };
+    }
+
+    // Owner only: the switch, whether a file server is set (deleting
+    // happens only with both), how many members' apps have reported a
+    // backup, and after how many days.
+    case "getretention":
+      return {
+        result: {
+          on: mailRetentionOn(sql),
+          storage: hasBackRoom(sql),
+          backedUp: backedUpMemberCount(sql),
+          days: MAIL_RETENTION_SECONDS / 86400,
+        },
+      };
 
     case "homemembers": {
       const owner = getOwnerPubkey(sql, env);

@@ -9,7 +9,7 @@ import {
   resetWronglyExhaustedRelays,
   seedBackfillRelays,
 } from "./backfill";
-import { matchesAnyFilter, parseFilter } from "./filters";
+import { matchesAnyFilter, parseFilter, PROFILE_KIND } from "./filters";
 import {
   groupIdOf,
   ALL_SCOPES,
@@ -32,6 +32,10 @@ import {
   REQUEST_JOIN_RATE_LIMIT_WINDOW_MS,
   MAX_VAULT_CALLS_PER_IP_PER_WINDOW,
   MAX_SIGNALS_PER_SENDER_PER_WINDOW,
+  MAX_RINGS_PER_IP_PER_WINDOW,
+  MAX_RINGS_PER_RECIPIENT_PER_WINDOW,
+  RING_MAX_TTL_SECONDS,
+  RING_RATE_LIMIT_WINDOW_MS,
   SIGNAL_MAX_BYTES,
   SIGNAL_RATE_LIMIT_WINDOW_MS,
   MAX_VAULT_OPENS_PER_HASH_PER_WINDOW,
@@ -40,6 +44,8 @@ import {
   MEMBER_REMOVAL_GRACE_SECONDS,
   FORMER_MEMBER_SWEEP_PUBKEYS,
   FORMER_MEMBER_SWEEP_BATCH_SIZE,
+  RETENTION_PAUSE_AT_ROWS_WRITTEN,
+  RETENTION_SWEEP_BATCH_SIZE,
   MAX_PUSH_ENDPOINTS_PER_NOTIFICATION,
   PRESENCE_MAX_TRACKED,
   PRESENCE_STALE_SECONDS,
@@ -89,6 +95,19 @@ import {
 } from "./nip29";
 import { handleManagementCall, type ManagementResponse } from "./nip86";
 import {
+  GROUP_KINDS,
+  GROUP_MESSAGE_KIND,
+  NOT_IN_GROUP_MESSAGE,
+  groupEpoch,
+  groupEventExists,
+  keeperOf,
+  isInAnyGroup,
+  memberOf,
+  rosterPubkeys,
+  storeGroupMessage,
+  type GroupOutboxEntry,
+} from "./home-groups";
+import {
   importVaultKey,
   isVaultHash,
   issueChallenge,
@@ -118,6 +137,7 @@ import {
   type Filter,
   GIFT_WRAP_KIND,
   isEphemeralKind,
+  isRing,
   type NostrEvent,
   pTagValues,
   SIGNAL_KIND,
@@ -152,7 +172,7 @@ import {
   type WriteMetricsSnapshot,
 } from "./read-metrics";
 import { getRelayPubkey } from "./relay-identity";
-import { type PhotoType, sqlitePhotoStore, takeUploadAllowance } from "./photos";
+import { type PhotoType, SEALED_PHOTO_TYPE, sqlitePhotoStore, takeUploadAllowance } from "./photos";
 import { ingestNetwork, networkSummary, networkWork } from "./network";
 import {
   accessToken,
@@ -216,16 +236,21 @@ import {
   isGroupMember,
   isMember,
   listMemberGroups,
+  clearCallPush,
   clearInboxPush,
   hasPushSubscription,
   memberCount,
+  pendingCallPushes,
   pendingInboxPushes,
   pushSubscriptionsFor,
   fcmTokensFor,
   forgetFcmToken,
   type FcmTokenRow,
+  queueCallPush,
   queueInboxPush,
   sweepFormerMembers,
+  mailRetentionOn,
+  sweepRetention,
   sweepExpiredJoinRequests,
   storagePubkey,
   countMailDay,
@@ -240,6 +265,7 @@ import {
   storeEvent,
 } from "./storage";
 import { idMatchesContent, isCreatedAtTooFarInFuture, parseEventShape, verifySignature } from "./validate";
+import { filtersAllowedForProfile, gatedProfileAuthor, profileGateFor } from "./profiles";
 
 // Answers a client "ping" with "pong" inside the runtime, without waking
 // this object or billing DO duration.
@@ -444,6 +470,10 @@ export class Relay extends DurableObject<Env> {
   // otherwise have to become async for a call unrelated to storing the
   // event.
   private pushAlarmWanted = false;
+
+  // Set beside pushAlarmWanted when a ring was queued: the alarm is set
+  // for now rather than PUSH_ALARM_DELAY_MS ahead.
+  private pushAlarmNow = false;
 
   // Every storage access in this object goes through this handle rather
   // than `ctx.storage.sql`. read-metrics.ts uses it to attribute rows read
@@ -701,7 +731,9 @@ export class Relay extends DurableObject<Env> {
           this.notePush(sql, event, pTagValues(event.tags));
           this.broadcast(event);
         }
-        const { outbox: _delivered, ...rest } = reply;
+        for (const entry of reply.groupOutbox ?? []) this.deliverGroupEvent(sql, entry);
+        if (reply.wake?.length) this.wakeOnly(sql, reply.wake);
+        const { outbox: _delivered, groupOutbox: _groupDelivered, wake: _woken, ...rest } = reply;
         return rest;
       });
       await this.settlePushAlarm();
@@ -809,6 +841,12 @@ export class Relay extends DurableObject<Env> {
     return this.metered(() => withReadPath("management", () => storagePubkey(this.sql) === pubkey));
   }
 
+  // For the Worker's push gate (src/index.ts GUEST_PUSH_METHODS): is this
+  // signer on any home group's roster here? One indexed read.
+  async isGroupGuest(pubkey: string): Promise<boolean> {
+    return this.metered(() => withReadPath("management", () => isInAnyGroup(this.sql, pubkey)));
+  }
+
   async getRole(pubkey: string): Promise<Role> {
     return this.metered(() =>
       withReadPath("management", () => roleOf(this.sql, pubkey, getOwnerPubkey(this.sql, this.env))),
@@ -837,13 +875,19 @@ export class Relay extends DurableObject<Env> {
     sha256: string,
     type: PhotoType,
     data: Uint8Array,
-  ): Promise<{ status: 200; uploadedAt: number } | { status: 403 | 429 | 507; reason: string }> {
+  ): Promise<{ status: 200; uploadedAt: number } | { status: 403 | 415 | 429 | 507; reason: string }> {
     return this.metered(() =>
       withReadPath("photos", () => {
         const sql = this.sql;
         const owner = getOwnerPubkey(sql, this.env);
         if (pubkey !== owner && !isMember(sql, pubkey)) {
           return { status: 403 as const, reason: "only this relay's members can store a photo here" };
+        }
+        // The owner's photo is public (his main identity), so it must be
+        // an image; sealed photos are for members (photos.ts
+        // SEALED_PHOTO_TYPE).
+        if (type === SEALED_PHOTO_TYPE && pubkey === owner) {
+          return { status: 415 as const, reason: "the owner's photo is public, so it must be JPEG, PNG or WebP" };
         }
         const store = sqlitePhotoStore(sql);
         const current = store.currentFor(pubkey);
@@ -1174,6 +1218,9 @@ export class Relay extends DurableObject<Env> {
         // Removed members' mail, once their grace period is over
         // (storage.ts sweepFormerMembers). Free while nobody is waiting.
         withReadPath("giftWrapSweep", () => this.sweepFormerMemberMail(sql, now));
+        // Mailbox retention (storage.ts sweepRetention): nothing unless the
+        // owner turned it on and a file server is set, checked every tick.
+        withReadPath("giftWrapSweep", () => this.sweepRetainedMail(sql, now));
         // Join requests past their 30 days, answered or not.
         sweepExpiredJoinRequests(sql, now);
         // Restore vault challenges spent and since expired (src/vault.ts).
@@ -1387,6 +1434,13 @@ export class Relay extends DurableObject<Env> {
       this.handleSignal(ws, event);
       return;
     }
+    // Home group messages (src/home-groups.ts): signed by a throwaway key,
+    // so the sender's AUTH and the group's roster are the authority.
+    // Changes (kind 1491) arrive only through groupchange.
+    if (GROUP_KINDS.includes(event.kind)) {
+      this.handleGroupMessage(ws, event);
+      return;
+    }
 
     // Authorization before id/signature validity: schnorr is the most
     // expensive per-event step (validate.ts verifySignature), and a refused
@@ -1469,8 +1523,15 @@ export class Relay extends DurableObject<Env> {
     }
 
     // Size is capped for every writer at the top of acceptEvent
-    // (limits.ts MAX_EVENT_BYTES).
-    if (this.isGiftWrapRateLimited(getState(ws).ip)) {
+    // (limits.ts MAX_EVENT_BYTES). A ring has its own expiry rule and
+    // limits in place of the gift wrap limit (ringRefusal).
+    if (isRing(event)) {
+      const refusal = this.ringRefusal(ws, event, recipients);
+      if (refusal !== null) {
+        ok(ws, event.id, false, refusal);
+        return;
+      }
+    } else if (this.isGiftWrapRateLimited(getState(ws).ip)) {
       ok(ws, event.id, false, "rate-limited: too many gift wraps from this connection, slow down");
       return;
     }
@@ -1504,6 +1565,36 @@ export class Relay extends DurableObject<Env> {
     this.acceptEvent(ws, sql, event, event.pubkey === owner, recipients);
   }
 
+  // Why a ring (nostr.ts isRing) is refused, or null. A ring is a call
+  // invite, so it must say when it stops ringing: a NIP-40 expiration in
+  // the future and at most RING_MAX_TTL_SECONDS ahead, which the
+  // wrap_expiry sweep then honours. Then two limits in place of the gift
+  // wrap one (limits.ts MAX_RINGS_*): per address, and per recipient, so a
+  // stranger cannot ring one phone in a loop from many addresses. Like the
+  // gift wrap limit, both count before schnorr: they bound its cost too.
+  private ringRefusal(ws: WebSocket, event: NostrEvent, recipients: readonly string[]): string | null {
+    const expiration = expirationOf(event);
+    const now = nowSeconds();
+    if (expiration === null || expiration <= now || expiration > now + RING_MAX_TTL_SECONDS) {
+      return `invalid: a ring must expire within ${RING_MAX_TTL_SECONDS} seconds`;
+    }
+    if (
+      this.windowLimited(this.ringIpLimits, getState(ws).ip, RING_RATE_LIMIT_WINDOW_MS, MAX_RINGS_PER_IP_PER_WINDOW)
+    ) {
+      return "rate-limited: too many rings from this connection, slow down";
+    }
+    const overRung = recipients.some((pubkey) =>
+      this.windowLimited(this.ringRecipientLimits, pubkey, RING_RATE_LIMIT_WINDOW_MS, MAX_RINGS_PER_RECIPIENT_PER_WINDOW),
+    );
+    if (overRung) return "rate-limited: too many rings to this person, try again in a minute";
+    return null;
+  }
+
+  // Per address and per recipient (limits.ts MAX_RINGS_*). The recipient
+  // map is bounded by membership, since a ring must name a member.
+  private ringIpLimits = new Map<string, { windowStart: number; count: number }>();
+  private ringRecipientLimits = new Map<string, { windowStart: number; count: number }>();
+
   // A sealed signal (nostr.ts SIGNAL_KIND): typing, seen, call setup.
   // From a connection AUTHed as the owner or a member, p-tagged to the
   // owner or a member. NEVER stored, never pushed, never on the live feed:
@@ -1513,8 +1604,21 @@ export class Relay extends DurableObject<Env> {
     const sql = this.sql;
     const owner = getOwnerPubkey(sql, this.env);
     const sender = getState(ws).authedPubkey;
-    if (owner === null || sender === undefined || (sender !== owner && !isMember(sql, sender))) {
-      ok(ws, event.id, false, "restricted: signals are for this home's members; authenticate first");
+    // Not yet authenticated is NIP-42's "auth-required", so a client authenticates and sends it
+    // again (a call's first offer and candidates often go out before the AUTH answer lands).
+    if (sender === undefined) {
+      // A challenge with the refusal, so the client can AUTH and send again (as for group messages).
+      const state = getState(ws);
+      if (!state.challenge) {
+        state.challenge = crypto.randomUUID();
+        setState(ws, state);
+      }
+      send(ws, ["AUTH", state.challenge]);
+      ok(ws, event.id, false, "auth-required: signals are for this home's members");
+      return;
+    }
+    if (owner === null || (sender !== owner && !isMember(sql, sender))) {
+      ok(ws, event.id, false, "restricted: signals are for this home's members");
       return;
     }
     if (isAnyGroupEvent(event)) {
@@ -1568,6 +1672,124 @@ export class Relay extends DurableObject<Env> {
 
   // Per authenticated sender (limits.ts MAX_SIGNALS_PER_SENDER_PER_WINDOW).
   private signalRateLimits = new Map<string, { windowStart: number; count: number }>();
+
+  // A home group message (home-groups.ts, kind 1490): one sealed event for
+  // the whole group, from a connection AUTHed as someone on the group's
+  // roster. Stored with the home's next number, delivered live to the
+  // roster's own subscriptions, and a content-free wake queued for every
+  // other member, guests included.
+  private handleGroupMessage(ws: WebSocket, event: NostrEvent): void {
+    const sql = this.sql;
+    const sender = getState(ws).authedPubkey;
+    if (event.kind !== GROUP_MESSAGE_KIND) {
+      ok(ws, event.id, false, "invalid: group changes are made with groupchange, not published");
+      return;
+    }
+    if (sender === undefined) {
+      // A challenge with the refusal, so the client can AUTH and send again.
+      const state = getState(ws);
+      if (!state.challenge) {
+        state.challenge = crypto.randomUUID();
+        setState(ws, state);
+      }
+      send(ws, ["AUTH", state.challenge]);
+      ok(ws, event.id, false, "auth-required: group messages are for the group's members; authenticate first");
+      return;
+    }
+    const gids = event.tags.filter((t) => t[0] === "h").map((t) => t[1]);
+    const gid = gids.length === 1 ? gids[0] : undefined;
+    const epochTag = event.tags.find((t) => t[0] === "epoch")?.[1];
+    if (gid === undefined || epochTag === undefined || !/^[1-9][0-9]{0,8}$/.test(epochTag)) {
+      ok(ws, event.id, false, "invalid: a group message carries one h tag and an epoch tag");
+      return;
+    }
+    const current = withReadPath("write", () => (memberOf(sql, gid, sender) === null ? null : groupEpoch(sql, gid)));
+    if (current === null) {
+      ok(ws, event.id, false, `restricted: ${NOT_IN_GROUP_MESSAGE}`);
+      return;
+    }
+    if (Number(epochTag) > current) {
+      ok(ws, event.id, false, "invalid: that key is newer than the group's; fetch the group again");
+      return;
+    }
+    const byteCap = maxEventBytes(this.env);
+    const bytes = JSON.stringify(event).length;
+    if (byteCap !== null && bytes > byteCap) {
+      ok(ws, event.id, false, `invalid: event exceeds the maximum size of ${byteCap} bytes`);
+      return;
+    }
+    if (isCreatedAtTooFarInFuture(event, nowSeconds())) {
+      ok(ws, event.id, false, "invalid: created_at is too far in the future");
+      return;
+    }
+    if (this.windowLimited(this.groupMessageRateLimits, sender, SIGNAL_RATE_LIMIT_WINDOW_MS, MAX_SIGNALS_PER_SENDER_PER_WINDOW)) {
+      ok(ws, event.id, false, "rate-limited: too many group messages, slow down");
+      return;
+    }
+    if (!idMatchesContent(event)) {
+      ok(ws, event.id, false, "invalid: id does not match the hash of its contents");
+      return;
+    }
+    if (!verifySignature(event)) {
+      ok(ws, event.id, false, "invalid: signature verification failed");
+      return;
+    }
+    if (groupEventExists(sql, event.id)) {
+      ok(ws, event.id, true, "duplicate: already have this event");
+      return;
+    }
+    // The sender's mail share and the home's total (storage.ts mailRoom).
+    const room = mailRoom(sql, [sender], bytes, mailStorageBytes(this.env), mailBytesPerMember(this.env));
+    if (room !== "ok") {
+      ok(ws, event.id, false, room === "home-full" ? HOME_MAILBOX_FULL_MESSAGE : "blocked: your share of this home's mailbox is full");
+      return;
+    }
+    const now = nowSeconds();
+    storeGroupMessage(sql, gid, event, sender, now);
+    countMailDay(sql, utcDay(now));
+    ok(ws, event.id, true, "");
+    this.deliverGroupEvent(sql, { gid, event, wake: rosterPubkeys(sql, gid).filter((p) => p !== sender) });
+  }
+
+  private groupMessageRateLimits = new Map<string, { windowStart: number; count: number }>();
+
+  // Live to the roster's own subscriptions that asked for this kind, and a
+  // wake queued for `wake` (the inbox push queue: one content-free push per
+  // person per burst, skipped while they have a socket open).
+  private deliverGroupEvent(sql: SqlStorage, entry: GroupOutboxEntry): void {
+    // The roster, and the box that keeps the group (home-groups.ts keeperOf). Also everyone the
+    // event affects (`wake`): someone just removed gets the change that removed them live, as
+    // a member, instead of learning it only at their next catch-up.
+    const roster = new Set([...rosterPubkeys(sql, entry.gid), ...entry.wake]);
+    const keeper = keeperOf(sql);
+    if (keeper !== null) roster.add(keeper);
+    for (const other of this.ctx.getWebSockets()) {
+      if (this.ctx.getTags(other).includes(LIVE_FEED_TAG)) continue;
+      const state = getState(other);
+      const authed = state.authedPubkey;
+      if (authed === undefined || !roster.has(authed)) continue;
+      for (const [subId, filters] of Object.entries(state.subs)) {
+        const asked = filters.filter((f) => f.kinds?.includes(entry.event.kind));
+        if (asked.length > 0 && matchesAnyFilter(entry.event, asked)) send(other, ["EVENT", subId, entry.event]);
+      }
+    }
+    this.wakeOnly(sql, entry.wake);
+  }
+
+  // The content-free wake, through the inbox push queue.
+  private wakeOnly(sql: SqlStorage, pubkeys: readonly string[]): void {
+    const web = pushConfigured(this.env);
+    const android = fcmConfigured(this.env);
+    if (!web && !android) return;
+    withReadPath("push", () => {
+      const now = nowSeconds();
+      for (const pubkey of pubkeys) {
+        if (!hasPushSubscription(sql, pubkey, web, android)) continue;
+        queueInboxPush(sql, pubkey, now);
+        this.pushAlarmWanted = true;
+      }
+    });
+  }
 
   // NIP-29 kind-9021 join request. The decision is nip29.ts
   // handleJoinRequest; this is the wire-level work before any invite code
@@ -2001,6 +2223,23 @@ export class Relay extends DurableObject<Env> {
     );
   }
 
+  // One cron tick of mailbox retention (storage.ts sweepRetention). Free
+  // while retention is off: one settings row. While on, it first reads the
+  // day's rows written and skips the tick once half the day's allowance is
+  // spent, so retention never takes the room new mail needs; then at most
+  // limits.ts RETENTION_SWEEP_BATCH_SIZE wraps. Logs counts only.
+  private sweepRetainedMail(sql: SqlStorage, nowSec: number): void {
+    if (!mailRetentionOn(sql)) return;
+    const written = readIngestCounts(sql, nowSec, utcDayStartSeconds(nowSec * 1000)).rowsWrittenToday;
+    if (written >= RETENTION_PAUSE_AT_ROWS_WRITTEN) return;
+    const result = sweepRetention(sql, nowSec, getOwnerPubkey(sql, this.env), RETENTION_SWEEP_BATCH_SIZE);
+    if (result.removed === 0) return;
+    console.log(
+      `mailbox retention: removed ${result.removed} old, backed-up gift wrap(s)` +
+        `${result.done ? "" : ", more to come next tick"}`,
+    );
+  }
+
   // One cron tick of the expired-gift-wrap sweep (storage.ts
   // sweepExpiredGiftWraps). No mode switch, unlike the chat sweep: it
   // removes only rows whose author set an expiry that has passed, and no
@@ -2028,13 +2267,22 @@ export class Relay extends DurableObject<Env> {
     // Mail: queued per recipient who has a device registered (one indexed
     // read each), so mail for someone without push writes nothing. Web
     // push or Android (src/fcm.ts), whichever this relay can send.
+    //
+    // A ring (nostr.ts isRing) goes to its own queue instead, never to
+    // the mail queue as well: one "call" push, at once.
     if (event.kind === GIFT_WRAP_KIND) {
       if (!web && !android) return;
+      const ring = isRing(event);
       withReadPath("push", () => {
         const now = nowSeconds();
         for (const pubkey of wrapRecipients) {
           if (!hasPushSubscription(sql, pubkey, web, android)) continue;
-          queueInboxPush(sql, pubkey, now);
+          if (ring) {
+            queueCallPush(sql, pubkey, now);
+            this.pushAlarmNow = true;
+          } else {
+            queueInboxPush(sql, pubkey, now);
+          }
           this.pushAlarmWanted = true;
         }
       });
@@ -2116,11 +2364,14 @@ export class Relay extends DurableObject<Env> {
   // moves the alarm sooner, like scheduleLiveFeedAlarm: there is one alarm
   // shared with the live feed, and setAlarm is a row write.
   // PUSH_ALARM_DELAY_MS is also the coalescing window: a message inside it
-  // finds an alarm already due sooner and writes nothing.
+  // finds an alarm already due sooner and writes nothing. A ring wants the
+  // alarm now, not after that delay; whatever mail is queued then goes out
+  // with it.
   private async settlePushAlarm(): Promise<void> {
     if (!this.pushAlarmWanted) return;
     this.pushAlarmWanted = false;
-    const desired = Date.now() + PUSH_ALARM_DELAY_MS;
+    const desired = Date.now() + (this.pushAlarmNow ? 0 : PUSH_ALARM_DELAY_MS);
+    this.pushAlarmNow = false;
     const existing = await this.ctx.storage.getAlarm();
     if (existing === null || existing > desired) {
       await this.ctx.storage.setAlarm(desired);
@@ -2158,23 +2409,46 @@ export class Relay extends DurableObject<Env> {
   // Each recipient's web push endpoints AND Android tokens (src/fcm.ts),
   // counted together against the budget: each is one subrequest. Minting
   // an FCM access token is one more, set aside first when it is due.
-  private async drainInboxPushes(budget: number): Promise<{ spent: number; more: boolean }> {
+  private drainInboxPushes(budget: number): Promise<{ spent: number; more: boolean }> {
+    return this.drainPersonalPushes(budget, "message", pendingInboxPushes, clearInboxPush);
+  }
+
+  // Announces rings (schema.ts `call_push`), the same way with two
+  // differences: the kind is "call", and a recipient with a socket open is
+  // pushed anyway, because that socket may belong to an app Android has
+  // frozen, which would never ring. Same payload otherwise: the room and
+  // the app's label, never the caller.
+  private drainCallPushes(budget: number): Promise<{ spent: number; more: boolean }> {
+    return this.drainPersonalPushes(budget, "call", pendingCallPushes, clearCallPush);
+  }
+
+  // The body of both drains above: a queue keyed by recipient, each
+  // served whole to their own devices.
+  private async drainPersonalPushes(
+    budget: number,
+    kind: "message" | "call",
+    pendingOf: (sql: SqlStorage, limit: number) => string[],
+    clear: (sql: SqlStorage, pubkey: string) => void,
+  ): Promise<{ spent: number; more: boolean }> {
     const keys = vapidKeys(this.env);
     const account = serviceAccount(this.env);
     if (keys === null && account === null) return { spent: 0, more: false };
     const sql = this.sql;
+    // Rings took every subrequest this time: come back for the rest.
+    if (budget <= 0) return { spent: 0, more: withReadPath("push", () => pendingOf(sql, 1).length > 0) };
     const nowSec = nowSeconds();
-    const online = this.onlinePubkeys();
+    // Who is online only matters for mail: a ring is pushed regardless.
+    const online = kind === "call" ? new Set<string>() : this.onlinePubkeys();
     const mint = account !== null && needsAccessToken(account, nowSec) ? 1 : 0;
 
     const plan = withReadPath("push", () => {
       // One more than could possibly be served, so "more" is known without
       // a second query.
-      const pending = pendingInboxPushes(sql, budget + 1);
+      const pending = pendingOf(sql, budget + 1);
       if (pending.length === 0) return null;
       const payload: PushPayload = {
         room: resolveName(this.env, getRelaySettings(sql), getOwnerProfile(sql, this.env)),
-        kind: "message",
+        kind,
       };
       const subject = pushSubject(getOwnHost(sql));
       let left = budget - mint;
@@ -2230,7 +2504,7 @@ export class Relay extends DurableObject<Env> {
 
     let spent = wantsFcm && mint ? 1 : 0;
     withReadPath("push", () => {
-      for (const pubkey of plan.skip) clearInboxPush(sql, pubkey);
+      for (const pubkey of plan.skip) clear(sql, pubkey);
       for (const { entry, outcomes, fcm } of results) {
         spent += outcomes.length + (bearer === null ? 0 : fcm.length);
         outcomes.forEach((outcome, index) => this.settlePushOutcome(sql, entry.targets[index]!, outcome, nowSec));
@@ -2240,7 +2514,7 @@ export class Relay extends DurableObject<Env> {
           // The access token was refused: mint a fresh one next time.
           if (outcome === "auth" && account !== null) forgetAccessToken(account);
         });
-        clearInboxPush(sql, entry.pubkey);
+        clear(sql, entry.pubkey);
       }
     });
     return { spent, more: plan.more };
@@ -2507,6 +2781,38 @@ export class Relay extends DurableObject<Env> {
       filters.push(bound.filter);
     }
 
+    // Home groups (home-groups.ts): a REQ asking only for group kinds is
+    // LIVE ONLY, answered EOSE at once; stored traffic comes from
+    // groupsince, which carries the home's numbers. Every group it names
+    // must be one the reader is on the roster of; deliverGroupEvent checks
+    // the roster again for each event.
+    if (filters.every((f) => f.kinds !== undefined && f.kinds.length > 0 && f.kinds.every((k) => GROUP_KINDS.includes(k)))) {
+      if (state.authedPubkey === undefined) {
+        if (!state.challenge) {
+          state.challenge = crypto.randomUUID();
+          setState(ws, state);
+        }
+        send(ws, ["AUTH", state.challenge]);
+        this.refuse(ws, subId, "auth-required: authentication required to read group events");
+        return;
+      }
+      const reader = state.authedPubkey;
+      const named = filters.flatMap((f) => (Array.isArray(f["#h"]) ? (f["#h"] as string[]) : []));
+      const keeper = keeperOf(this.sql);
+      if (named.some((gid) => memberOf(this.sql, gid, reader) === null && reader !== keeper)) {
+        this.refuse(ws, subId, "restricted: not allowed to read group events");
+        return;
+      }
+      const live: ConnState = { ...state, subs: { ...state.subs, [subId]: filters }, reqs: (state.reqs ?? 0) + 1 };
+      if (!stateFits(live)) {
+        this.refuse(ws, subId, "invalid: filters are too large to hold open");
+        return;
+      }
+      setState(ws, live);
+      send(ws, ["EOSE", subId]);
+      return;
+    }
+
     // The read gates for gift wraps and groups share one rule:
     // REFUSAL LEAKS, OMISSION DOES NOT.
     //
@@ -2536,6 +2842,18 @@ export class Relay extends DurableObject<Env> {
       } else {
         this.refuse(ws, subId, "restricted: not allowed to read group events");
       }
+      return;
+    }
+    // Signals reach only authenticated subscriptions, so an unauthenticated REQ for them is told to
+    // authenticate (with a challenge) instead of sitting open and never hearing anything: a call's
+    // own socket only listens until the answer comes (DMs round 2 device pass).
+    if (state.authedPubkey === undefined && filters.some((f) => f.kinds?.includes(SIGNAL_KIND))) {
+      if (!state.challenge) {
+        state.challenge = crypto.randomUUID();
+        setState(ws, state);
+      }
+      send(ws, ["AUTH", state.challenge]);
+      this.refuse(ws, subId, "auth-required: authentication required to read signals");
       return;
     }
     if (
@@ -2598,7 +2916,16 @@ export class Relay extends DurableObject<Env> {
       horizon = chatHorizon(readChatState(this.sql), now);
     }
 
+    // Private profiles (src/profiles.ts): members' kind 0 only for this
+    // home's own people. Resolved only when some filter can match kind 0,
+    // so every other read, the unauthenticated ones included, pays nothing
+    // for it. broadcast() applies the same gate to live events.
+    const profileGate = filters.some((f) => f.kinds === undefined || f.kinds.includes(PROFILE_KIND))
+      ? profileGateFor(this.sql, this.env, authedPubkey, getOwnerPubkey(this.sql, this.env))
+      : undefined;
+
     const events = queryFilters(this.sql, filters, now, {
+      ...(profileGate === undefined ? {} : { hideMemberProfiles: profileGate }),
       excludeGiftWraps: !mayReadGiftWraps,
       // Somebody joining a conversation sees its last few minutes, not the
       // whole of it (limits.ts CHAT_BACKLOG_SECONDS). Applied to the owner
@@ -2717,6 +3044,10 @@ export class Relay extends DurableObject<Env> {
     // traffic.
     const eventGroup = gated && !giftWrap ? groupIdOf(event) : null;
     const membership = new Map<string, boolean>();
+    // Private profiles (src/profiles.ts): a member's kind 0 goes only to
+    // the sockets handleReqInner would have answered with it.
+    const profileOwner = event.kind === PROFILE_KIND ? getOwnerPubkey(this.sql, this.env) : null;
+    const profileAuthor = gatedProfileAuthor(this.sql, event, profileOwner);
     const mayReceive = (authed: string | undefined): boolean => {
       if (authed === undefined) return false;
       if (owner !== null && authed === owner) return true;
@@ -2745,6 +3076,14 @@ export class Relay extends DurableObject<Env> {
         continue;
       }
       if (gated && !mayReceive(authed)) continue;
+      if (profileAuthor !== null) {
+        const gate = profileGateFor(this.sql, this.env, authed, profileOwner);
+        for (const [subId, filters] of Object.entries(state.subs)) {
+          const allowed = filtersAllowedForProfile(gate, profileAuthor, event, filters);
+          if (allowed.length > 0 && matchesAnyFilter(event, allowed)) send(ws, ["EVENT", subId, event]);
+        }
+        continue;
+      }
       for (const [subId, filters] of Object.entries(state.subs)) {
         if (matchesAnyFilter(event, filters)) {
           send(ws, ["EVENT", subId, event]);
@@ -2763,6 +3102,14 @@ export class Relay extends DurableObject<Env> {
   // owner or member case here: a live feed socket cannot be anybody.
   private liveBroadcast(event: NostrEvent): void {
     if (event.kind === GIFT_WRAP_KIND || isGroupEvent(event, groupHost(this.sql))) return;
+    // A member's profile change, even redacted, would time it for anyone
+    // watching (src/profiles.ts).
+    if (
+      event.kind === PROFILE_KIND &&
+      gatedProfileAuthor(this.sql, event, getOwnerPubkey(this.sql, this.env)) !== null
+    ) {
+      return;
+    }
     const live = this.ctx.getWebSockets(LIVE_FEED_TAG);
     if (live.length === 0) return;
     const notice = JSON.stringify({ kind: event.kind, created_at: event.created_at, id: event.id.slice(0, 8) });
@@ -2792,15 +3139,18 @@ export class Relay extends DurableObject<Env> {
   }
 
   private async alarmInner(): Promise<void> {
-    // Push first: it is the one with a deadline. Mail before group
-    // traffic: it is for one person, and it is the reason most members
-    // have push at all. The two share one invocation's subrequests.
-    const inbox = await this.drainInboxPushes(MAX_PUSHES_PER_TICK);
-    const moreGroupPushes = await this.drainPushOutbox(MAX_PUSHES_PER_TICK - inbox.spent);
+    // Push first: it is the one with a deadline. Rings before anything,
+    // since a ring is stale in seconds. Mail before group traffic: it is
+    // for one person, and it is the reason most members have push at all.
+    // All three share one invocation's subrequests.
+    const calls = await this.drainCallPushes(MAX_PUSHES_PER_TICK);
+    const inbox = await this.drainInboxPushes(MAX_PUSHES_PER_TICK - calls.spent);
+    const moreGroupPushes = await this.drainPushOutbox(MAX_PUSHES_PER_TICK - calls.spent - inbox.spent);
     const morePushes = inbox.more || moreGroupPushes;
 
     const now = Date.now();
-    let next: number | null = morePushes ? now + PUSH_ALARM_DELAY_MS : null;
+    // Rings left over come back at once; anything else after the delay.
+    let next: number | null = calls.more ? now : morePushes ? now + PUSH_ALARM_DELAY_MS : null;
     for (const ws of this.ctx.getWebSockets(LIVE_FEED_TAG)) {
       const expiresAt = getLiveFeedState(ws).connectedAt + LIVE_FEED_MAX_LIFETIME_MS;
       if (expiresAt <= now) {
