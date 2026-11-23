@@ -334,7 +334,8 @@ export const TABLES: readonly TableSpec[] = [
       // 'pending' until the owner's relay list has been discovered,
       // 'running' while any backfill_relays row is unexhausted,
       // 'paused-budget' when a cron tick's ingest hit the daily
-      // rows-written ceiling and stopped without finishing its page,
+      // rows-written ceiling and stopped without finishing its page
+      // (lifted by the first tick with headroom, backfill-worker.ts),
       // 'done' once every relay is exhausted.
       col("status", "TEXT NOT NULL DEFAULT 'pending'"),
       col("total_stored", "INTEGER NOT NULL DEFAULT 0"),
@@ -705,6 +706,49 @@ export const TABLES: readonly TableSpec[] = [
     ],
   },
   {
+    // The restore vault (src/vault.ts): one row per passkey, keyed by the
+    // hex sha256 of its credential id. `blob` is the copy of the person's
+    // key the passkey locked; this relay cannot open it. `public_key` is
+    // the passkey's SPKI (base64url) and `alg` its COSE algorithm, both
+    // given on the member-signed vaultput, so nothing here parses CBOR.
+    // `size` is what counts against limits.ts vaultStorageBytes. Deleted
+    // by eraseme, and at the end of a removed member's grace with their
+    // mail (storage.ts eraseMember, sweepFormerMembers).
+    name: "vault",
+    columns: [
+      col("hash", "TEXT PRIMARY KEY"),
+      col("pubkey", "TEXT NOT NULL"),
+      col("credential_id", "TEXT NOT NULL"),
+      col("public_key", "TEXT NOT NULL"),
+      col("alg", "INTEGER NOT NULL"),
+      col("blob", "TEXT NOT NULL"),
+      col("label", "TEXT"),
+      col("size", "INTEGER NOT NULL"),
+      col("counter", "INTEGER NOT NULL DEFAULT 0"),
+      col("added_at", "INTEGER NOT NULL"),
+      col("updated_at", "INTEGER NOT NULL"),
+      col("last_used_at", "INTEGER"),
+    ],
+  },
+  {
+    // "Removed on purpose" (storage.ts markRemovedOnPurpose): people the
+    // owner or an admin removed, so nip86.ts addmykey will not bring them
+    // back as someone's own key. Outlives the grace period, unlike
+    // `former_members`. Holds only the sha256 of the pubkey and when.
+    // Cleared by letting the person back in, by forgetremoval, and by the
+    // person's own eraseme.
+    name: "removal_marks",
+    columns: [col("hash", "TEXT PRIMARY KEY"), col("removed_at", "INTEGER NOT NULL")],
+  },
+  {
+    // vaultchallenge nonces already spent by a vaultopen (src/vault.ts).
+    // Issuing one writes nothing (it carries its own HMAC and expiry);
+    // spending it writes this row, so it cannot be spent twice. Rows past
+    // `expires_at` are dead weight, dropped by the cron tick.
+    name: "vault_spent",
+    columns: [col("nonce", "TEXT PRIMARY KEY"), col("expires_at", "INTEGER NOT NULL")],
+  },
+  {
     // Home activity (nip86.ts homestats), the one per-person thing it keeps:
     // the last UTC day each member completed NIP-42 auth, one row each,
     // overwritten, never a log. Read only as counts ("members seen in the
@@ -793,6 +837,17 @@ export const TABLES: readonly TableSpec[] = [
       // 'removed' by the owner or an admin. Room for a member erasing
       // their own account, which will write 'erased'.
       col("reason", "TEXT NOT NULL DEFAULT 'removed'"),
+      // Their `allowed_pubkeys` row as it was when they were removed, so
+      // allowpubkey during the grace ("Let back in") puts them back where
+      // they were in the tree, with their join date (storage.ts
+      // allowPubkey). NULL on rows written before these columns, and
+      // `member_allowed_at` NULL means there is nothing to restore.
+      col("member_reason", "TEXT"),
+      col("member_allowed_at", "INTEGER"),
+      col("member_source", "TEXT"),
+      col("member_invited_by", "TEXT"),
+      col("member_via_code", "TEXT"),
+      col("member_close", "INTEGER"),
     ],
   },
   {
@@ -1143,6 +1198,19 @@ export const INDEXES: readonly IndexSpec[] = [
     name: "idx_photos_sha256",
     table: "photos",
     keyColumns: ["sha256"],
+  },
+  // Serves a member's own vault rows (src/vault.ts vaultlist, the per-member
+  // cap) and their deletion with the member.
+  {
+    name: "idx_vault_pubkey",
+    table: "vault",
+    keyColumns: ["pubkey"],
+  },
+  // Serves the cron tick's drop of expired spent challenges.
+  {
+    name: "idx_vault_spent_expires",
+    table: "vault_spent",
+    keyColumns: ["expires_at"],
   },
   // Serves a member's own Android tokens (storage.ts fcmTokensFor).
   {

@@ -199,6 +199,15 @@ export function buildRelayInfo(
   if (ownerPubkey && stored.storageUrl) {
     info.storage = { url: stored.storageUrl };
   }
+  // The restore vault (src/vault.ts), bothy's own field: this home keeps
+  // members' passkey-locked copies (vaultput, vaultopen). Omitted while
+  // unclaimed, when there are no members to keep one for.
+  if (ownerPubkey) {
+    info.restore = { v: 1 };
+    // Sealed signals (relay.ts handleSignal, kind 21059), bothy's own
+    // field: typing, seen and call setup, delivered live, never stored.
+    info.signals = { v: 1 };
+  }
   const contact = resolveContact(profile);
   if (contact) {
     info.contact = contact;

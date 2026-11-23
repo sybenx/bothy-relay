@@ -27,6 +27,11 @@ import {
   homeMemberPubkeys,
   getRelaySettings,
   eraseMember,
+  listInvitees,
+  addOwnKey,
+  clearRemovalMark,
+  markRemovedOnPurpose,
+  ownKeysOf,
   mailTimes,
   memberKeys,
   deleteFcmToken,
@@ -94,8 +99,10 @@ import {
   HOME_STATS_DAYS,
   HOME_STATS_WEEKS,
   photoStorageBytes,
+  ownKeysPerMember,
 } from "./limits";
 import { sqlitePhotoStore } from "./photos";
+import { deleteVaultRow, isVaultHash, listVaultRows, parseVaultPut, storeVaultRow } from "./vault";
 import { GROUPS_PAUSED_MESSAGE } from "./nip29";
 import { pushConfigured } from "./push";
 import { fcmConfigured } from "./fcm";
@@ -216,6 +223,20 @@ export const SUPPORTED_METHODS = [
   // about by members.
   "setclose",
   "areclose",
+  // bothy's own: the restore vault (src/vault.ts). The first three are a
+  // member's own rows; vaultchallenge and vaultopen are UNSIGNED
+  // (UNSIGNED_METHODS below).
+  "vaultput",
+  "vaultlist",
+  "vaultdelete",
+  "vaultchallenge",
+  "vaultopen",
+  // bothy's own: a member letting in another key of their own, and the
+  // owner forgetting that someone was removed on purpose.
+  "addmykey",
+  "forgetremoval",
+  // bothy's own: listmembers' rows for the caller's own branch.
+  "myinvitees",
 ] as const;
 
 // The methods a MEMBER may call, not just the owner.
@@ -248,7 +269,19 @@ export const MEMBER_CALLABLE_METHODS: readonly string[] = [
   "listunusedinvites",
   "revokeinvite",
   "myinvites",
+  "vaultput",
+  "vaultlist",
+  "vaultdelete",
+  "addmykey",
+  "myinvitees",
 ];
+
+// The methods that take NO signature, an exception to NIP-86's NIP-98
+// rule: a new phone restoring with a passkey has no key yet, and the
+// passkey assertion is the credential (src/vault.ts). index.ts routes them
+// before NIP-98 verification, to relay.ts vaultChallenge and vaultOpen;
+// they never reach handleManagementCall.
+export const UNSIGNED_METHODS: readonly string[] = ["vaultchallenge", "vaultopen"];
 
 // The method ANY valid signature may call: redeeminvite, whose caller is
 // by definition not a member yet. The code is the authority, and the
@@ -716,7 +749,8 @@ export function handleManagementCall(
       // Nobody but the owner removes an admin, directly or as part of a
       // subtree: admins are the owner's to give and take away.
       if (signer !== owner) {
-        const affected = choice === "remove" ? invitedSubtree(sql, pubkey, owner) : [pubkey];
+        const affected =
+          choice === "remove" ? invitedSubtree(sql, pubkey, owner) : [pubkey, ...ownKeysOf(sql, pubkey)];
         if (affected.some((member) => isAdmin(sql, member))) {
           return err(
             affected[0] !== undefined && isAdmin(sql, affected[0])
@@ -725,10 +759,19 @@ export function handleManagementCall(
           );
         }
       }
+      // Their own keys (addmykey) leave with them and are not "people they
+      // invited".
       const invited = sql
-        .exec<{ n: number }>(`SELECT COUNT(*) AS n FROM allowed_pubkeys WHERE invited_by = ?`, pubkey)
+        .exec<{ n: number }>(
+          `SELECT COUNT(*) AS n FROM allowed_pubkeys WHERE invited_by = ? AND source != 'own'`,
+          pubkey,
+        )
         .toArray()[0]?.n ?? 0;
       const removed = removeMember(sql, pubkey, owner, choice, nowSec, newParent);
+      // The owner or an admin removing someone is on purpose: addmykey will
+      // not bring any of these keys back until they are let back in
+      // (storage.ts markRemovedOnPurpose).
+      if (!byMember) markRemovedOnPurpose(sql, removed, nowSec);
       if (removed.length === 0 || invited === 0) return { result: true };
       if (choice === "remove") {
         const others = removed.length - 1;
@@ -974,6 +1017,22 @@ export function handleManagementCall(
 
     // Members, and the removed ones whose mail has not been deleted yet.
     // Letting a removed one back in is allowpubkey, which stops the clock.
+    // listmembers for the caller's own branch (storage.ts listInvitees):
+    // the same row shape, for any member's "People you invited".
+    // A plain member gets the rows without the activity fields (lastSeen,
+    // push, waiting), which stay the owner's and admins' (v0.29): a member
+    // does not see when a friend was last online. Owner and admins keep them.
+    case "myinvitees": {
+      const owner = getOwnerPubkey(sql, env) ?? signer;
+      const listing = listInvitees(sql, MEMBER_REMOVAL_GRACE_SECONDS, owner, signer, nowSec);
+      if (roleOf(sql, signer, owner) !== "member") return { result: listing };
+      const strip = <T extends { lastSeen: unknown; push: unknown; waiting: unknown }>(row: T) => {
+        const { lastSeen: _seen, push: _push, waiting: _waiting, ...rest } = row;
+        return rest;
+      };
+      return { result: { members: listing.members.map(strip), removed: listing.removed.map(strip) } };
+    }
+
     case "listmembers":
       return { result: listMembers(sql, MEMBER_REMOVAL_GRACE_SECONDS, getOwnerPubkey(sql, env) ?? signer) };
 
@@ -1204,6 +1263,59 @@ export function handleManagementCall(
     // keeps those for the owner and admins). With MEMBER_LIST=hidden a
     // plain member gets an empty list and MEMBER_LIST_HIDDEN_NOTE; the
     // owner and admins still get it.
+    // The restore vault (src/vault.ts), a member's own rows. vaultput's key
+    // was imported by relay.ts manage before this ran.
+    case "vaultput": {
+      const input = parseVaultPut(params, signer);
+      if (typeof input === "string") return err(input);
+      const refusal = storeVaultRow(sql, env, input, signer, nowSec);
+      return refusal === null ? { result: true } : err(refusal);
+    }
+
+    case "vaultlist":
+      return { result: listVaultRows(sql, signer) };
+
+    case "vaultdelete": {
+      const [hash] = params;
+      if (!isVaultHash(hash)) return err("vaultdelete: the parameter must be the row's hash");
+      deleteVaultRow(sql, hash, signer);
+      return { result: true };
+    }
+
+    // Another key of the caller's own (src/own-keys.ts). The Worker has
+    // checked the proof signed by that key; this decides whether it may
+    // join: not a member already, not banned, not removed on purpose, and
+    // within limits.ts ownKeysPerMember. It joins under the caller, at the
+    // caller's depth, spending no invite place.
+    case "addmykey": {
+      const cap = ownKeysPerMember(env);
+      if (cap === null) return err("addmykey: this home does not take own keys");
+      const child = pubkeyParam(params, 0);
+      if (child === null) return err("addmykey: it takes [your other key, as npub or hex, and its proof event]");
+      if (child === signer) return err("addmykey: that is the key you are signing with");
+      switch (addOwnKey(sql, signer, child, nowSec, cap)) {
+        case "added":
+          return { result: true };
+        case "already-member":
+          return err("addmykey: that key is already a member here");
+        case "banned":
+          return err("addmykey: that key is banned here");
+        case "removed-on-purpose":
+          return err("addmykey: that account was removed from this home. Ask the owner or an admin to let it back in.");
+        case "too-many":
+          return err(`addmykey: at most ${cap} own keys each`);
+      }
+    }
+
+    // The owner forgetting that someone was removed on purpose, so their
+    // key can come back through addmykey. Letting them back in does the
+    // same.
+    case "forgetremoval": {
+      const pubkey = pubkeyParam(params, 0);
+      if (pubkey === null) return err("forgetremoval takes a pubkey, as npub or 64-character hex");
+      return { result: { forgotten: clearRemovalMark(sql, pubkey) } };
+    }
+
     case "homemembers": {
       const owner = getOwnerPubkey(sql, env);
       const role = roleOf(sql, signer, owner);

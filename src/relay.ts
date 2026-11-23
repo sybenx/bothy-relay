@@ -30,6 +30,13 @@ import {
   photoStorageBytes,
   MAX_REQUEST_JOINS_PER_IP_PER_WINDOW,
   REQUEST_JOIN_RATE_LIMIT_WINDOW_MS,
+  MAX_VAULT_CALLS_PER_IP_PER_WINDOW,
+  MAX_SIGNALS_PER_SENDER_PER_WINDOW,
+  SIGNAL_MAX_BYTES,
+  SIGNAL_RATE_LIMIT_WINDOW_MS,
+  MAX_VAULT_OPENS_PER_HASH_PER_WINDOW,
+  VAULT_HASH_RATE_LIMIT_WINDOW_MS,
+  VAULT_IP_RATE_LIMIT_WINDOW_MS,
   MEMBER_REMOVAL_GRACE_SECONDS,
   FORMER_MEMBER_SWEEP_PUBKEYS,
   FORMER_MEMBER_SWEEP_BATCH_SIZE,
@@ -81,6 +88,18 @@ import {
   JOIN_REQUEST_KIND,
 } from "./nip29";
 import { handleManagementCall, type ManagementResponse } from "./nip86";
+import {
+  importVaultKey,
+  isVaultHash,
+  issueChallenge,
+  openVault,
+  parseVaultPut,
+  sweepSpentChallenges,
+  VAULT_CHALLENGE_KEY_LABEL,
+  VAULT_NOT_FOUND,
+  VAULT_RATE_LIMITED,
+} from "./vault";
+import { relayDerivedKey } from "./relay-identity";
 import { resolveIcon, resolveName, type OwnerProfile } from "./nip11";
 import {
   CALL_PRESENCE_KIND,
@@ -101,6 +120,7 @@ import {
   isEphemeralKind,
   type NostrEvent,
   pTagValues,
+  SIGNAL_KIND,
   VANISH_KIND,
 } from "./nostr";
 import {
@@ -659,6 +679,16 @@ export class Relay extends DurableObject<Env> {
     if (method === "requestjoin" && this.isRequestJoinRateLimited(callerIp)) {
       return { error: "requestjoin: too many requests from this address. Try again in a few minutes." };
     }
+    // vaultput's public key must import as its algorithm, which takes
+    // WebCrypto (async); handleManagementCall is synchronous, so it is
+    // checked here first (src/vault.ts).
+    if (method === "vaultput") {
+      const input = parseVaultPut(params, signer);
+      if (typeof input === "string") return { error: input };
+      if ((await importVaultKey(input.publicKey, input.alg)) === null) {
+        return { error: "vaultput: publicKey is not a public key of that alg" };
+      }
+    }
     const response = await this.metered(async () => {
       const answer = withReadPath("management", () => {
         const sql = this.sql;
@@ -682,6 +712,72 @@ export class Relay extends DurableObject<Env> {
     // methods invalidate it will eventually be wrong about one.
     this.cachedWritePolicy = undefined;
     return response;
+  }
+
+  // ------------------------------------------------------------------
+  // The restore vault's two unsigned methods (src/vault.ts). index.ts
+  // reaches these without a signature and holds vaultopen's time floor.
+  // ------------------------------------------------------------------
+
+  // The challenge MAC key, derived once per wake (relay-identity.ts).
+  private vaultChallengeKey: Uint8Array | null = null;
+
+  private challengeKey(): Uint8Array {
+    this.vaultChallengeKey ??= relayDerivedKey(this.sql, VAULT_CHALLENGE_KEY_LABEL);
+    return this.vaultChallengeKey;
+  }
+
+  // {challenge}: single use, two minutes. Takes no credential id, so it
+  // cannot answer differently for one.
+  async vaultChallenge(callerIp: string): Promise<ManagementResponse> {
+    if (this.windowLimited(this.vaultChallengeIpLimits, normalizeIp(callerIp), VAULT_IP_RATE_LIMIT_WINDOW_MS, MAX_VAULT_CALLS_PER_IP_PER_WINDOW)) {
+      return { error: VAULT_RATE_LIMITED };
+    }
+    return this.metered(() =>
+      withReadPath("management", () => ({ result: { challenge: issueChallenge(this.challengeKey(), nowSeconds()) } })),
+    );
+  }
+
+  // {blob}, or VAULT_NOT_FOUND for every failure. The per-hash limit is
+  // counted for any well-formed hash, stored or not.
+  async vaultOpen(params: unknown[], callerIp: string): Promise<ManagementResponse> {
+    if (this.windowLimited(this.vaultOpenIpLimits, normalizeIp(callerIp), VAULT_IP_RATE_LIMIT_WINDOW_MS, MAX_VAULT_CALLS_PER_IP_PER_WINDOW)) {
+      return { error: VAULT_RATE_LIMITED };
+    }
+    const [hash, assertion] = params;
+    if (!isVaultHash(hash)) return { error: VAULT_NOT_FOUND };
+    if (this.windowLimited(this.vaultHashLimits, hash, VAULT_HASH_RATE_LIMIT_WINDOW_MS, MAX_VAULT_OPENS_PER_HASH_PER_WINDOW)) {
+      return { error: VAULT_RATE_LIMITED };
+    }
+    return this.metered(async () => {
+      const blob = await openVault(this.sql, this.env, this.challengeKey(), hash, assertion, nowSeconds());
+      // Stored as JSON text (vault.ts parseVaultPut), given back as the object.
+      return blob === null ? { error: VAULT_NOT_FOUND } : { result: { blob: JSON.parse(blob) as unknown } };
+    });
+  }
+
+  private vaultChallengeIpLimits = new Map<string, { windowStart: number; count: number }>();
+  private vaultOpenIpLimits = new Map<string, { windowStart: number; count: number }>();
+  private vaultHashLimits = new Map<string, { windowStart: number; count: number }>();
+
+  // A fixed-window counter in memory. An evicted object forgets, which
+  // costs at most one more window's worth of calls; a full map is cleared
+  // rather than grown.
+  private windowLimited(
+    limits: Map<string, { windowStart: number; count: number }>,
+    key: string,
+    windowMs: number,
+    max: number,
+  ): boolean {
+    const now = Date.now();
+    const entry = limits.get(key);
+    if (!entry || now - entry.windowStart >= windowMs) {
+      if (limits.size >= 4096) limits.clear();
+      limits.set(key, { windowStart: now, count: 1 });
+      return false;
+    }
+    entry.count++;
+    return entry.count > max;
   }
 
   // See limits.ts REQUEST_JOIN_RATE_LIMIT_WINDOW_MS. In memory, like the
@@ -1080,6 +1176,8 @@ export class Relay extends DurableObject<Env> {
         withReadPath("giftWrapSweep", () => this.sweepFormerMemberMail(sql, now));
         // Join requests past their 30 days, answered or not.
         sweepExpiredJoinRequests(sql, now);
+        // Restore vault challenges spent and since expired (src/vault.ts).
+        sweepSpentChallenges(sql, now);
         pruneHomeStats(sql, utcDay(now), HOME_STATS_DAYS_KEPT);
         // Last: see the comment on runCron.
         this.drainPendingVanishes(sql);
@@ -1283,6 +1381,12 @@ export class Relay extends DurableObject<Env> {
       this.handleJoin(ws, event);
       return;
     }
+    // Sealed signals: signed by a throwaway key like a gift wrap, so the
+    // writer gate cannot judge them; the sender's AUTH is the authority.
+    if (event.kind === SIGNAL_KIND) {
+      this.handleSignal(ws, event);
+      return;
+    }
 
     // Authorization before id/signature validity: schnorr is the most
     // expensive per-event step (validate.ts verifySignature), and a refused
@@ -1399,6 +1503,71 @@ export class Relay extends DurableObject<Env> {
     // it.
     this.acceptEvent(ws, sql, event, event.pubkey === owner, recipients);
   }
+
+  // A sealed signal (nostr.ts SIGNAL_KIND): typing, seen, call setup.
+  // From a connection AUTHed as the owner or a member, p-tagged to the
+  // owner or a member. NEVER stored, never pushed, never on the live feed:
+  // it goes only to the recipient's own open, AUTHed subscriptions that
+  // ask for kind 21059 addressed to them, and is gone if they have none.
+  private handleSignal(ws: WebSocket, event: NostrEvent): void {
+    const sql = this.sql;
+    const owner = getOwnerPubkey(sql, this.env);
+    const sender = getState(ws).authedPubkey;
+    if (owner === null || sender === undefined || (sender !== owner && !isMember(sql, sender))) {
+      ok(ws, event.id, false, "restricted: signals are for this home's members; authenticate first");
+      return;
+    }
+    if (isAnyGroupEvent(event)) {
+      ok(ws, event.id, false, "invalid: a signal is addressed to one person and cannot carry a group tag");
+      return;
+    }
+    if (JSON.stringify(event).length > SIGNAL_MAX_BYTES) {
+      ok(ws, event.id, false, `invalid: a signal can be at most ${SIGNAL_MAX_BYTES} bytes`);
+      return;
+    }
+    if (isCreatedAtTooFarInFuture(event, nowSeconds())) {
+      ok(ws, event.id, false, "invalid: created_at is too far in the future");
+      return;
+    }
+    const named = [...new Set(pTagValues(event.tags))];
+    const recipients = new Set(
+      named
+        .filter((pubkey) => pubkey !== owner)
+        .slice(0, MAX_WRAP_RECIPIENTS_CHECKED)
+        .filter((pubkey) => isMember(sql, pubkey)),
+    );
+    if (named.includes(owner)) recipients.add(owner);
+    if (recipients.size === 0) {
+      ok(ws, event.id, false, "restricted: signal is not addressed to this relay's owner or one of its members");
+      return;
+    }
+    if (this.windowLimited(this.signalRateLimits, sender, SIGNAL_RATE_LIMIT_WINDOW_MS, MAX_SIGNALS_PER_SENDER_PER_WINDOW)) {
+      ok(ws, event.id, false, "rate-limited: too many signals, slow down");
+      return;
+    }
+    if (!idMatchesContent(event)) {
+      ok(ws, event.id, false, "invalid: id does not match the hash of its contents");
+      return;
+    }
+    if (!verifySignature(event)) {
+      ok(ws, event.id, false, "invalid: signature verification failed");
+      return;
+    }
+    ok(ws, event.id, true, "");
+    for (const other of this.ctx.getWebSockets()) {
+      if (this.ctx.getTags(other).includes(LIVE_FEED_TAG)) continue;
+      const state = getState(other);
+      const authed = state.authedPubkey;
+      if (authed === undefined || !recipients.has(authed)) continue;
+      for (const [subId, filters] of Object.entries(state.subs)) {
+        const own = filters.filter((f) => f.kinds?.includes(SIGNAL_KIND) && readsOnlyOwnMail(f, authed));
+        if (own.length > 0 && matchesAnyFilter(event, own)) send(other, ["EVENT", subId, event]);
+      }
+    }
+  }
+
+  // Per authenticated sender (limits.ts MAX_SIGNALS_PER_SENDER_PER_WINDOW).
+  private signalRateLimits = new Map<string, { windowStart: number; count: number }>();
 
   // NIP-29 kind-9021 join request. The decision is nip29.ts
   // handleJoinRequest; this is the wire-level work before any invite code
